@@ -1,0 +1,21 @@
+use std.io.file.File;
+use std.mem.arena.Arena;
+
+use core.ids.ObjectId;
+use object.types.ByteList;
+use object.types.ObjectKind;
+
+export struct ObjectBytes {
+    bytes: ByteList
+}
+
+export struct ObjectReader {
+    file: File
+}
+
+export interface ObjectStore {
+    fn has(self: &Self, id: ObjectId) !bool;
+    fn get(self: &Self, id: ObjectId, arena: &Arena) !ObjectBytes;
+    fn put(self: &Self, kind: ObjectKind, payload: &[byte]) !ObjectId;
+    fn open_reader(self: &Self, id: ObjectId) !ObjectReader;
+}

@@ -1,0 +1,433 @@
+use std.crypto.blake3.blake3_digest;
+use std.io.file.File;
+use std.io.file.file_close;
+use std.io.file.file_open;
+use std.io.file.file_read;
+use std.io.file.file_write;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.string.strlen;
+
+use libc.Stat;
+use libc.errno;
+use libc.getpid;
+use libc.mkdir;
+use libc.rename;
+use libc.stat;
+use libc.unlink;
+use libc.EACCES;
+use libc.EEXIST;
+use libc.ENOENT;
+use libc.EPERM;
+use libc.O_CREAT;
+use libc.O_EXCL;
+use libc.O_RDONLY;
+use libc.O_WRONLY;
+use libc.S_IRWXU;
+use libc.free;
+use libc.malloc;
+use core.codec.CODEC_ENVELOPE_BYTES;
+use core.codec.DecodedObject;
+use core.codec.codec_decode_object;
+use core.codec.codec_encode_object;
+use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.ObjectId;
+use core.ids.object_id_compare;
+use core.ids.object_id_encode_hex;
+use core.ids.object_id_from_hash;
+use object.hash.object_hash_domain;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use object.types.object_kind_from_u16;
+use object.types.object_kind_to_u16;
+use store.object_store.ObjectBytes;
+use store.object_store.ObjectReader;
+use store.object_store.ObjectStore;
+
+const STORE_PATH_MAX: usize = 4096;
+const STAT_S_IFMT: u32 = 61440u32;
+const STAT_S_IFDIR: u32 = 16384u32;
+
+error StorePathTooLong;
+error StoreAlloc;
+error StoreNotFound;
+error StoreOpenFailed;
+error StoreReadFailed;
+error StoreWriteFailed;
+error StoreCorruptObject;
+error StoreHashMismatch;
+error StorePermissionDenied;
+error StorePublishFailed;
+error StoreMkdirFailed;
+
+struct StorePath {
+    bytes: [byte: 4096] = [],
+    len: usize = 0
+}
+
+fn errno_is_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn store_path_empty() StorePath {
+    return StorePath{ bytes: [], len: 0 };
+}
+
+fn store_path_clone(src: &StorePath) StorePath {
+    var out: StorePath = store_path_empty();
+    var i: usize = 0;
+    while i < src.len {
+        out.bytes[i] = src.bytes[i];
+        i = i + 1;
+    }
+    out.bytes[src.len] = 0 as byte;
+    out.len = src.len;
+    return out;
+}
+
+fn store_path_cstr(path: &StorePath) &byte {
+    return &path.bytes[0];
+}
+
+fn store_path_from_cstr(text: &byte) !StorePath {
+    if text == null {
+        return error.StorePathTooLong;
+    }
+    const len: usize = strlen(text as &const byte);
+    if len >= STORE_PATH_MAX {
+        return error.StorePathTooLong;
+    }
+    var out: StorePath = store_path_empty();
+    var i: usize = 0;
+    while i < len {
+        out.bytes[i] = text[i];
+        i = i + 1;
+    }
+    out.bytes[len] = 0 as byte;
+    out.len = len;
+    return out;
+}
+
+fn store_path_append_byte(path: &StorePath, value: byte) !void {
+    if path.len + 1 >= STORE_PATH_MAX {
+        return error.StorePathTooLong;
+    }
+    path.bytes[path.len] = value;
+    path.len = path.len + 1;
+    path.bytes[path.len] = 0 as byte;
+}
+
+fn store_path_append_bytes(path: &StorePath, src: &byte, count: usize) !void {
+    if path.len + count >= STORE_PATH_MAX {
+        return error.StorePathTooLong;
+    }
+    var i: usize = 0;
+    while i < count {
+        path.bytes[path.len + i] = src[i];
+        i = i + 1;
+    }
+    path.len = path.len + count;
+    path.bytes[path.len] = 0 as byte;
+}
+
+fn store_path_append_literal(path: &StorePath, literal: &const byte) !void {
+    return store_path_append_bytes(path, literal as &byte, strlen(literal));
+}
+
+fn store_path_join_literal(base: &StorePath, literal: &const byte) !StorePath {
+    var out: StorePath = store_path_empty();
+    try store_path_append_bytes(&out, &base.bytes[0], base.len);
+    if out.len > 0 {
+        const last_index: usize = out.len - 1;
+        if last_index < STORE_PATH_MAX && out.bytes[last_index] != '/' as byte {
+            try store_path_append_byte(&out, '/' as byte);
+        }
+    }
+    try store_path_append_literal(&out, literal);
+    return out;
+}
+
+fn store_path_exists(path: &StorePath) bool {
+    var st: Stat = Stat{};
+    return stat(store_path_cstr(path) as &const byte, &st) == 0;
+}
+
+fn store_path_is_dir(path: &StorePath) bool {
+    var st: Stat = Stat{};
+    if stat(store_path_cstr(path) as &const byte, &st) != 0 {
+        return false;
+    }
+    return (st.st_mode as u32 & STAT_S_IFMT) == STAT_S_IFDIR;
+}
+
+fn ensure_dir(path: &StorePath) !void {
+    if store_path_is_dir(path) {
+        return;
+    }
+    if mkdir(store_path_cstr(path) as &const byte, S_IRWXU as i32) == 0 {
+        return;
+    }
+    if errno == EEXIST && store_path_is_dir(path) {
+        return;
+    }
+    if errno_is_permission() {
+        return error.StorePermissionDenied;
+    }
+    return error.StoreMkdirFailed;
+}
+
+fn append_decimal_i32(path: &StorePath, value: i32) !void {
+    var buf: [byte: 16] = [];
+    var temp: i32 = value;
+    if temp < 0 {
+        temp = 0 - temp;
+    }
+    var count: usize = 0;
+    if temp == 0 {
+        buf[0] = '0' as byte;
+        count = 1;
+    } else {
+        while temp > 0 {
+            if count >= 16 as usize {
+                return error.StorePathTooLong;
+            }
+            buf[count] = ('0' as byte) + (temp % 10) as byte;
+            temp = temp / 10;
+            count = count + 1;
+        }
+    }
+    while count > 0 {
+        count = count - 1;
+        const idx: usize = count;
+        if idx >= 16 as usize {
+            return error.StorePathTooLong;
+        }
+        try store_path_append_byte(path, buf[idx]);
+    }
+}
+
+fn hash_object_payload(kind: ObjectKind, payload: &[byte]) !ObjectId {
+    const domain: &const byte = object_hash_domain(kind);
+    const domain_len: usize = strlen(domain);
+    const total_len: usize = domain_len + 1 + payload.len;
+    const raw: &byte = malloc(total_len) as &byte;
+    if raw == null {
+        return error.StoreAlloc;
+    }
+    defer {
+        free(raw as &void);
+    }
+    const combined: &[byte] = raw[0: total_len];
+
+    var i: usize = 0;
+    while i < domain_len {
+        combined.ptr[i] = domain[i];
+        i = i + 1;
+    }
+    combined.ptr[domain_len] = 0 as byte;
+    i = 0;
+    while i < payload.len {
+        combined.ptr[domain_len + 1 + i] = payload.ptr[i];
+        i = i + 1;
+    }
+
+    var hash: Hash32 = Hash32{ bytes: [] };
+    blake3_digest(combined, hash.bytes[0: HASH32_BYTES]);
+    return object_id_from_hash(hash);
+}
+
+fn build_loose_paths(root: &StorePath, id: &ObjectId, dir_out: &StorePath, file_out: &StorePath, temp_out: &StorePath) !void {
+    var hex: [byte: 64] = [];
+    _ = try object_id_encode_hex(id, hex[0: HASH32_HEX_BYTES]);
+
+    var dir_path: StorePath = store_path_clone(root);
+    if dir_path.len > 0 {
+        const last_index: usize = dir_path.len - 1;
+        if last_index < STORE_PATH_MAX && dir_path.bytes[last_index] != '/' as byte {
+            try store_path_append_byte(&dir_path, '/' as byte);
+        }
+    }
+    try store_path_append_bytes(&dir_path, &hex[0], 2 as usize);
+
+    var file_path: StorePath = store_path_clone(&dir_path);
+    try store_path_append_byte(&file_path, '/' as byte);
+    try store_path_append_bytes(&file_path, &hex[2], HASH32_HEX_BYTES - 2 as usize);
+
+    var temp_path: StorePath = store_path_clone(&file_path);
+    try store_path_append_literal(&temp_path, ".tmp.");
+    try append_decimal_i32(&temp_path, getpid());
+
+    dir_out[0] = store_path_clone(&dir_path);
+    file_out[0] = store_path_clone(&file_path);
+    temp_out[0] = store_path_clone(&temp_path);
+}
+
+fn load_file_bytes(arena: &Arena, path: &StorePath) !ByteList {
+    var st: Stat = Stat{};
+    if stat(store_path_cstr(path) as &const byte, &st) != 0 {
+        if errno == ENOENT {
+            return error.StoreNotFound;
+        }
+        if errno_is_permission() {
+            return error.StorePermissionDenied;
+        }
+        return error.StoreOpenFailed;
+    }
+
+    const size: usize = st.st_size as usize;
+    var want: usize = size;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.StoreAlloc;
+    }
+    const out: &[byte] = raw[0: size];
+    const file: File = file_open(store_path_cstr(path) as &const byte, O_RDONLY as i32, 0u32) catch {
+        return error.StoreOpenFailed;
+    };
+    defer {
+        _ = file_close(&file) catch {};
+    }
+
+    var read_total: usize = 0;
+    while read_total < size {
+        const chunk: isize = file_read(&file, &raw[read_total], size - read_total);
+        if chunk <= 0 {
+            return error.StoreReadFailed;
+        }
+        read_total = read_total + chunk as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: size };
+}
+
+fn verify_object_bytes(id: &ObjectId, data: ByteList) !void {
+    var offset: usize = 0;
+    const decoded: DecodedObject = codec_decode_object(data.ptr[0: data.len], &offset) catch {
+        return error.StoreCorruptObject;
+    };
+    if offset != data.len {
+        return error.StoreCorruptObject;
+    }
+    const kind: ObjectKind = object_kind_from_u16(decoded.envelope.kind) catch {
+        return error.StoreCorruptObject;
+    };
+    const computed: ObjectId = try hash_object_payload(kind, decoded.payload.ptr[0: decoded.payload.len]);
+    if object_id_compare(&computed, id) != 0 {
+        return error.StoreHashMismatch;
+    }
+}
+
+export struct LooseObjectStore : ObjectStore {
+    root: StorePath,
+
+    fn has(self: &Self, id: ObjectId) !bool {
+        var dir_path: StorePath = store_path_empty();
+        var file_path: StorePath = store_path_empty();
+        var temp_path: StorePath = store_path_empty();
+        try build_loose_paths(&self.root, &id, &dir_path, &file_path, &temp_path);
+        return store_path_exists(&file_path);
+    },
+
+    fn get(self: &Self, id: ObjectId, arena: &Arena) !ObjectBytes {
+        var dir_path: StorePath = store_path_empty();
+        var file_path: StorePath = store_path_empty();
+        var temp_path: StorePath = store_path_empty();
+        try build_loose_paths(&self.root, &id, &dir_path, &file_path, &temp_path);
+        const data: ByteList = try load_file_bytes(arena, &file_path);
+        try verify_object_bytes(&id, data);
+        return ObjectBytes{ bytes: data };
+    },
+
+    fn put(self: &Self, kind: ObjectKind, payload: &[byte]) !ObjectId {
+        const id: ObjectId = try hash_object_payload(kind, payload);
+        if try self.has(id) {
+            return id;
+        }
+
+        var dir_path: StorePath = store_path_empty();
+        var file_path: StorePath = store_path_empty();
+        var temp_path: StorePath = store_path_empty();
+        try build_loose_paths(&self.root, &id, &dir_path, &file_path, &temp_path);
+        try ensure_dir(&dir_path);
+
+        const total_len: usize = CODEC_ENVELOPE_BYTES + payload.len;
+        const encoded_raw: &byte = malloc(total_len) as &byte;
+        if encoded_raw == null {
+            return error.StoreAlloc;
+        }
+        defer {
+            free(encoded_raw as &void);
+        }
+        const encoded: &[byte] = encoded_raw[0: total_len];
+        var offset: usize = 0;
+        try codec_encode_object(encoded, &offset, object_kind_to_u16(kind), 0 as u16, payload);
+
+        const file: File = file_open(store_path_cstr(&temp_path) as &const byte, (O_WRONLY | O_CREAT | O_EXCL) as i32, S_IRWXU as u32) catch {
+            if errno_is_permission() {
+                return error.StorePermissionDenied;
+            }
+            return error.StoreWriteFailed;
+        };
+        defer {
+            _ = file_close(&file) catch {};
+        }
+
+        if (try file_write(&file, encoded.ptr as &const byte, total_len)) != total_len {
+            _ = unlink(store_path_cstr(&temp_path) as &const byte);
+            return error.StoreWriteFailed;
+        }
+
+        _ = file_close(&file) catch {
+            _ = unlink(store_path_cstr(&temp_path) as &const byte);
+            return error.StoreWriteFailed;
+        };
+
+        if rename(store_path_cstr(&temp_path) as &const byte, store_path_cstr(&file_path) as &const byte) != 0 {
+            if try self.has(id) {
+                _ = unlink(store_path_cstr(&temp_path) as &const byte);
+                return id;
+            }
+            _ = unlink(store_path_cstr(&temp_path) as &const byte);
+            return error.StorePublishFailed;
+        }
+
+        return id;
+    },
+
+    fn open_reader(self: &Self, id: ObjectId) !ObjectReader {
+        var dir_path: StorePath = store_path_empty();
+        var file_path: StorePath = store_path_empty();
+        var temp_path: StorePath = store_path_empty();
+        try build_loose_paths(&self.root, &id, &dir_path, &file_path, &temp_path);
+        const file: File = file_open(store_path_cstr(&file_path) as &const byte, O_RDONLY as i32, 0u32) catch {
+            return error.StoreOpenFailed;
+        };
+        return ObjectReader{ file: file };
+    },
+}
+
+export fn loose_store_open(root_path: &byte) !LooseObjectStore {
+    return LooseObjectStore{
+        root: try store_path_from_cstr(root_path),
+    };
+}
+
+export fn loose_store_object_path(store: &LooseObjectStore, id: &ObjectId, out: &[byte]) !usize {
+    var dir_path: StorePath = store_path_empty();
+    var file_path: StorePath = store_path_empty();
+    var temp_path: StorePath = store_path_empty();
+    try build_loose_paths(&store.root, id, &dir_path, &file_path, &temp_path);
+    if file_path.len + 1 > out.len {
+        return error.StorePathTooLong;
+    }
+    var i: usize = 0;
+    while i <= file_path.len {
+        out.ptr[i] = file_path.bytes[i];
+        i = i + 1;
+    }
+    return file_path.len;
+}

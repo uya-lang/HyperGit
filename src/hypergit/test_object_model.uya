@@ -1,0 +1,199 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+
+use object.types.ObjectKind;
+use object.types.StoredObject;
+use object.types.ByteList;
+use object.types.BloomFilter;
+use object.types.ModuleBitmap;
+use object.types.Identity;
+use object.types.CommitPayload;
+use object.types.PathPrefix;
+use object.types.EntryKind;
+use object.types.ContentType;
+use object.types.ManifestEntry;
+use object.types.ManifestChild;
+use object.types.ManifestNodePayload;
+use object.types.SmallBlobPayload;
+use object.types.FileType;
+use object.types.ChunkingStrategy;
+use object.types.DedupeScope;
+use object.types.StorageTier;
+use object.types.ChunkRef;
+use object.types.ChunkedBlobPayload;
+use object.types.PublishedView;
+use object.types.byte_list_from_slice;
+use object.types.commit_id_list_from_slice;
+use object.types.manifest_entry_list_from_slice;
+use object.types.manifest_child_list_from_slice;
+use object.types.chunk_ref_list_from_slice;
+use object.types.object_kind_from_u16;
+use object.types.object_kind_to_u16;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.CommitId;
+use core.ids.ManifestId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use core.ids.manifest_id_from_object;
+use core.ids.policy_id_from_object;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn test_object_kind_roundtrip() !void {
+    try expect(object_kind_to_u16(ObjectKind.Commit) == 0 as u16);
+    try expect((try object_kind_from_u16(0 as u16)) == ObjectKind.Commit);
+    try expect((try object_kind_from_u16(4 as u16)) == ObjectKind.PublishedView);
+}
+
+fn test_stored_object_wrapper() !void {
+    const id: ObjectId = object_id_from_hash(make_hash(3 as byte));
+    const wrapped: StoredObject<u16> = StoredObject<u16>{
+        object_id: id,
+        payload: 17 as u16,
+    };
+    try expect(wrapped.object_id.hash.bytes[0] == 3 as byte);
+    try expect(wrapped.payload == 17 as u16);
+}
+
+fn test_commit_payload_layout() !void {
+    var parent_ids: [CommitId: 2] = [
+        commit_id_from_object(object_id_from_hash(make_hash(10 as byte))),
+        commit_id_from_object(object_id_from_hash(make_hash(20 as byte))),
+    ];
+    var alice_name: [byte: 5] = ['a' as byte, 'l' as byte, 'i' as byte, 'c' as byte, 'e' as byte];
+    var alice_mail: [byte: 17] = ['a' as byte, 'l' as byte, 'i' as byte, 'c' as byte, 'e' as byte, '@' as byte, 'e' as byte, 'x' as byte, 'a' as byte, 'm' as byte, 'p' as byte, 'l' as byte, 'e' as byte, '.' as byte, 'c' as byte, 'o' as byte, 'm' as byte];
+    var msg: [byte: 12] = ['i' as byte, 'n' as byte, 'i' as byte, 't' as byte, 'i' as byte, 'a' as byte, 'l' as byte, ' ' as byte, 'i' as byte, 'm' as byte, 'p' as byte, 'o' as byte];
+    const author: Identity = Identity{
+        name: byte_list_from_slice(alice_name[0: 5]),
+        email: byte_list_from_slice(alice_mail[0: 17]),
+    };
+    const committer: Identity = Identity{
+        name: byte_list_from_slice(alice_name[0: 5]),
+        email: byte_list_from_slice(alice_mail[0: 17]),
+    };
+    const payload: CommitPayload = CommitPayload{
+        parents: commit_id_list_from_slice(parent_ids[0: 2]),
+        author: author,
+        committer: committer,
+        message: byte_list_from_slice(msg[0: 12]),
+        timestamp_ms: 42,
+        manifest_root: manifest_id_from_object(object_id_from_hash(make_hash(30 as byte))),
+        changed_path_bloom: BloomFilter{ bytes: ByteList{ ptr: null, len: 0 } },
+        module_bitmap: ModuleBitmap{ bytes: ByteList{ ptr: null, len: 0 } },
+        generation: 7u64,
+    };
+
+    try expect(payload.parents.len == 2 as usize);
+    try expect(payload.author.name.len == 5 as usize);
+    try expect(payload.committer.email.len == 17 as usize);
+    try expect(payload.message.len == 12 as usize);
+    try expect(payload.manifest_root.id.hash.bytes[0] == 30 as byte);
+    try expect(payload.generation == 7u64);
+}
+
+fn test_manifest_payload_layout() !void {
+    var entry_name: [byte: 8] = ['r' as byte, 'e' as byte, 'a' as byte, 'd' as byte, 'm' as byte, 'e' as byte, '.' as byte, 'm' as byte];
+    var min_name: [byte: 1] = ['a' as byte];
+    var max_name: [byte: 1] = ['z' as byte];
+    const entry: ManifestEntry = ManifestEntry{
+        name: byte_list_from_slice(entry_name[0: 8]),
+        kind: EntryKind.File,
+        mode: 0o100644u32,
+        object_id: object_id_from_hash(make_hash(40 as byte)),
+        logical_size: 128u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: policy_id_from_object(object_id_from_hash(make_hash(41 as byte))),
+    };
+    const child: ManifestChild = ManifestChild{
+        min_name: byte_list_from_slice(min_name[0: 1]),
+        max_name: byte_list_from_slice(max_name[0: 1]),
+        child_id: manifest_id_from_object(object_id_from_hash(make_hash(42 as byte))),
+        child_hash: make_hash(43 as byte),
+    };
+    var entries: [ManifestEntry: 1] = [entry];
+    var children: [ManifestChild: 1] = [child];
+    const payload: ManifestNodePayload = ManifestNodePayload{
+        prefix: PathPrefix{ bytes: byte_list_from_slice(entry_name[0: 8]) },
+        level: 1 as u16,
+        entry_count: 1u32,
+        child_count: 1u32,
+        entries: manifest_entry_list_from_slice(entries[0: 1]),
+        children: manifest_child_list_from_slice(children[0: 1]),
+    };
+
+    try expect(payload.prefix.bytes.len == 8 as usize);
+    try expect(payload.entries.len == 1 as usize);
+    try expect(payload.children.len == 1 as usize);
+    try expect(payload.entries.ptr[0].kind == EntryKind.File);
+    try expect(payload.entries.ptr[0].content_type == ContentType.Utf8Text);
+    try expect(payload.children.ptr[0].child_hash.bytes[0] == 43 as byte);
+}
+
+fn test_blob_and_view_layout() !void {
+    var blob_bytes: [byte: 4] = ['d' as byte, 'a' as byte, 't' as byte, 'a' as byte];
+    const small_blob: SmallBlobPayload = SmallBlobPayload{
+        logical_size: 4u64,
+        content_hash: make_hash(50 as byte),
+        payload: byte_list_from_slice(blob_bytes[0: 4]),
+    };
+    const chunk: ChunkRef = ChunkRef{
+        logical_chunk_id: make_hash(51 as byte),
+        storage_id: make_hash(52 as byte),
+        offset: 64u64,
+        logical_size: 32u32,
+        stored_size: 24u32,
+        checksum: make_hash(53 as byte),
+        storage_tier: StorageTier.Warm,
+    };
+    var chunks: [ChunkRef: 1] = [chunk];
+    const chunked_blob: ChunkedBlobPayload = ChunkedBlobPayload{
+        logical_size: 32u64,
+        file_type: FileType.Binary,
+        chunking_strategy: ChunkingStrategy.ContentDefined,
+        chunk_count: 1u32,
+        chunks: chunk_ref_list_from_slice(chunks[0: 1]),
+        content_fingerprint: make_hash(54 as byte),
+        encryption_profile: policy_id_from_object(object_id_from_hash(make_hash(55 as byte))),
+        dedupe_scope: DedupeScope.Repository,
+    };
+    const view: PublishedView = PublishedView{
+        head_commit: commit_id_from_object(object_id_from_hash(make_hash(56 as byte))),
+        manifest_root: manifest_id_from_object(object_id_from_hash(make_hash(57 as byte))),
+        serving_index_snapshot: object_id_from_hash(make_hash(58 as byte)),
+        lineage_watermark: 9u64,
+        dependency_watermark: 10u64,
+        created_at_ms: 11,
+    };
+
+    try expect(small_blob.logical_size == 4u64);
+    try expect(small_blob.payload.len == 4 as usize);
+    try expect(chunked_blob.chunks.len == 1 as usize);
+    try expect(chunked_blob.chunks.ptr[0].storage_tier == StorageTier.Warm);
+    try expect(chunked_blob.file_type == FileType.Binary);
+    try expect(chunked_blob.chunking_strategy == ChunkingStrategy.ContentDefined);
+    try expect(view.head_commit.id.hash.bytes[0] == 56 as byte);
+    try expect(view.dependency_watermark == 10u64);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Object Model Tests");
+    run_test("object kind roundtrip", test_object_kind_roundtrip);
+    run_test("stored object wrapper", test_stored_object_wrapper);
+    run_test("commit payload layout", test_commit_payload_layout);
+    run_test("manifest payload layout", test_manifest_payload_layout);
+    run_test("blob and view layout", test_blob_and_view_layout);
+    return test_suite_end();
+}

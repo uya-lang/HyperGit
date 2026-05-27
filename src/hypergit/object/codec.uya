@@ -1,0 +1,782 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.codec.ByteSpan;
+use core.codec.DecodedObject;
+use core.codec.codec_decode_bytes;
+use core.codec.codec_decode_enum_u16;
+use core.codec.codec_decode_hash32;
+use core.codec.codec_decode_i64;
+use core.codec.codec_decode_object;
+use core.codec.codec_decode_u16;
+use core.codec.codec_decode_u32;
+use core.codec.codec_decode_u64;
+use core.codec.codec_decode_varuint;
+use core.codec.codec_encode_enum_u16;
+use core.codec.codec_encode_hash32;
+use core.codec.codec_encode_i64;
+use core.codec.codec_encode_object;
+use core.codec.codec_encode_u16;
+use core.codec.codec_encode_u32;
+use core.codec.codec_encode_u64;
+use core.codec.codec_encode_u8;
+use core.codec.codec_encode_varuint;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.CommitId;
+use core.ids.ManifestId;
+use core.ids.BlobId;
+use core.ids.PublishedViewId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use core.ids.manifest_id_from_object;
+use core.ids.blob_id_from_object;
+use core.ids.published_view_id_from_hash;
+use core.ids.policy_id_from_object;
+use core.ids.HASH32_BYTES;
+use object.types.ObjectKind;
+use object.types.ByteList;
+use object.types.CommitIdList;
+use object.types.BloomFilter;
+use object.types.ModuleBitmap;
+use object.types.Identity;
+use object.types.CommitPayload;
+use object.types.PathPrefix;
+use object.types.EntryKind;
+use object.types.ContentType;
+use object.types.ManifestEntry;
+use object.types.ManifestChild;
+use object.types.ManifestEntryList;
+use object.types.ManifestChildList;
+use object.types.ManifestNodePayload;
+use object.types.SmallBlobPayload;
+use object.types.FileType;
+use object.types.ChunkingStrategy;
+use object.types.DedupeScope;
+use object.types.StorageTier;
+use object.types.ChunkRef;
+use object.types.ChunkRefList;
+use object.types.ChunkedBlobPayload;
+use object.types.PublishedView;
+use object.types.byte_list_from_slice;
+use object.types.commit_id_list_from_slice;
+use object.types.manifest_entry_list_from_slice;
+use object.types.manifest_child_list_from_slice;
+use object.types.chunk_ref_list_from_slice;
+use object.types.object_kind_from_u16;
+use object.types.object_kind_to_u16;
+
+error ObjectCodecAlloc;
+error ObjectUnexpectedKind;
+
+fn object_varuint_encoded_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1;
+    while temp >= 128u64 {
+        temp = temp >> 7;
+        count = count + 1;
+    }
+    return count;
+}
+
+fn bytes_encoded_len(value: ByteList) usize {
+    return object_varuint_encoded_len(value.len as u64) + value.len;
+}
+
+fn encode_byte_list(output: &[byte], offset: &usize, value: ByteList) !void {
+    try codec_encode_varuint(output, offset, value.len as u64);
+    var i: usize = 0;
+    while i < value.len {
+        try codec_encode_u8(output, offset, value.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn decode_byte_list(input: &[byte], offset: &usize) !ByteList {
+    const span: ByteSpan = try codec_decode_bytes(input, offset);
+    return ByteList{ ptr: span.ptr, len: span.len };
+}
+
+fn encode_object_id(output: &[byte], offset: &usize, id: &ObjectId) !void {
+    try codec_encode_hash32(output, offset, &id.hash);
+}
+
+fn decode_object_id(input: &[byte], offset: &usize) !ObjectId {
+    return object_id_from_hash(try codec_decode_hash32(input, offset));
+}
+
+fn encode_commit_id(output: &[byte], offset: &usize, id: &CommitId) !void {
+    try encode_object_id(output, offset, &id.id);
+}
+
+fn decode_commit_id(input: &[byte], offset: &usize) !CommitId {
+    return commit_id_from_object(try decode_object_id(input, offset));
+}
+
+fn encode_manifest_id(output: &[byte], offset: &usize, id: &ManifestId) !void {
+    try encode_object_id(output, offset, &id.id);
+}
+
+fn decode_manifest_id(input: &[byte], offset: &usize) !ManifestId {
+    return manifest_id_from_object(try decode_object_id(input, offset));
+}
+
+fn encode_blob_id(output: &[byte], offset: &usize, id: &BlobId) !void {
+    try encode_object_id(output, offset, &id.id);
+}
+
+fn decode_blob_id(input: &[byte], offset: &usize) !BlobId {
+    return blob_id_from_object(try decode_object_id(input, offset));
+}
+
+fn encode_published_view_id(output: &[byte], offset: &usize, id: &PublishedViewId) !void {
+    try codec_encode_hash32(output, offset, &id.hash);
+}
+
+fn decode_published_view_id(input: &[byte], offset: &usize) !PublishedViewId {
+    return published_view_id_from_hash(try codec_decode_hash32(input, offset));
+}
+
+fn encode_policy_id(output: &[byte], offset: &usize, id: &PolicyId) !void {
+    try encode_object_id(output, offset, &id.id);
+}
+
+fn decode_policy_id(input: &[byte], offset: &usize) !PolicyId {
+    return policy_id_from_object(try decode_object_id(input, offset));
+}
+
+fn entry_kind_to_u16(kind: EntryKind) u16 {
+    if kind == EntryKind.File {
+        return 0 as u16;
+    }
+    if kind == EntryKind.Executable {
+        return 1 as u16;
+    }
+    return 2 as u16;
+}
+
+fn decode_entry_kind(input: &[byte], offset: &usize) !EntryKind {
+    const raw: u16 = try codec_decode_enum_u16(input, offset, 2 as u16);
+    if raw == 0 as u16 {
+        return EntryKind.File;
+    }
+    if raw == 1 as u16 {
+        return EntryKind.Executable;
+    }
+    return EntryKind.Symlink;
+}
+
+fn content_type_to_u16(kind: ContentType) u16 {
+    if kind == ContentType.Unknown {
+        return 0 as u16;
+    }
+    if kind == ContentType.Utf8Text {
+        return 1 as u16;
+    }
+    return 2 as u16;
+}
+
+fn decode_content_type(input: &[byte], offset: &usize) !ContentType {
+    const raw: u16 = try codec_decode_enum_u16(input, offset, 2 as u16);
+    if raw == 0 as u16 {
+        return ContentType.Unknown;
+    }
+    if raw == 1 as u16 {
+        return ContentType.Utf8Text;
+    }
+    return ContentType.Binary;
+}
+
+fn file_type_to_u16(kind: FileType) u16 {
+    if kind == FileType.Regular {
+        return 0 as u16;
+    }
+    if kind == FileType.Binary {
+        return 1 as u16;
+    }
+    return 2 as u16;
+}
+
+fn decode_file_type(input: &[byte], offset: &usize) !FileType {
+    const raw: u16 = try codec_decode_enum_u16(input, offset, 2 as u16);
+    if raw == 0 as u16 {
+        return FileType.Regular;
+    }
+    if raw == 1 as u16 {
+        return FileType.Binary;
+    }
+    return FileType.Archive;
+}
+
+fn chunking_strategy_to_u16(kind: ChunkingStrategy) u16 {
+    if kind == ChunkingStrategy.Fixed {
+        return 0 as u16;
+    }
+    return 1 as u16;
+}
+
+fn decode_chunking_strategy(input: &[byte], offset: &usize) !ChunkingStrategy {
+    const raw: u16 = try codec_decode_enum_u16(input, offset, 1 as u16);
+    if raw == 0 as u16 {
+        return ChunkingStrategy.Fixed;
+    }
+    return ChunkingStrategy.ContentDefined;
+}
+
+fn dedupe_scope_to_u16(kind: DedupeScope) u16 {
+    if kind == DedupeScope.Repository {
+        return 0 as u16;
+    }
+    return 1 as u16;
+}
+
+fn decode_dedupe_scope(input: &[byte], offset: &usize) !DedupeScope {
+    const raw: u16 = try codec_decode_enum_u16(input, offset, 1 as u16);
+    if raw == 0 as u16 {
+        return DedupeScope.Repository;
+    }
+    return DedupeScope.Global;
+}
+
+fn storage_tier_to_u16(kind: StorageTier) u16 {
+    if kind == StorageTier.Hot {
+        return 0 as u16;
+    }
+    if kind == StorageTier.Warm {
+        return 1 as u16;
+    }
+    return 2 as u16;
+}
+
+fn decode_storage_tier(input: &[byte], offset: &usize) !StorageTier {
+    const raw: u16 = try codec_decode_enum_u16(input, offset, 2 as u16);
+    if raw == 0 as u16 {
+        return StorageTier.Hot;
+    }
+    if raw == 1 as u16 {
+        return StorageTier.Warm;
+    }
+    return StorageTier.Cold;
+}
+
+fn commit_id_list_encoded_len(values: CommitIdList) usize {
+    return object_varuint_encoded_len(values.len as u64) + values.len * HASH32_BYTES;
+}
+
+fn encode_commit_id_list(output: &[byte], offset: &usize, values: CommitIdList) !void {
+    try codec_encode_varuint(output, offset, values.len as u64);
+    var i: usize = 0;
+    while i < values.len {
+        try encode_commit_id(output, offset, &values.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn decode_commit_id_list(arena: &Arena, input: &[byte], offset: &usize) !CommitIdList {
+    const count_u64: u64 = try codec_decode_varuint(input, offset);
+    const count: usize = count_u64 as usize;
+    if count == 0 {
+        return CommitIdList{ ptr: null, len: 0 };
+    }
+    const raw: &CommitId = arena_alloc(arena, @size_of(CommitId) as usize * count) as &CommitId;
+    if raw == null {
+        return error.ObjectCodecAlloc;
+    }
+
+    var i: usize = 0;
+    while i < count {
+        raw[i] = try decode_commit_id(input, offset);
+        i = i + 1;
+    }
+    return commit_id_list_from_slice(raw[0: count]);
+}
+
+fn encode_identity(output: &[byte], offset: &usize, identity: &Identity) !void {
+    try encode_byte_list(output, offset, identity.name);
+    try encode_byte_list(output, offset, identity.email);
+}
+
+fn decode_identity(input: &[byte], offset: &usize) !Identity {
+    return Identity{
+        name: try decode_byte_list(input, offset),
+        email: try decode_byte_list(input, offset),
+    };
+}
+
+fn identity_encoded_len(identity: &Identity) usize {
+    return bytes_encoded_len(identity.name) + bytes_encoded_len(identity.email);
+}
+
+fn manifest_entry_encoded_len(entry: &ManifestEntry) usize {
+    return bytes_encoded_len(entry.name) + 2 + 4 + HASH32_BYTES + 8 + 2 + HASH32_BYTES;
+}
+
+fn manifest_child_encoded_len(child: &ManifestChild) usize {
+    return bytes_encoded_len(child.min_name) + bytes_encoded_len(child.max_name) + HASH32_BYTES + HASH32_BYTES;
+}
+
+fn chunk_ref_encoded_len(value: &ChunkRef) usize {
+    _ = value;
+    return HASH32_BYTES + HASH32_BYTES + 8 + 4 + 4 + HASH32_BYTES + 2;
+}
+
+fn manifest_entry_list_encoded_len(values: ManifestEntryList) usize {
+    var total: usize = object_varuint_encoded_len(values.len as u64);
+    var i: usize = 0;
+    while i < values.len {
+        total = total + manifest_entry_encoded_len(&values.ptr[i]);
+        i = i + 1;
+    }
+    return total;
+}
+
+fn manifest_child_list_encoded_len(values: ManifestChildList) usize {
+    var total: usize = object_varuint_encoded_len(values.len as u64);
+    var i: usize = 0;
+    while i < values.len {
+        total = total + manifest_child_encoded_len(&values.ptr[i]);
+        i = i + 1;
+    }
+    return total;
+}
+
+fn chunk_ref_list_encoded_len(values: ChunkRefList) usize {
+    var total: usize = object_varuint_encoded_len(values.len as u64);
+    var i: usize = 0;
+    while i < values.len {
+        total = total + chunk_ref_encoded_len(&values.ptr[i]);
+        i = i + 1;
+    }
+    return total;
+}
+
+export fn commit_payload_encoded_len(payload: &CommitPayload) usize {
+    return commit_id_list_encoded_len(payload.parents) +
+        identity_encoded_len(&payload.author) +
+        identity_encoded_len(&payload.committer) +
+        bytes_encoded_len(payload.message) +
+        8 +
+        HASH32_BYTES +
+        bytes_encoded_len(payload.changed_path_bloom.bytes) +
+        bytes_encoded_len(payload.module_bitmap.bytes) +
+        8;
+}
+
+export fn encode_commit_payload(output: &[byte], offset: &usize, payload: &CommitPayload) !void {
+    try encode_commit_id_list(output, offset, payload.parents);
+    try encode_identity(output, offset, &payload.author);
+    try encode_identity(output, offset, &payload.committer);
+    try encode_byte_list(output, offset, payload.message);
+    try codec_encode_i64(output, offset, payload.timestamp_ms);
+    try encode_manifest_id(output, offset, &payload.manifest_root);
+    try encode_byte_list(output, offset, payload.changed_path_bloom.bytes);
+    try encode_byte_list(output, offset, payload.module_bitmap.bytes);
+    try codec_encode_u64(output, offset, payload.generation);
+}
+
+export fn decode_commit_payload(arena: &Arena, input: &[byte], offset: &usize) !CommitPayload {
+    return CommitPayload{
+        parents: try decode_commit_id_list(arena, input, offset),
+        author: try decode_identity(input, offset),
+        committer: try decode_identity(input, offset),
+        message: try decode_byte_list(input, offset),
+        timestamp_ms: try codec_decode_i64(input, offset),
+        manifest_root: try decode_manifest_id(input, offset),
+        changed_path_bloom: BloomFilter{ bytes: try decode_byte_list(input, offset) },
+        module_bitmap: ModuleBitmap{ bytes: try decode_byte_list(input, offset) },
+        generation: try codec_decode_u64(input, offset),
+    };
+}
+
+export fn manifest_entry_encode(output: &[byte], offset: &usize, entry: &ManifestEntry) !void {
+    try encode_byte_list(output, offset, entry.name);
+    try codec_encode_enum_u16(output, offset, entry_kind_to_u16(entry.kind));
+    try codec_encode_u32(output, offset, entry.mode);
+    try encode_object_id(output, offset, &entry.object_id);
+    try codec_encode_u64(output, offset, entry.logical_size);
+    try codec_encode_enum_u16(output, offset, content_type_to_u16(entry.content_type));
+    try encode_policy_id(output, offset, &entry.policy_id);
+}
+
+export fn manifest_entry_decode(input: &[byte], offset: &usize) !ManifestEntry {
+    return ManifestEntry{
+        name: try decode_byte_list(input, offset),
+        kind: try decode_entry_kind(input, offset),
+        mode: try codec_decode_u32(input, offset),
+        object_id: try decode_object_id(input, offset),
+        logical_size: try codec_decode_u64(input, offset),
+        content_type: try decode_content_type(input, offset),
+        policy_id: try decode_policy_id(input, offset),
+    };
+}
+
+export fn manifest_child_encode(output: &[byte], offset: &usize, child: &ManifestChild) !void {
+    try encode_byte_list(output, offset, child.min_name);
+    try encode_byte_list(output, offset, child.max_name);
+    try encode_manifest_id(output, offset, &child.child_id);
+    try codec_encode_hash32(output, offset, &child.child_hash);
+}
+
+export fn manifest_child_decode(input: &[byte], offset: &usize) !ManifestChild {
+    return ManifestChild{
+        min_name: try decode_byte_list(input, offset),
+        max_name: try decode_byte_list(input, offset),
+        child_id: try decode_manifest_id(input, offset),
+        child_hash: try codec_decode_hash32(input, offset),
+    };
+}
+
+fn decode_manifest_entry_list(arena: &Arena, input: &[byte], offset: &usize) !ManifestEntryList {
+    const count_u64: u64 = try codec_decode_varuint(input, offset);
+    const count: usize = count_u64 as usize;
+    if count == 0 {
+        return ManifestEntryList{ ptr: null, len: 0 };
+    }
+    const raw: &ManifestEntry = arena_alloc(arena, @size_of(ManifestEntry) as usize * count) as &ManifestEntry;
+    if raw == null {
+        return error.ObjectCodecAlloc;
+    }
+
+    var i: usize = 0;
+    while i < count {
+        raw[i] = try manifest_entry_decode(input, offset);
+        i = i + 1;
+    }
+    return manifest_entry_list_from_slice(raw[0: count]);
+}
+
+fn decode_manifest_child_list(arena: &Arena, input: &[byte], offset: &usize) !ManifestChildList {
+    const count_u64: u64 = try codec_decode_varuint(input, offset);
+    const count: usize = count_u64 as usize;
+    if count == 0 {
+        return ManifestChildList{ ptr: null, len: 0 };
+    }
+    const raw: &ManifestChild = arena_alloc(arena, @size_of(ManifestChild) as usize * count) as &ManifestChild;
+    if raw == null {
+        return error.ObjectCodecAlloc;
+    }
+
+    var i: usize = 0;
+    while i < count {
+        raw[i] = try manifest_child_decode(input, offset);
+        i = i + 1;
+    }
+    return manifest_child_list_from_slice(raw[0: count]);
+}
+
+fn encode_manifest_entry_list(output: &[byte], offset: &usize, values: ManifestEntryList) !void {
+    try codec_encode_varuint(output, offset, values.len as u64);
+    var i: usize = 0;
+    while i < values.len {
+        try manifest_entry_encode(output, offset, &values.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn encode_manifest_child_list(output: &[byte], offset: &usize, values: ManifestChildList) !void {
+    try codec_encode_varuint(output, offset, values.len as u64);
+    var i: usize = 0;
+    while i < values.len {
+        try manifest_child_encode(output, offset, &values.ptr[i]);
+        i = i + 1;
+    }
+}
+
+export fn manifest_node_payload_encoded_len(payload: &ManifestNodePayload) usize {
+    return bytes_encoded_len(payload.prefix.bytes) +
+        2 +
+        4 +
+        4 +
+        manifest_entry_list_encoded_len(payload.entries) +
+        manifest_child_list_encoded_len(payload.children);
+}
+
+export fn encode_manifest_node_payload(output: &[byte], offset: &usize, payload: &ManifestNodePayload) !void {
+    try encode_byte_list(output, offset, payload.prefix.bytes);
+    try codec_encode_u16(output, offset, payload.level);
+    try codec_encode_u32(output, offset, payload.entry_count);
+    try codec_encode_u32(output, offset, payload.child_count);
+    try encode_manifest_entry_list(output, offset, payload.entries);
+    try encode_manifest_child_list(output, offset, payload.children);
+}
+
+export fn decode_manifest_node_payload(arena: &Arena, input: &[byte], offset: &usize) !ManifestNodePayload {
+    return ManifestNodePayload{
+        prefix: PathPrefix{ bytes: try decode_byte_list(input, offset) },
+        level: try codec_decode_u16(input, offset),
+        entry_count: try codec_decode_u32(input, offset),
+        child_count: try codec_decode_u32(input, offset),
+        entries: try decode_manifest_entry_list(arena, input, offset),
+        children: try decode_manifest_child_list(arena, input, offset),
+    };
+}
+
+export fn small_blob_payload_encoded_len(payload: &SmallBlobPayload) usize {
+    return 8 + HASH32_BYTES + bytes_encoded_len(payload.payload);
+}
+
+export fn encode_small_blob_payload(output: &[byte], offset: &usize, payload: &SmallBlobPayload) !void {
+    try codec_encode_u64(output, offset, payload.logical_size);
+    try codec_encode_hash32(output, offset, &payload.content_hash);
+    try encode_byte_list(output, offset, payload.payload);
+}
+
+export fn decode_small_blob_payload(input: &[byte], offset: &usize) !SmallBlobPayload {
+    return SmallBlobPayload{
+        logical_size: try codec_decode_u64(input, offset),
+        content_hash: try codec_decode_hash32(input, offset),
+        payload: try decode_byte_list(input, offset),
+    };
+}
+
+export fn chunk_ref_encode(output: &[byte], offset: &usize, value: &ChunkRef) !void {
+    try codec_encode_hash32(output, offset, &value.logical_chunk_id);
+    try codec_encode_hash32(output, offset, &value.storage_id);
+    try codec_encode_u64(output, offset, value.offset);
+    try codec_encode_u32(output, offset, value.logical_size);
+    try codec_encode_u32(output, offset, value.stored_size);
+    try codec_encode_hash32(output, offset, &value.checksum);
+    try codec_encode_enum_u16(output, offset, storage_tier_to_u16(value.storage_tier));
+}
+
+export fn chunk_ref_decode(input: &[byte], offset: &usize) !ChunkRef {
+    return ChunkRef{
+        logical_chunk_id: try codec_decode_hash32(input, offset),
+        storage_id: try codec_decode_hash32(input, offset),
+        offset: try codec_decode_u64(input, offset),
+        logical_size: try codec_decode_u32(input, offset),
+        stored_size: try codec_decode_u32(input, offset),
+        checksum: try codec_decode_hash32(input, offset),
+        storage_tier: try decode_storage_tier(input, offset),
+    };
+}
+
+fn encode_chunk_ref_list(output: &[byte], offset: &usize, values: ChunkRefList) !void {
+    try codec_encode_varuint(output, offset, values.len as u64);
+    var i: usize = 0;
+    while i < values.len {
+        try chunk_ref_encode(output, offset, &values.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn decode_chunk_ref_list(arena: &Arena, input: &[byte], offset: &usize) !ChunkRefList {
+    const count_u64: u64 = try codec_decode_varuint(input, offset);
+    const count: usize = count_u64 as usize;
+    if count == 0 {
+        return ChunkRefList{ ptr: null, len: 0 };
+    }
+    const raw: &ChunkRef = arena_alloc(arena, @size_of(ChunkRef) as usize * count) as &ChunkRef;
+    if raw == null {
+        return error.ObjectCodecAlloc;
+    }
+
+    var i: usize = 0;
+    while i < count {
+        raw[i] = try chunk_ref_decode(input, offset);
+        i = i + 1;
+    }
+    return chunk_ref_list_from_slice(raw[0: count]);
+}
+
+export fn chunked_blob_payload_encoded_len(payload: &ChunkedBlobPayload) usize {
+    return 8 + 2 + 2 + 4 + chunk_ref_list_encoded_len(payload.chunks) + HASH32_BYTES + HASH32_BYTES + 2;
+}
+
+export fn encode_chunked_blob_payload(output: &[byte], offset: &usize, payload: &ChunkedBlobPayload) !void {
+    try codec_encode_u64(output, offset, payload.logical_size);
+    try codec_encode_enum_u16(output, offset, file_type_to_u16(payload.file_type));
+    try codec_encode_enum_u16(output, offset, chunking_strategy_to_u16(payload.chunking_strategy));
+    try codec_encode_u32(output, offset, payload.chunk_count);
+    try encode_chunk_ref_list(output, offset, payload.chunks);
+    try codec_encode_hash32(output, offset, &payload.content_fingerprint);
+    try encode_policy_id(output, offset, &payload.encryption_profile);
+    try codec_encode_enum_u16(output, offset, dedupe_scope_to_u16(payload.dedupe_scope));
+}
+
+export fn decode_chunked_blob_payload(arena: &Arena, input: &[byte], offset: &usize) !ChunkedBlobPayload {
+    return ChunkedBlobPayload{
+        logical_size: try codec_decode_u64(input, offset),
+        file_type: try decode_file_type(input, offset),
+        chunking_strategy: try decode_chunking_strategy(input, offset),
+        chunk_count: try codec_decode_u32(input, offset),
+        chunks: try decode_chunk_ref_list(arena, input, offset),
+        content_fingerprint: try codec_decode_hash32(input, offset),
+        encryption_profile: try decode_policy_id(input, offset),
+        dedupe_scope: try decode_dedupe_scope(input, offset),
+    };
+}
+
+export fn published_view_payload_encoded_len(payload: &PublishedView) usize {
+    return HASH32_BYTES + HASH32_BYTES + HASH32_BYTES + 8 + 8 + 8;
+}
+
+export fn encode_published_view_payload(output: &[byte], offset: &usize, payload: &PublishedView) !void {
+    try encode_commit_id(output, offset, &payload.head_commit);
+    try encode_manifest_id(output, offset, &payload.manifest_root);
+    try encode_object_id(output, offset, &payload.serving_index_snapshot);
+    try codec_encode_u64(output, offset, payload.lineage_watermark);
+    try codec_encode_u64(output, offset, payload.dependency_watermark);
+    try codec_encode_i64(output, offset, payload.created_at_ms);
+}
+
+export fn decode_published_view_payload(input: &[byte], offset: &usize) !PublishedView {
+    return PublishedView{
+        head_commit: try decode_commit_id(input, offset),
+        manifest_root: try decode_manifest_id(input, offset),
+        serving_index_snapshot: try decode_object_id(input, offset),
+        lineage_watermark: try codec_decode_u64(input, offset),
+        dependency_watermark: try codec_decode_u64(input, offset),
+        created_at_ms: try codec_decode_i64(input, offset),
+    };
+}
+
+fn arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.ObjectCodecAlloc;
+    }
+    return raw[0: len];
+}
+
+export fn commit_payload_to_canonical(arena: &Arena, payload: &CommitPayload) !ByteList {
+    const len: usize = commit_payload_encoded_len(payload);
+    const out: &[byte] = try arena_bytes(arena, len);
+    var offset: usize = 0;
+    try encode_commit_payload(out, &offset, payload);
+    if offset != len {
+        return error.CodecNonCanonical;
+    }
+    return ByteList{ ptr: out.ptr, len: len };
+}
+
+export fn manifest_node_payload_to_canonical(arena: &Arena, payload: &ManifestNodePayload) !ByteList {
+    const len: usize = manifest_node_payload_encoded_len(payload);
+    const out: &[byte] = try arena_bytes(arena, len);
+    var offset: usize = 0;
+    try encode_manifest_node_payload(out, &offset, payload);
+    if offset != len {
+        return error.CodecNonCanonical;
+    }
+    return ByteList{ ptr: out.ptr, len: len };
+}
+
+export fn small_blob_payload_to_canonical(arena: &Arena, payload: &SmallBlobPayload) !ByteList {
+    const len: usize = small_blob_payload_encoded_len(payload);
+    const out: &[byte] = try arena_bytes(arena, len);
+    var offset: usize = 0;
+    try encode_small_blob_payload(out, &offset, payload);
+    if offset != len {
+        return error.CodecNonCanonical;
+    }
+    return ByteList{ ptr: out.ptr, len: len };
+}
+
+export fn chunked_blob_payload_to_canonical(arena: &Arena, payload: &ChunkedBlobPayload) !ByteList {
+    const len: usize = chunked_blob_payload_encoded_len(payload);
+    const out: &[byte] = try arena_bytes(arena, len);
+    var offset: usize = 0;
+    try encode_chunked_blob_payload(out, &offset, payload);
+    if offset != len {
+        return error.CodecNonCanonical;
+    }
+    return ByteList{ ptr: out.ptr, len: len };
+}
+
+export fn published_view_payload_to_canonical(arena: &Arena, payload: &PublishedView) !ByteList {
+    const len: usize = published_view_payload_encoded_len(payload);
+    const out: &[byte] = try arena_bytes(arena, len);
+    var offset: usize = 0;
+    try encode_published_view_payload(out, &offset, payload);
+    if offset != len {
+        return error.CodecNonCanonical;
+    }
+    return ByteList{ ptr: out.ptr, len: len };
+}
+
+fn object_payload_slice(payload: ByteList) &[byte] {
+    return payload.ptr[0: payload.len];
+}
+
+fn decode_expected_kind(decoded: DecodedObject, expected: ObjectKind) !void {
+    const actual: ObjectKind = object_kind_from_u16(decoded.envelope.kind) catch |err| {
+        _ = err;
+        return error.CodecNonCanonical;
+    };
+    if actual != expected {
+        return error.ObjectUnexpectedKind;
+    }
+}
+
+export fn encode_commit_object(arena: &Arena, output: &[byte], offset: &usize, payload: &CommitPayload) !void {
+    const encoded: ByteList = try commit_payload_to_canonical(arena, payload);
+    try codec_encode_object(output, offset, object_kind_to_u16(ObjectKind.Commit), 0 as u16, object_payload_slice(encoded));
+}
+
+export fn decode_commit_object(arena: &Arena, input: &[byte], offset: &usize) !CommitPayload {
+    const decoded: DecodedObject = try codec_decode_object(input, offset);
+    try decode_expected_kind(decoded, ObjectKind.Commit);
+    var payload_offset: usize = 0;
+    return try decode_commit_payload(arena, decoded.payload.ptr[0: decoded.payload.len], &payload_offset);
+}
+
+export fn encode_manifest_node_object(arena: &Arena, output: &[byte], offset: &usize, payload: &ManifestNodePayload) !void {
+    const encoded: ByteList = try manifest_node_payload_to_canonical(arena, payload);
+    try codec_encode_object(output, offset, object_kind_to_u16(ObjectKind.ManifestNode), 0 as u16, object_payload_slice(encoded));
+}
+
+export fn decode_manifest_node_object(arena: &Arena, input: &[byte], offset: &usize) !ManifestNodePayload {
+    const decoded: DecodedObject = try codec_decode_object(input, offset);
+    try decode_expected_kind(decoded, ObjectKind.ManifestNode);
+    var payload_offset: usize = 0;
+    return try decode_manifest_node_payload(arena, decoded.payload.ptr[0: decoded.payload.len], &payload_offset);
+}
+
+export fn encode_small_blob_object(arena: &Arena, output: &[byte], offset: &usize, payload: &SmallBlobPayload) !void {
+    const encoded: ByteList = try small_blob_payload_to_canonical(arena, payload);
+    try codec_encode_object(output, offset, object_kind_to_u16(ObjectKind.SmallBlob), 0 as u16, object_payload_slice(encoded));
+}
+
+export fn decode_small_blob_object(input: &[byte], offset: &usize) !SmallBlobPayload {
+    const decoded: DecodedObject = try codec_decode_object(input, offset);
+    try decode_expected_kind(decoded, ObjectKind.SmallBlob);
+    var payload_offset: usize = 0;
+    return try decode_small_blob_payload(decoded.payload.ptr[0: decoded.payload.len], &payload_offset);
+}
+
+export fn encode_chunked_blob_object(arena: &Arena, output: &[byte], offset: &usize, payload: &ChunkedBlobPayload) !void {
+    const encoded: ByteList = try chunked_blob_payload_to_canonical(arena, payload);
+    try codec_encode_object(output, offset, object_kind_to_u16(ObjectKind.ChunkedBlob), 0 as u16, object_payload_slice(encoded));
+}
+
+export fn decode_chunked_blob_object(arena: &Arena, input: &[byte], offset: &usize) !ChunkedBlobPayload {
+    const decoded: DecodedObject = try codec_decode_object(input, offset);
+    try decode_expected_kind(decoded, ObjectKind.ChunkedBlob);
+    var payload_offset: usize = 0;
+    return try decode_chunked_blob_payload(arena, decoded.payload.ptr[0: decoded.payload.len], &payload_offset);
+}
+
+export fn encode_published_view_object(arena: &Arena, output: &[byte], offset: &usize, payload: &PublishedView) !void {
+    const encoded: ByteList = try published_view_payload_to_canonical(arena, payload);
+    try codec_encode_object(output, offset, object_kind_to_u16(ObjectKind.PublishedView), 0 as u16, object_payload_slice(encoded));
+}
+
+export fn decode_published_view_object(input: &[byte], offset: &usize) !PublishedView {
+    const decoded: DecodedObject = try codec_decode_object(input, offset);
+    try decode_expected_kind(decoded, ObjectKind.PublishedView);
+    var payload_offset: usize = 0;
+    return try decode_published_view_payload(decoded.payload.ptr[0: decoded.payload.len], &payload_offset);
+}
+
+export fn decode_object_kind(input: &[byte], offset: &usize) !ObjectKind {
+    const decoded: DecodedObject = try codec_decode_object(input, offset);
+    return object_kind_from_u16(decoded.envelope.kind) catch |err| {
+        _ = err;
+        return error.CodecNonCanonical;
+    };
+}

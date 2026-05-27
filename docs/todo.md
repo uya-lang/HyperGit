@@ -88,54 +88,54 @@
 
 ## 5. Object Model
 
-- [ ] 实现 `ObjectKind`。
-- [ ] 实现 `StoredObject<T>` wrapper。
-- [ ] 实现 `CommitPayload` 结构。
-- [ ] 实现 `Identity` 结构。
-- [ ] 实现 `ManifestNodePayload` 结构。
-- [ ] 实现 `ManifestEntry` 结构。
-- [ ] 实现 `ManifestChild` 结构。
-- [ ] 实现 `SmallBlobPayload` 结构。
-- [ ] 实现 `ChunkedBlobPayload` 结构。
-- [ ] 实现 `ChunkRef` 结构。
-- [ ] 实现 `PublishedView` 结构。
-- [ ] 实现每类对象 codec。
-- [ ] 实现每类对象 hash。
-- [ ] 实现每类对象 validate。
-- [ ] 测试 commit 编码稳定性。
-- [ ] 测试 manifest entry 排序约束。
-- [ ] 测试非法 object kind 被拒绝。
+- [x] 实现 `ObjectKind`。
+- [x] 实现 `StoredObject<T>` wrapper。
+- [x] 实现 `CommitPayload` 结构。
+- [x] 实现 `Identity` 结构。
+- [x] 实现 `ManifestNodePayload` 结构。
+- [x] 实现 `ManifestEntry` 结构。
+- [x] 实现 `ManifestChild` 结构。
+- [x] 实现 `SmallBlobPayload` 结构。
+- [x] 实现 `ChunkedBlobPayload` 结构。
+- [x] 实现 `ChunkRef` 结构。
+- [x] 实现 `PublishedView` 结构。
+- [x] 实现每类对象 codec。
+- [x] 实现每类对象 hash。
+- [x] 实现每类对象 validate。
+- [x] 测试 commit 编码稳定性。
+- [x] 测试 manifest entry 排序约束。
+- [x] 测试非法 object kind 被拒绝。
 
 ## 6. 本地仓库布局
 
-- [ ] 定义 `.hgit/` 目录结构常量。
-- [ ] 实现 repo root 探测。
-- [ ] 实现 `.hgit/config.json` 读写。
-- [ ] 实现 `refs/heads` 目录创建。
-- [ ] 实现 `objects/loose` 目录创建。
-- [ ] 实现 `objects/packs` 目录创建。
-- [ ] 实现 `indexes` 目录创建。
-- [ ] 实现 `workspace` 目录创建。
-- [ ] 实现重复 `hgx init` 的幂等行为。
-- [ ] 实现非空错误和权限错误处理。
-- [ ] 测试空目录初始化。
-- [ ] 测试嵌套目录 repo root 探测。
+- [x] 定义 `.hgit/` 目录结构常量。
+- [x] 实现 repo root 探测。
+- [x] 实现 `.hgit/config.json` 读写。
+- [x] 实现 `refs/heads` 目录创建。
+- [x] 实现 `objects/loose` 目录创建。
+- [x] 实现 `objects/packs` 目录创建。
+- [x] 实现 `indexes` 目录创建。
+- [x] 实现 `workspace` 目录创建。
+- [x] 实现重复 `hgx init` 的幂等行为。
+- [x] 实现非空错误和权限错误处理。
+- [x] 测试空目录初始化。
+- [x] 测试嵌套目录 repo root 探测。
 
 ## 7. Loose Object Store
 
-- [ ] 定义 `ObjectStore` interface。
-- [ ] 实现 loose object path 映射。
-- [ ] 实现对象临时文件写入。
-- [ ] 实现原子 rename 发布。
-- [ ] 实现 `has`。
-- [ ] 实现 `get`。
-- [ ] 实现 `put`。
-- [ ] 实现读取时 hash 校验。
-- [ ] 实现重复 put 去重。
-- [ ] 实现损坏对象错误。
-- [ ] 测试 put/get roundtrip。
-- [ ] 测试并发重复 put。
-- [ ] 测试对象文件被截断。
+- [x] 定义 `ObjectStore` interface。
+- [x] 实现 loose object path 映射。
+- [x] 实现对象临时文件写入。
+- [x] 实现原子 rename 发布。
+- [x] 实现 `has`。
+- [x] 实现 `get`。
+- [x] 实现 `put`。
+- [x] 实现读取时 hash 校验。
+- [x] 实现重复 put 去重。
+- [x] 实现损坏对象错误。
+- [x] 测试 put/get roundtrip。
+- [x] 测试并发重复 put。
+- [x] 测试对象文件被截断。
 
 ## 8. Manifest
 

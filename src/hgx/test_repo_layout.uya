@@ -1,0 +1,62 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+
+use libc.chdir;
+use libc.system;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoInitResult;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_current_dir;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_init_current_dir;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_equal;
+use store.repo_layout.repo_read_config;
+
+fn test_repo_init_and_root_detection() !void {
+    const setup_status: i32 = system("rm -rf build/repo-layout-test && mkdir -p build/repo-layout-test/empty");
+    try expect(setup_status == 0);
+
+    const original_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("build/repo-layout-test/empty") == 0);
+
+    const init_result: RepoInitResult = try repo_init_current_dir();
+    try expect(init_result.created_new == true);
+    const config: RepoConfig = try repo_read_config(&init_result.repo_root);
+    try expect(config.format_version == 1 as u16);
+    try expect(config.default_branch_len == 4 as usize);
+    try expect(config.default_branch[0] == 'm' as byte);
+
+    try expect(system("mkdir -p nested/inside") == 0);
+    try expect(chdir("nested/inside") == 0);
+    const detected_root: RepoPath = try repo_find_root_from_cwd();
+    try expect(repo_path_equal(&detected_root, &init_result.repo_root));
+
+    try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
+}
+
+fn test_repo_init_non_empty_error() !void {
+    const setup_status: i32 = system("rm -rf build/repo-layout-test-nonempty && mkdir -p build/repo-layout-test-nonempty && printf data > build/repo-layout-test-nonempty/file.txt");
+    try expect(setup_status == 0);
+
+    const original_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("build/repo-layout-test-nonempty") == 0);
+
+    const result: RepoInitResult = repo_init_current_dir() catch |err| {
+        try expect(@error_id(err) == @error_id(error.RepoInitNonEmpty));
+        try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
+        return;
+    };
+    _ = result;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Repo Layout Tests");
+    run_test("repo init and root detection", test_repo_init_and_root_detection);
+    run_test("repo init non-empty error", test_repo_init_non_empty_error);
+    return test_suite_end();
+}

@@ -1,0 +1,229 @@
+use core.ids.ObjectId;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.PolicyId;
+
+error ObjectInvalidKind;
+
+export enum ObjectKind {
+    Commit,
+    ManifestNode,
+    SmallBlob,
+    ChunkedBlob,
+    PublishedView
+}
+
+export fn object_kind_max_value() u16 {
+    return 4 as u16;
+}
+
+export fn object_kind_to_u16(kind: ObjectKind) u16 {
+    if kind == ObjectKind.Commit {
+        return 0 as u16;
+    }
+    if kind == ObjectKind.ManifestNode {
+        return 1 as u16;
+    }
+    if kind == ObjectKind.SmallBlob {
+        return 2 as u16;
+    }
+    if kind == ObjectKind.ChunkedBlob {
+        return 3 as u16;
+    }
+    return 4 as u16;
+}
+
+export fn object_kind_from_u16(value: u16) !ObjectKind {
+    if value == 0 as u16 {
+        return ObjectKind.Commit;
+    }
+    if value == 1 as u16 {
+        return ObjectKind.ManifestNode;
+    }
+    if value == 2 as u16 {
+        return ObjectKind.SmallBlob;
+    }
+    if value == 3 as u16 {
+        return ObjectKind.ChunkedBlob;
+    }
+    if value == 4 as u16 {
+        return ObjectKind.PublishedView;
+    }
+    return error.ObjectInvalidKind;
+}
+
+export struct StoredObject<T> {
+    object_id: ObjectId,
+    payload: T
+}
+
+export struct ByteList {
+    ptr: &byte,
+    len: usize
+}
+
+export fn byte_list_from_slice(slice: &[byte]) ByteList {
+    return ByteList{ ptr: slice.ptr, len: slice.len };
+}
+
+export struct CommitIdList {
+    ptr: &CommitId,
+    len: usize
+}
+
+export fn commit_id_list_from_slice(slice: &[CommitId]) CommitIdList {
+    return CommitIdList{ ptr: slice.ptr, len: slice.len };
+}
+
+export struct BloomFilter {
+    bytes: ByteList
+}
+
+export struct ModuleBitmap {
+    bytes: ByteList
+}
+
+export struct Identity {
+    name: ByteList,
+    email: ByteList
+}
+
+export struct CommitPayload {
+    parents: CommitIdList,
+    author: Identity,
+    committer: Identity,
+    message: ByteList,
+    timestamp_ms: i64,
+    manifest_root: ManifestId,
+    changed_path_bloom: BloomFilter,
+    module_bitmap: ModuleBitmap,
+    generation: u64
+}
+
+export struct PathPrefix {
+    bytes: ByteList
+}
+
+export enum EntryKind {
+    File,
+    Executable,
+    Symlink
+}
+
+export enum ContentType {
+    Unknown,
+    Utf8Text,
+    Binary
+}
+
+export struct ManifestEntry {
+    name: ByteList,
+    kind: EntryKind,
+    mode: u32,
+    object_id: ObjectId,
+    logical_size: u64,
+    content_type: ContentType,
+    policy_id: PolicyId
+}
+
+export struct ManifestChild {
+    min_name: ByteList,
+    max_name: ByteList,
+    child_id: ManifestId,
+    child_hash: Hash32
+}
+
+export struct ManifestEntryList {
+    ptr: &ManifestEntry,
+    len: usize
+}
+
+export fn manifest_entry_list_from_slice(slice: &[ManifestEntry]) ManifestEntryList {
+    return ManifestEntryList{ ptr: slice.ptr, len: slice.len };
+}
+
+export struct ManifestChildList {
+    ptr: &ManifestChild,
+    len: usize
+}
+
+export fn manifest_child_list_from_slice(slice: &[ManifestChild]) ManifestChildList {
+    return ManifestChildList{ ptr: slice.ptr, len: slice.len };
+}
+
+export struct ManifestNodePayload {
+    prefix: PathPrefix,
+    level: u16,
+    entry_count: u32,
+    child_count: u32,
+    entries: ManifestEntryList,
+    children: ManifestChildList
+}
+
+export struct SmallBlobPayload {
+    logical_size: u64,
+    content_hash: Hash32,
+    payload: ByteList
+}
+
+export enum FileType {
+    Regular,
+    Binary,
+    Archive
+}
+
+export enum ChunkingStrategy {
+    Fixed,
+    ContentDefined
+}
+
+export enum DedupeScope {
+    Repository,
+    Global
+}
+
+export enum StorageTier {
+    Hot,
+    Warm,
+    Cold
+}
+
+export struct ChunkRef {
+    logical_chunk_id: Hash32,
+    storage_id: Hash32,
+    offset: u64,
+    logical_size: u32,
+    stored_size: u32,
+    checksum: Hash32,
+    storage_tier: StorageTier
+}
+
+export struct ChunkRefList {
+    ptr: &ChunkRef,
+    len: usize
+}
+
+export fn chunk_ref_list_from_slice(slice: &[ChunkRef]) ChunkRefList {
+    return ChunkRefList{ ptr: slice.ptr, len: slice.len };
+}
+
+export struct ChunkedBlobPayload {
+    logical_size: u64,
+    file_type: FileType,
+    chunking_strategy: ChunkingStrategy,
+    chunk_count: u32,
+    chunks: ChunkRefList,
+    content_fingerprint: Hash32,
+    encryption_profile: PolicyId,
+    dedupe_scope: DedupeScope
+}
+
+export struct PublishedView {
+    head_commit: CommitId,
+    manifest_root: ManifestId,
+    serving_index_snapshot: ObjectId,
+    lineage_watermark: u64,
+    dependency_watermark: u64,
+    created_at_ms: i64
+}

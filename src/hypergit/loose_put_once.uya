@@ -1,0 +1,23 @@
+use std.runtime.entry;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+
+use object.types.ObjectKind;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+
+export fn main() i32 {
+    if get_argc() < 2 {
+        return 2;
+    }
+
+    const root: &byte = get_argv(1);
+    const store: LooseObjectStore = loose_store_open(root) catch {
+        return 1;
+    };
+    var payload: [byte: 7] = ['p' as byte, 'a' as byte, 'y' as byte, 'l' as byte, 'o' as byte, 'a' as byte, 'd' as byte];
+    _ = store.put(ObjectKind.Commit, payload[0: 7]) catch {
+        return 1;
+    };
+    return 0;
+}

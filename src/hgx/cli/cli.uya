@@ -1,6 +1,7 @@
 use std.string.strcmp;
 
 export const EXIT_OK: i32 = 0;
+export const EXIT_RUNTIME_ERROR: i32 = 1;
 export const EXIT_USAGE_ERROR: i32 = 2;
 export const EXIT_NOT_IMPLEMENTED: i32 = 3;
 

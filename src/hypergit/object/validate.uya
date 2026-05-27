@@ -1,0 +1,177 @@
+use core.codec.codec_hash_payload;
+use core.ids.Hash32;
+use core.ids.hash32_compare;
+use object.types.ByteList;
+use object.types.Identity;
+use object.types.CommitPayload;
+use object.types.ManifestEntry;
+use object.types.ManifestChild;
+use object.types.ManifestNodePayload;
+use object.types.SmallBlobPayload;
+use object.types.ChunkRef;
+use object.types.ChunkedBlobPayload;
+use object.types.PublishedView;
+
+error ObjectInvalidIdentity;
+error ObjectInvalidCommitPayload;
+error ObjectInvalidManifestEntry;
+error ObjectInvalidManifestChild;
+error ObjectManifestEntryCountMismatch;
+error ObjectManifestChildCountMismatch;
+error ObjectManifestEntryOrder;
+error ObjectManifestChildOrder;
+error ObjectManifestChildOverlap;
+error ObjectSmallBlobSizeMismatch;
+error ObjectSmallBlobHashMismatch;
+error ObjectInvalidChunkRef;
+error ObjectChunkCountMismatch;
+error ObjectChunkSizeMismatch;
+
+fn byte_list_compare(left: ByteList, right: ByteList) i32 {
+    var i: usize = 0;
+    var limit: usize = left.len;
+    if right.len < limit {
+        limit = right.len;
+    }
+
+    while i < limit {
+        if left.ptr[i] < right.ptr[i] {
+            return -1;
+        }
+        if left.ptr[i] > right.ptr[i] {
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    if left.len < right.len {
+        return -1;
+    }
+    if left.len > right.len {
+        return 1;
+    }
+    return 0;
+}
+
+fn byte_list_contains(value: ByteList, needle: byte) bool {
+    var i: usize = 0;
+    while i < value.len {
+        if value.ptr[i] == needle {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+export fn validate_identity(identity: &Identity) !void {
+    if identity.name.len == 0 || identity.email.len == 0 {
+        return error.ObjectInvalidIdentity;
+    }
+    if !byte_list_contains(identity.email, '@' as byte) {
+        return error.ObjectInvalidIdentity;
+    }
+}
+
+export fn validate_commit_payload(payload: &CommitPayload) !void {
+    try validate_identity(&payload.author);
+    try validate_identity(&payload.committer);
+    if payload.parents.len > 0 && payload.parents.ptr == null {
+        return error.ObjectInvalidCommitPayload;
+    }
+    if payload.message.len > 0 && payload.message.ptr == null {
+        return error.ObjectInvalidCommitPayload;
+    }
+}
+
+export fn validate_manifest_entry(entry: &ManifestEntry) !void {
+    if entry.name.len == 0 {
+        return error.ObjectInvalidManifestEntry;
+    }
+}
+
+export fn validate_manifest_child(child: &ManifestChild) !void {
+    if child.min_name.len == 0 || child.max_name.len == 0 {
+        return error.ObjectInvalidManifestChild;
+    }
+    if byte_list_compare(child.min_name, child.max_name) > 0 {
+        return error.ObjectInvalidManifestChild;
+    }
+}
+
+export fn validate_manifest_node_payload(payload: &ManifestNodePayload) !void {
+    if payload.entry_count as usize != payload.entries.len {
+        return error.ObjectManifestEntryCountMismatch;
+    }
+    if payload.child_count as usize != payload.children.len {
+        return error.ObjectManifestChildCountMismatch;
+    }
+
+    var i: usize = 0;
+    while i < payload.entries.len {
+        try validate_manifest_entry(&payload.entries.ptr[i]);
+        if i > 0 && byte_list_compare(payload.entries.ptr[i - 1].name, payload.entries.ptr[i].name) >= 0 {
+            return error.ObjectManifestEntryOrder;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < payload.children.len {
+        try validate_manifest_child(&payload.children.ptr[i]);
+        if i > 0 {
+            if byte_list_compare(payload.children.ptr[i - 1].min_name, payload.children.ptr[i].min_name) >= 0 {
+                return error.ObjectManifestChildOrder;
+            }
+            if byte_list_compare(payload.children.ptr[i - 1].max_name, payload.children.ptr[i].min_name) >= 0 {
+                return error.ObjectManifestChildOverlap;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+export fn validate_small_blob_payload(payload: &SmallBlobPayload) !void {
+    if payload.logical_size != payload.payload.len as u64 {
+        return error.ObjectSmallBlobSizeMismatch;
+    }
+
+    var empty: [byte: 1] = [];
+    var content: &[byte] = empty[0: 0];
+    if payload.payload.len > 0 {
+        content = payload.payload.ptr[0: payload.payload.len];
+    }
+    const actual: Hash32 = codec_hash_payload(content);
+    if hash32_compare(&actual, &payload.content_hash) != 0 {
+        return error.ObjectSmallBlobHashMismatch;
+    }
+}
+
+export fn validate_chunk_ref(value: &ChunkRef) !void {
+    if value.logical_size == 0u32 || value.stored_size == 0u32 {
+        return error.ObjectInvalidChunkRef;
+    }
+}
+
+export fn validate_chunked_blob_payload(payload: &ChunkedBlobPayload) !void {
+    if payload.chunk_count as usize != payload.chunks.len {
+        return error.ObjectChunkCountMismatch;
+    }
+
+    var total: u64 = 0u64;
+    var i: usize = 0;
+    while i < payload.chunks.len {
+        try validate_chunk_ref(&payload.chunks.ptr[i]);
+        total = total + payload.chunks.ptr[i].logical_size as u64;
+        i = i + 1;
+    }
+
+    if total != payload.logical_size {
+        return error.ObjectChunkSizeMismatch;
+    }
+}
+
+export fn validate_published_view(view: &PublishedView) !void {
+    _ = view;
+    return;
+}

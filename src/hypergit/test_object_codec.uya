@@ -1,0 +1,354 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.codec.codec_encode_object;
+use core.codec.codec_hash_payload;
+use core.ids.Hash32;
+use core.ids.CommitId;
+use core.ids.ManifestId;
+use core.ids.BlobId;
+use core.ids.PublishedViewId;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use core.ids.manifest_id_from_object;
+use core.ids.policy_id_from_object;
+use core.ids.commit_id_compare;
+use core.ids.manifest_id_compare;
+use core.ids.blob_id_compare;
+use core.ids.published_view_id_compare;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use object.types.BloomFilter;
+use object.types.ModuleBitmap;
+use object.types.Identity;
+use object.types.CommitPayload;
+use object.types.PathPrefix;
+use object.types.EntryKind;
+use object.types.ContentType;
+use object.types.ManifestEntry;
+use object.types.ManifestChild;
+use object.types.ManifestNodePayload;
+use object.types.SmallBlobPayload;
+use object.types.FileType;
+use object.types.ChunkingStrategy;
+use object.types.DedupeScope;
+use object.types.StorageTier;
+use object.types.ChunkRef;
+use object.types.ChunkedBlobPayload;
+use object.types.PublishedView;
+use object.types.byte_list_from_slice;
+use object.types.commit_id_list_from_slice;
+use object.types.manifest_entry_list_from_slice;
+use object.types.manifest_child_list_from_slice;
+use object.types.chunk_ref_list_from_slice;
+use object.codec.encode_commit_object;
+use object.codec.decode_commit_object;
+use object.codec.encode_manifest_node_object;
+use object.codec.decode_manifest_node_object;
+use object.codec.encode_small_blob_object;
+use object.codec.decode_small_blob_object;
+use object.codec.encode_chunked_blob_object;
+use object.codec.decode_chunked_blob_object;
+use object.codec.encode_published_view_object;
+use object.codec.decode_published_view_object;
+use object.codec.decode_object_kind;
+use object.hash.hash_commit_payload;
+use object.hash.hash_manifest_node_payload;
+use object.hash.hash_small_blob_payload;
+use object.hash.hash_chunked_blob_payload;
+use object.hash.hash_published_view;
+use object.validate.validate_commit_payload;
+use object.validate.validate_manifest_node_payload;
+use object.validate.validate_small_blob_payload;
+use object.validate.validate_chunked_blob_payload;
+use object.validate.validate_published_view;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn bytes_equal(left: &[byte], right: &[byte]) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn test_commit_encoding_stability() !void {
+    var arena_left_buf: [byte: 8192] = [];
+    var arena_left: Arena = Arena{ buffer: &arena_left_buf[0], size: 0, used: 0 };
+    arena_init(&arena_left, &arena_left_buf[0], 8192 as usize);
+    var arena_right_buf: [byte: 8192] = [];
+    var arena_right: Arena = Arena{ buffer: &arena_right_buf[0], size: 0, used: 0 };
+    arena_init(&arena_right, &arena_right_buf[0], 8192 as usize);
+
+    var parent_ids: [CommitId: 2] = [
+        commit_id_from_object(object_id_from_hash(make_hash(1 as byte))),
+        commit_id_from_object(object_id_from_hash(make_hash(2 as byte))),
+    ];
+    var name: [byte: 5] = ['a' as byte, 'l' as byte, 'i' as byte, 'c' as byte, 'e' as byte];
+    var mail: [byte: 17] = ['a' as byte, 'l' as byte, 'i' as byte, 'c' as byte, 'e' as byte, '@' as byte, 'e' as byte, 'x' as byte, 'a' as byte, 'm' as byte, 'p' as byte, 'l' as byte, 'e' as byte, '.' as byte, 'c' as byte, 'o' as byte, 'm' as byte];
+    var message: [byte: 11] = ['s' as byte, 't' as byte, 'a' as byte, 'b' as byte, 'l' as byte, 'e' as byte, ' ' as byte, 'c' as byte, 'o' as byte, 'm' as byte, 'm' as byte];
+    const author: Identity = Identity{
+        name: byte_list_from_slice(name[0: 5]),
+        email: byte_list_from_slice(mail[0: 17]),
+    };
+    const committer: Identity = Identity{
+        name: byte_list_from_slice(name[0: 5]),
+        email: byte_list_from_slice(mail[0: 17]),
+    };
+    const payload: CommitPayload = CommitPayload{
+        parents: commit_id_list_from_slice(parent_ids[0: 2]),
+        author: author,
+        committer: committer,
+        message: byte_list_from_slice(message[0: 11]),
+        timestamp_ms: 100,
+        manifest_root: manifest_id_from_object(object_id_from_hash(make_hash(3 as byte))),
+        changed_path_bloom: BloomFilter{ bytes: ByteList{ ptr: null, len: 0 } },
+        module_bitmap: ModuleBitmap{ bytes: ByteList{ ptr: null, len: 0 } },
+        generation: 4u64,
+    };
+
+    var left: [byte: 512] = [];
+    var right: [byte: 512] = [];
+    var left_offset: usize = 0;
+    var right_offset: usize = 0;
+    try encode_commit_object(&arena_left, left[0: 512], &left_offset, &payload);
+    try encode_commit_object(&arena_right, right[0: 512], &right_offset, &payload);
+
+    try expect(left_offset == right_offset);
+    try expect(bytes_equal(left[0: left_offset], right[0: right_offset]));
+}
+
+fn test_object_roundtrip_hash_and_validate() !void {
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+    var decode_arena_buf: [byte: 32768] = [];
+    var decode_arena: Arena = Arena{ buffer: &decode_arena_buf[0], size: 0, used: 0 };
+    arena_init(&decode_arena, &decode_arena_buf[0], 32768 as usize);
+
+    var parent_ids: [CommitId: 1] = [commit_id_from_object(object_id_from_hash(make_hash(10 as byte)))];
+    var name: [byte: 3] = ['b' as byte, 'o' as byte, 'b' as byte];
+    var mail: [byte: 15] = ['b' as byte, 'o' as byte, 'b' as byte, '@' as byte, 'e' as byte, 'x' as byte, 'a' as byte, 'm' as byte, 'p' as byte, 'l' as byte, 'e' as byte, '.' as byte, 'c' as byte, 'o' as byte, 'm' as byte];
+    var commit_message: [byte: 6] = ['c' as byte, 'o' as byte, 'm' as byte, 'm' as byte, 'i' as byte, 't' as byte];
+    const commit_author: Identity = Identity{
+        name: byte_list_from_slice(name[0: 3]),
+        email: byte_list_from_slice(mail[0: 15]),
+    };
+    const commit_committer: Identity = Identity{
+        name: byte_list_from_slice(name[0: 3]),
+        email: byte_list_from_slice(mail[0: 15]),
+    };
+    const commit_payload: CommitPayload = CommitPayload{
+        parents: commit_id_list_from_slice(parent_ids[0: 1]),
+        author: commit_author,
+        committer: commit_committer,
+        message: byte_list_from_slice(commit_message[0: 6]),
+        timestamp_ms: 99,
+        manifest_root: manifest_id_from_object(object_id_from_hash(make_hash(11 as byte))),
+        changed_path_bloom: BloomFilter{ bytes: ByteList{ ptr: null, len: 0 } },
+        module_bitmap: ModuleBitmap{ bytes: ByteList{ ptr: null, len: 0 } },
+        generation: 12u64,
+    };
+    try validate_commit_payload(&commit_payload);
+    var commit_buf: [byte: 512] = [];
+    var commit_offset: usize = 0;
+    try encode_commit_object(&arena, commit_buf[0: 512], &commit_offset, &commit_payload);
+    var commit_read_offset: usize = 0;
+    const decoded_commit: CommitPayload = try decode_commit_object(&decode_arena, commit_buf[0: commit_offset], &commit_read_offset);
+    try expect(commit_read_offset == commit_offset);
+    try expect(decoded_commit.parents.len == 1 as usize);
+    try expect(decoded_commit.message.len == 6 as usize);
+    const commit_hash_a: CommitId = try hash_commit_payload(&arena, &commit_payload);
+    const commit_hash_b: CommitId = try hash_commit_payload(&arena, &commit_payload);
+    try expect(commit_id_compare(&commit_hash_a, &commit_hash_b) == 0);
+
+    var entry_name: [byte: 8] = ['r' as byte, 'e' as byte, 'a' as byte, 'd' as byte, 'm' as byte, 'e' as byte, '.' as byte, 'm' as byte];
+    var child_min: [byte: 1] = ['n' as byte];
+    var child_max: [byte: 1] = ['z' as byte];
+    const manifest_entry: ManifestEntry = ManifestEntry{
+        name: byte_list_from_slice(entry_name[0: 8]),
+        kind: EntryKind.File,
+        mode: 0o100644u32,
+        object_id: object_id_from_hash(make_hash(12 as byte)),
+        logical_size: 32u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: policy_id_from_object(object_id_from_hash(make_hash(13 as byte))),
+    };
+    const manifest_child: ManifestChild = ManifestChild{
+        min_name: byte_list_from_slice(child_min[0: 1]),
+        max_name: byte_list_from_slice(child_max[0: 1]),
+        child_id: manifest_id_from_object(object_id_from_hash(make_hash(14 as byte))),
+        child_hash: make_hash(15 as byte),
+    };
+    var entries: [ManifestEntry: 1] = [manifest_entry];
+    var children: [ManifestChild: 1] = [manifest_child];
+    const manifest_payload: ManifestNodePayload = ManifestNodePayload{
+        prefix: PathPrefix{ bytes: ByteList{ ptr: null, len: 0 } },
+        level: 1 as u16,
+        entry_count: 1u32,
+        child_count: 1u32,
+        entries: manifest_entry_list_from_slice(entries[0: 1]),
+        children: manifest_child_list_from_slice(children[0: 1]),
+    };
+    try validate_manifest_node_payload(&manifest_payload);
+    var manifest_buf: [byte: 512] = [];
+    var manifest_offset: usize = 0;
+    try encode_manifest_node_object(&arena, manifest_buf[0: 512], &manifest_offset, &manifest_payload);
+    var manifest_read_offset: usize = 0;
+    const decoded_manifest: ManifestNodePayload = try decode_manifest_node_object(&decode_arena, manifest_buf[0: manifest_offset], &manifest_read_offset);
+    try expect(decoded_manifest.entries.len == 1 as usize);
+    try expect(decoded_manifest.children.len == 1 as usize);
+    const manifest_hash_a: ManifestId = try hash_manifest_node_payload(&arena, &manifest_payload);
+    const manifest_hash_b: ManifestId = try hash_manifest_node_payload(&arena, &manifest_payload);
+    try expect(manifest_id_compare(&manifest_hash_a, &manifest_hash_b) == 0);
+
+    var blob_bytes: [byte: 4] = ['d' as byte, 'a' as byte, 't' as byte, 'a' as byte];
+    const small_blob_payload: SmallBlobPayload = SmallBlobPayload{
+        logical_size: 4u64,
+        content_hash: codec_hash_payload(blob_bytes[0: 4]),
+        payload: byte_list_from_slice(blob_bytes[0: 4]),
+    };
+    try validate_small_blob_payload(&small_blob_payload);
+    var small_blob_buf: [byte: 256] = [];
+    var small_blob_offset: usize = 0;
+    try encode_small_blob_object(&arena, small_blob_buf[0: 256], &small_blob_offset, &small_blob_payload);
+    var small_blob_read_offset: usize = 0;
+    const decoded_small_blob: SmallBlobPayload = try decode_small_blob_object(small_blob_buf[0: small_blob_offset], &small_blob_read_offset);
+    try expect(decoded_small_blob.payload.len == 4 as usize);
+    const small_blob_hash_a: BlobId = try hash_small_blob_payload(&arena, &small_blob_payload);
+    const small_blob_hash_b: BlobId = try hash_small_blob_payload(&arena, &small_blob_payload);
+    try expect(blob_id_compare(&small_blob_hash_a, &small_blob_hash_b) == 0);
+
+    const chunk_ref: ChunkRef = ChunkRef{
+        logical_chunk_id: make_hash(16 as byte),
+        storage_id: make_hash(17 as byte),
+        offset: 64u64,
+        logical_size: 4u32,
+        stored_size: 4u32,
+        checksum: make_hash(18 as byte),
+        storage_tier: StorageTier.Hot,
+    };
+    var chunks: [ChunkRef: 1] = [chunk_ref];
+    const chunked_blob_payload: ChunkedBlobPayload = ChunkedBlobPayload{
+        logical_size: 4u64,
+        file_type: FileType.Binary,
+        chunking_strategy: ChunkingStrategy.ContentDefined,
+        chunk_count: 1u32,
+        chunks: chunk_ref_list_from_slice(chunks[0: 1]),
+        content_fingerprint: make_hash(19 as byte),
+        encryption_profile: policy_id_from_object(object_id_from_hash(make_hash(20 as byte))),
+        dedupe_scope: DedupeScope.Repository,
+    };
+    try validate_chunked_blob_payload(&chunked_blob_payload);
+    var chunked_blob_buf: [byte: 512] = [];
+    var chunked_blob_offset: usize = 0;
+    try encode_chunked_blob_object(&arena, chunked_blob_buf[0: 512], &chunked_blob_offset, &chunked_blob_payload);
+    var chunked_blob_read_offset: usize = 0;
+    const decoded_chunked_blob: ChunkedBlobPayload = try decode_chunked_blob_object(&decode_arena, chunked_blob_buf[0: chunked_blob_offset], &chunked_blob_read_offset);
+    try expect(decoded_chunked_blob.chunks.len == 1 as usize);
+    const chunked_blob_hash_a: BlobId = try hash_chunked_blob_payload(&arena, &chunked_blob_payload);
+    const chunked_blob_hash_b: BlobId = try hash_chunked_blob_payload(&arena, &chunked_blob_payload);
+    try expect(blob_id_compare(&chunked_blob_hash_a, &chunked_blob_hash_b) == 0);
+
+    const view_payload: PublishedView = PublishedView{
+        head_commit: commit_id_from_object(object_id_from_hash(make_hash(21 as byte))),
+        manifest_root: manifest_id_from_object(object_id_from_hash(make_hash(22 as byte))),
+        serving_index_snapshot: object_id_from_hash(make_hash(23 as byte)),
+        lineage_watermark: 24u64,
+        dependency_watermark: 25u64,
+        created_at_ms: 26,
+    };
+    try validate_published_view(&view_payload);
+    var view_buf: [byte: 256] = [];
+    var view_offset: usize = 0;
+    try encode_published_view_object(&arena, view_buf[0: 256], &view_offset, &view_payload);
+    var view_read_offset: usize = 0;
+    const decoded_view: PublishedView = try decode_published_view_object(view_buf[0: view_offset], &view_read_offset);
+    try expect(decoded_view.lineage_watermark == 24u64);
+    const view_hash_a: PublishedViewId = try hash_published_view(&arena, &view_payload);
+    const view_hash_b: PublishedViewId = try hash_published_view(&arena, &view_payload);
+    try expect(published_view_id_compare(&view_hash_a, &view_hash_b) == 0);
+}
+
+fn test_manifest_entry_sort_constraint() !void {
+    var a_name: [byte: 1] = ['a' as byte];
+    var b_name: [byte: 1] = ['b' as byte];
+    const first: ManifestEntry = ManifestEntry{
+        name: byte_list_from_slice(b_name[0: 1]),
+        kind: EntryKind.File,
+        mode: 1u32,
+        object_id: object_id_from_hash(make_hash(30 as byte)),
+        logical_size: 1u64,
+        content_type: ContentType.Binary,
+        policy_id: policy_id_from_object(object_id_from_hash(make_hash(31 as byte))),
+    };
+    const second: ManifestEntry = ManifestEntry{
+        name: byte_list_from_slice(a_name[0: 1]),
+        kind: EntryKind.File,
+        mode: 1u32,
+        object_id: object_id_from_hash(make_hash(32 as byte)),
+        logical_size: 1u64,
+        content_type: ContentType.Binary,
+        policy_id: policy_id_from_object(object_id_from_hash(make_hash(33 as byte))),
+    };
+    var entries: [ManifestEntry: 2] = [first, second];
+    var empty_children: [ManifestChild: 1] = [];
+    const payload: ManifestNodePayload = ManifestNodePayload{
+        prefix: PathPrefix{ bytes: ByteList{ ptr: null, len: 0 } },
+        level: 0 as u16,
+        entry_count: 2u32,
+        child_count: 0u32,
+        entries: manifest_entry_list_from_slice(entries[0: 2]),
+        children: manifest_child_list_from_slice(empty_children[0: 0]),
+    };
+
+    validate_manifest_node_payload(&payload) catch |err| {
+        try expect(@error_id(err) == @error_id(error.ObjectManifestEntryOrder));
+        return;
+    };
+    return error.AssertionFailed;
+}
+
+fn test_illegal_object_kind_rejected() !void {
+    var payload: [byte: 1] = [7 as byte];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+    try codec_encode_object(buf[0: 128], &offset, 99 as u16, 0 as u16, payload[0: 1]);
+
+    var read_offset: usize = 0;
+    const kind: ObjectKind = decode_object_kind(buf[0: offset], &read_offset) catch |err| {
+        try expect(@error_id(err) == @error_id(error.CodecNonCanonical));
+        return;
+    };
+    _ = kind;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Object Codec Tests");
+    run_test("commit encoding stability", test_commit_encoding_stability);
+    run_test("object roundtrip hash and validate", test_object_roundtrip_hash_and_validate);
+    run_test("manifest entry sort constraint", test_manifest_entry_sort_constraint);
+    run_test("illegal object kind rejected", test_illegal_object_kind_rejected);
+    return test_suite_end();
+}

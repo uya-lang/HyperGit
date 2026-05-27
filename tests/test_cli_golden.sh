@@ -37,4 +37,3 @@ run_case() {
 
 run_case unknown 2 tests/golden/unknown.stderr status
 run_case doctor 3 tests/golden/doctor.stderr doctor
-run_case init 3 tests/golden/init.stderr init

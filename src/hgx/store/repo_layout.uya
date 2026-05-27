@@ -1,0 +1,467 @@
+use libc.DIR;
+use libc.Dirent;
+use libc.Stat;
+use libc.closedir;
+use libc.errno;
+use libc.getcwd;
+use libc.mkdir;
+use libc.opendir;
+use libc.readdir;
+use libc.stat;
+use libc.EACCES;
+use libc.EEXIST;
+use libc.ENOENT;
+use libc.EPERM;
+use libc.S_IRWXU;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.fwrite;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.json.encoder.json_expect_i64;
+use std.json.encoder.json_expect_str;
+use std.json.encoder.json_object_find_index;
+use std.json.parser.parse;
+use std.json.value.JsonObject;
+use std.json.value.JsonStrView;
+use std.json.value.JsonValue;
+use std.string.strlen;
+
+export const REPO_PATH_MAX: usize = 4096;
+const REPO_CONFIG_BYTES_MAX: usize = 512;
+const STAT_S_IFMT: u32 = 61440u32;
+const STAT_S_IFDIR: u32 = 16384u32;
+
+export const HGIT_DIR_NAME: &const byte = ".hgit";
+export const HGIT_CONFIG_REL: &const byte = ".hgit/config.json";
+export const HGIT_REFS_REL: &const byte = ".hgit/refs";
+export const HGIT_REFS_HEADS_REL: &const byte = ".hgit/refs/heads";
+export const HGIT_OBJECTS_REL: &const byte = ".hgit/objects";
+export const HGIT_OBJECTS_LOOSE_REL: &const byte = ".hgit/objects/loose";
+export const HGIT_OBJECTS_PACKS_REL: &const byte = ".hgit/objects/packs";
+export const HGIT_INDEXES_REL: &const byte = ".hgit/indexes";
+export const HGIT_WORKSPACE_REL: &const byte = ".hgit/workspace";
+
+error RepoPathTooLong;
+error RepoCurrentDirUnavailable;
+error RepoNotFound;
+error RepoPermissionDenied;
+error RepoExpectedDirectory;
+error RepoDirReadFailed;
+error RepoInitNonEmpty;
+error RepoConfigOpenFailed;
+error RepoConfigWriteFailed;
+error RepoConfigReadFailed;
+error RepoConfigInvalid;
+
+export struct RepoPath {
+    bytes: [byte: 4096] = [],
+    len: usize = 0
+}
+
+export struct RepoConfig {
+    format_version: u16,
+    default_branch: [byte: 64] = [],
+    default_branch_len: usize
+}
+
+export struct RepoInitResult {
+    repo_root: RepoPath,
+    created_new: bool
+}
+
+fn repo_path_empty() RepoPath {
+    return RepoPath{ bytes: [], len: 0 };
+}
+
+export fn repo_path_cstr(path: &RepoPath) &byte {
+    return &path.bytes[0];
+}
+
+fn repo_path_copy_bytes(path: &RepoPath, out: &RepoPath, limit: usize) void {
+    var i: usize = 0;
+    while i < limit {
+        out.bytes[i] = path.bytes[i];
+        i = i + 1;
+    }
+}
+
+export fn repo_path_equal(left: &RepoPath, right: &RepoPath) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.bytes[i] != right.bytes[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn repo_path_from_cstr(text: &byte) !RepoPath {
+    if text == null {
+        return error.RepoCurrentDirUnavailable;
+    }
+    const len: usize = strlen(text as &const byte);
+    if len >= REPO_PATH_MAX {
+        return error.RepoPathTooLong;
+    }
+    var out: RepoPath = repo_path_empty();
+    var i: usize = 0;
+    while i < len {
+        out.bytes[i] = text[i];
+        i = i + 1;
+    }
+    out.bytes[len] = 0 as byte;
+    out.len = len;
+    return out;
+}
+
+fn repo_path_join_literal(base: &RepoPath, literal: &const byte) !RepoPath {
+    var out: RepoPath = repo_path_empty();
+    repo_path_copy_bytes(base, &out, base.len);
+    var pos: usize = base.len;
+
+    if pos > 0 {
+        const last_index: usize = pos - 1;
+        if last_index < REPO_PATH_MAX && out.bytes[last_index] != '/' as byte {
+            if pos + 1 >= REPO_PATH_MAX {
+                return error.RepoPathTooLong;
+            }
+            out.bytes[pos] = '/' as byte;
+            pos = pos + 1;
+        }
+    }
+
+    const suffix_len: usize = strlen(literal);
+    if pos + suffix_len >= REPO_PATH_MAX {
+        return error.RepoPathTooLong;
+    }
+    var i: usize = 0;
+    while i < suffix_len {
+        out.bytes[pos + i] = literal[i];
+        i = i + 1;
+    }
+    pos = pos + suffix_len;
+    out.bytes[pos] = 0 as byte;
+    out.len = pos;
+    return out;
+}
+
+fn repo_path_parent(path: &RepoPath) !RepoPath {
+    if path.len == 0 {
+        return error.RepoNotFound;
+    }
+    if path.len == 1 && path.bytes[0] == '/' as byte {
+        return error.RepoNotFound;
+    }
+
+    var end: usize = path.len;
+    while end > 1 {
+        const last_index: usize = end - 1;
+        if last_index >= REPO_PATH_MAX || path.bytes[last_index] != '/' as byte {
+            break;
+        }
+        end = end - 1;
+    }
+    while end > 1 {
+        const last_index: usize = end - 1;
+        if last_index >= REPO_PATH_MAX || path.bytes[last_index] == '/' as byte {
+            break;
+        }
+        end = end - 1;
+    }
+
+    var copy_len: usize = 1;
+    if end > 1 {
+        copy_len = end - 1;
+    }
+
+    var out: RepoPath = repo_path_empty();
+    repo_path_copy_bytes(path, &out, copy_len);
+    out.bytes[copy_len] = 0 as byte;
+    out.len = copy_len;
+    return out;
+}
+
+fn errno_is_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn repo_path_exists(path: &RepoPath) bool {
+    var st: Stat = Stat{};
+    return stat(repo_path_cstr(path) as &const byte, &st) == 0;
+}
+
+export fn repo_path_is_dir(path: &RepoPath) bool {
+    var st: Stat = Stat{};
+    if stat(repo_path_cstr(path) as &const byte, &st) != 0 {
+        return false;
+    }
+    return (st.st_mode as u32 & STAT_S_IFMT) == STAT_S_IFDIR;
+}
+
+fn dirent_is_dot(entry: &Dirent) bool {
+    if entry.d_name[0] != '.' as byte {
+        return false;
+    }
+    if entry.d_name[1] == 0 as byte {
+        return true;
+    }
+    if entry.d_name[1] == '.' as byte && entry.d_name[2] == 0 as byte {
+        return true;
+    }
+    return false;
+}
+
+fn repo_dir_is_empty(path: &RepoPath) !bool {
+    const dir: &DIR = opendir(repo_path_cstr(path) as &const byte);
+    if dir == null {
+        if errno_is_permission() {
+            return error.RepoPermissionDenied;
+        }
+        return error.RepoDirReadFailed;
+        return false;
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            return true;
+        }
+        if !dirent_is_dot(entry) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn ensure_dir(path: &RepoPath) !void {
+    if repo_path_is_dir(path) {
+        return;
+    }
+    if mkdir(repo_path_cstr(path) as &const byte, S_IRWXU as i32) == 0 {
+        return;
+    }
+    if errno == EEXIST {
+        if repo_path_is_dir(path) {
+            return;
+        }
+        return error.RepoExpectedDirectory;
+    }
+    if errno_is_permission() {
+        return error.RepoPermissionDenied;
+    }
+    return error.RepoExpectedDirectory;
+}
+
+export fn repo_current_dir() !RepoPath {
+    var out: RepoPath = repo_path_empty();
+    if getcwd(&out.bytes[0], REPO_PATH_MAX as usize) == null {
+        return error.RepoCurrentDirUnavailable;
+    }
+    out.len = strlen(&out.bytes[0] as &const byte);
+    return out;
+}
+
+export fn repo_find_root(start: &RepoPath) !RepoPath {
+    var cursor: RepoPath = *start;
+    while true {
+        const hgit_dir: RepoPath = try repo_path_join_literal(&cursor, HGIT_DIR_NAME);
+        if repo_path_is_dir(&hgit_dir) {
+            return cursor;
+        }
+        if cursor.len == 1 && cursor.bytes[0] == '/' as byte {
+            return error.RepoNotFound;
+        }
+        cursor = try repo_path_parent(&cursor);
+    }
+    return error.RepoNotFound;
+}
+
+export fn repo_find_root_from_cwd() !RepoPath {
+    const cwd: RepoPath = try repo_current_dir();
+    return try repo_find_root(&cwd);
+}
+
+export fn repo_default_config() RepoConfig {
+    var config: RepoConfig = RepoConfig{
+        format_version: 1 as u16,
+        default_branch: [],
+        default_branch_len: 4 as usize,
+    };
+    config.default_branch[0] = 'm' as byte;
+    config.default_branch[1] = 'a' as byte;
+    config.default_branch[2] = 'i' as byte;
+    config.default_branch[3] = 'n' as byte;
+    return config;
+}
+
+fn repo_config_path(root: &RepoPath) !RepoPath {
+    return try repo_path_join_literal(root, HGIT_CONFIG_REL);
+}
+
+fn repo_write_json_prefix(buf: &[byte], offset: &usize, text: &const byte) !void {
+    const len: usize = strlen(text);
+    if *offset + len > buf.len {
+        return error.RepoConfigWriteFailed;
+    }
+    var i: usize = 0;
+    while i < len {
+        buf.ptr[*offset + i] = text[i];
+        i = i + 1;
+    }
+    *offset = *offset + len;
+}
+
+export fn repo_write_config(root: &RepoPath, config: &RepoConfig) !void {
+    const path: RepoPath = try repo_config_path(root);
+    const stream: &FILE = fopen(repo_path_cstr(&path) as &const byte, "w");
+    if stream == null {
+        if errno_is_permission() {
+            return error.RepoPermissionDenied;
+        }
+        return error.RepoConfigOpenFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var buf: [byte: REPO_CONFIG_BYTES_MAX] = [];
+    var offset: usize = 0;
+    try repo_write_json_prefix(buf[0: REPO_CONFIG_BYTES_MAX], &offset, "{\"format_version\":1,\"default_branch\":\"");
+    if offset + config.default_branch_len + 3 > REPO_CONFIG_BYTES_MAX {
+        return error.RepoConfigWriteFailed;
+    }
+    var i: usize = 0;
+    while i < config.default_branch_len {
+        buf[offset + i] = config.default_branch[i];
+        i = i + 1;
+    }
+    offset = offset + config.default_branch_len;
+    buf[offset] = '"' as byte;
+    buf[offset + 1] = '}' as byte;
+    buf[offset + 2] = '\n' as byte;
+    offset = offset + 3;
+
+    if fwrite(&buf[0] as &const byte, 1 as usize, offset, stream) != offset {
+        return error.RepoConfigWriteFailed;
+    }
+}
+
+export fn repo_read_config(root: &RepoPath) !RepoConfig {
+    const path: RepoPath = try repo_config_path(root);
+    const stream: &FILE = fopen(repo_path_cstr(&path) as &const byte, "r");
+    if stream == null {
+        if errno_is_permission() {
+            return error.RepoPermissionDenied;
+        }
+        return error.RepoConfigOpenFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var data: [byte: REPO_CONFIG_BYTES_MAX] = [];
+    const count: usize = fread(&data[0], 1 as usize, REPO_CONFIG_BYTES_MAX - 1 as usize, stream);
+    if count == 0 {
+        return error.RepoConfigReadFailed;
+    }
+    data[count] = 0 as byte;
+
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const value: JsonValue = parse(&arena, &data[0], count) catch {
+        return error.RepoConfigInvalid;
+    };
+    var object: JsonObject = JsonObject{ pairs: null, len: 0 };
+    match value {
+        .obj(o) => { object = o; },
+        else => { return error.RepoConfigInvalid; },
+    }
+    const version_index: usize = json_object_find_index(&object, "format_version", 14 as usize) catch {
+        return error.RepoConfigInvalid;
+    };
+    const branch_index: usize = json_object_find_index(&object, "default_branch", 14 as usize) catch {
+        return error.RepoConfigInvalid;
+    };
+    const version: i64 = json_expect_i64(&object.pairs[version_index].value) catch {
+        return error.RepoConfigInvalid;
+    };
+    const branch: JsonStrView = json_expect_str(&object.pairs[branch_index].value) catch {
+        return error.RepoConfigInvalid;
+    };
+    if version < 0 || version > 65535 || branch.len > 64 as usize {
+        return error.RepoConfigInvalid;
+    }
+
+    var config: RepoConfig = RepoConfig{
+        format_version: version as u16,
+        default_branch: [],
+        default_branch_len: branch.len,
+    };
+    var i: usize = 0;
+    while i < branch.len {
+        config.default_branch[i] = branch.ptr[i];
+        i = i + 1;
+    }
+    return config;
+}
+
+fn ensure_repo_structure(root: &RepoPath) !void {
+    const hgit_dir: RepoPath = try repo_path_join_literal(root, HGIT_DIR_NAME);
+    const refs_dir: RepoPath = try repo_path_join_literal(root, HGIT_REFS_REL);
+    const refs_heads_dir: RepoPath = try repo_path_join_literal(root, HGIT_REFS_HEADS_REL);
+    const objects_dir: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_REL);
+    const objects_loose_dir: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
+    const objects_packs_dir: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_PACKS_REL);
+    const indexes_dir: RepoPath = try repo_path_join_literal(root, HGIT_INDEXES_REL);
+    const workspace_dir: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_REL);
+    try ensure_dir(&hgit_dir);
+    try ensure_dir(&refs_dir);
+    try ensure_dir(&refs_heads_dir);
+    try ensure_dir(&objects_dir);
+    try ensure_dir(&objects_loose_dir);
+    try ensure_dir(&objects_packs_dir);
+    try ensure_dir(&indexes_dir);
+    try ensure_dir(&workspace_dir);
+}
+
+export fn repo_init_at(root: &RepoPath) !RepoInitResult {
+    const hgit_dir: RepoPath = try repo_path_join_literal(root, HGIT_DIR_NAME);
+    const existed: bool = repo_path_is_dir(&hgit_dir);
+    if !existed {
+        if !(try repo_dir_is_empty(root)) {
+            return error.RepoInitNonEmpty;
+        }
+    }
+
+    try ensure_repo_structure(root);
+
+    const config_path: RepoPath = try repo_config_path(root);
+    if repo_path_exists(&config_path) {
+        _ = try repo_read_config(root);
+    } else {
+        const config: RepoConfig = repo_default_config();
+        try repo_write_config(root, &config);
+    }
+
+    return RepoInitResult{
+        repo_root: root[0],
+        created_new: !existed,
+    };
+}
+
+export fn repo_init_current_dir() !RepoInitResult {
+    const cwd: RepoPath = try repo_current_dir();
+    return try repo_init_at(&cwd);
+}

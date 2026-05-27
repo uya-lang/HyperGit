@@ -1,0 +1,91 @@
+use std.mem.arena.Arena;
+
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.CommitId;
+use core.ids.ManifestId;
+use core.ids.BlobId;
+use core.ids.PublishedViewId;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use core.ids.manifest_id_from_object;
+use core.ids.blob_id_from_object;
+use core.ids.published_view_id_from_hash;
+use core.ids.hash_domain_payload;
+use object.types.ObjectKind;
+use object.types.CommitPayload;
+use object.types.ManifestNodePayload;
+use object.types.SmallBlobPayload;
+use object.types.ChunkedBlobPayload;
+use object.types.PublishedView;
+use object.types.ByteList;
+use object.codec.commit_payload_to_canonical;
+use object.codec.manifest_node_payload_to_canonical;
+use object.codec.small_blob_payload_to_canonical;
+use object.codec.chunked_blob_payload_to_canonical;
+use object.codec.published_view_payload_to_canonical;
+
+export const HASH_DOMAIN_COMMIT: &const byte = "hypergit.commit.v1";
+export const HASH_DOMAIN_MANIFEST: &const byte = "hypergit.manifest.v1";
+export const HASH_DOMAIN_SMALL_BLOB: &const byte = "hypergit.blob.small.v1";
+export const HASH_DOMAIN_CHUNKED_BLOB: &const byte = "hypergit.blob.chunked.v1";
+export const HASH_DOMAIN_PUBLISHED_VIEW: &const byte = "hypergit.view.v1";
+
+fn hash_canonical(arena: &Arena, domain: &const byte, payload: &[byte]) !Hash32 {
+    return try hash_domain_payload(arena, domain, payload);
+}
+
+export fn object_hash_domain(kind: ObjectKind) &const byte {
+    if kind == ObjectKind.Commit {
+        return HASH_DOMAIN_COMMIT;
+    }
+    if kind == ObjectKind.ManifestNode {
+        return HASH_DOMAIN_MANIFEST;
+    }
+    if kind == ObjectKind.SmallBlob {
+        return HASH_DOMAIN_SMALL_BLOB;
+    }
+    if kind == ObjectKind.ChunkedBlob {
+        return HASH_DOMAIN_CHUNKED_BLOB;
+    }
+    if kind == ObjectKind.PublishedView {
+        return HASH_DOMAIN_PUBLISHED_VIEW;
+    }
+    return HASH_DOMAIN_COMMIT;
+}
+
+export fn hash_object_payload_bytes(arena: &Arena, kind: ObjectKind, payload: &[byte]) !ObjectId {
+    const domain: &const byte = object_hash_domain(kind);
+    const hash: Hash32 = try hash_canonical(arena, domain, payload);
+    return object_id_from_hash(hash);
+}
+
+export fn hash_commit_payload(arena: &Arena, payload: &CommitPayload) !CommitId {
+    const encoded: ByteList = try commit_payload_to_canonical(arena, payload);
+    const hash: Hash32 = try hash_canonical(arena, HASH_DOMAIN_COMMIT, encoded.ptr[0: encoded.len]);
+    return commit_id_from_object(object_id_from_hash(hash));
+}
+
+export fn hash_manifest_node_payload(arena: &Arena, payload: &ManifestNodePayload) !ManifestId {
+    const encoded: ByteList = try manifest_node_payload_to_canonical(arena, payload);
+    const hash: Hash32 = try hash_canonical(arena, HASH_DOMAIN_MANIFEST, encoded.ptr[0: encoded.len]);
+    return manifest_id_from_object(object_id_from_hash(hash));
+}
+
+export fn hash_small_blob_payload(arena: &Arena, payload: &SmallBlobPayload) !BlobId {
+    const encoded: ByteList = try small_blob_payload_to_canonical(arena, payload);
+    const hash: Hash32 = try hash_canonical(arena, HASH_DOMAIN_SMALL_BLOB, encoded.ptr[0: encoded.len]);
+    return blob_id_from_object(object_id_from_hash(hash));
+}
+
+export fn hash_chunked_blob_payload(arena: &Arena, payload: &ChunkedBlobPayload) !BlobId {
+    const encoded: ByteList = try chunked_blob_payload_to_canonical(arena, payload);
+    const hash: Hash32 = try hash_canonical(arena, HASH_DOMAIN_CHUNKED_BLOB, encoded.ptr[0: encoded.len]);
+    return blob_id_from_object(object_id_from_hash(hash));
+}
+
+export fn hash_published_view(arena: &Arena, payload: &PublishedView) !PublishedViewId {
+    const encoded: ByteList = try published_view_payload_to_canonical(arena, payload);
+    const hash: Hash32 = try hash_canonical(arena, HASH_DOMAIN_PUBLISHED_VIEW, encoded.ptr[0: encoded.len]);
+    return published_view_id_from_hash(hash);
+}

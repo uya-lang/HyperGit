@@ -1,0 +1,73 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use libc.Stat;
+use libc.stat;
+use libc.system;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fwrite;
+use core.codec.DecodedObject;
+use core.codec.codec_decode_object;
+use core.ids.ObjectId;
+use core.ids.object_id_compare;
+use object.types.ObjectKind;
+use store.object_store.ObjectBytes;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_object_path;
+
+fn test_loose_store_roundtrip() !void {
+    try expect(system("rm -rf build/loose-store-test && mkdir -p build/loose-store-test/objects/loose") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/loose-store-test/objects/loose");
+    var payload: [byte: 7] = ['p' as byte, 'a' as byte, 'y' as byte, 'l' as byte, 'o' as byte, 'a' as byte, 'd' as byte];
+    const id: ObjectId = try store.put(ObjectKind.Commit, payload[0: 7]);
+    try expect(try store.has(id));
+    const dedup_id: ObjectId = try store.put(ObjectKind.Commit, payload[0: 7]);
+    try expect(object_id_compare(&id, &dedup_id) == 0);
+
+    var path_buf: [byte: 4096] = [];
+    _ = try loose_store_object_path(&store, &id, path_buf[0: 4096]);
+    var st: Stat = Stat{};
+    try expect(stat(&path_buf[0] as &const byte, &st) == 0);
+
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const object_bytes: ObjectBytes = try store.get(dedup_id, &arena);
+    var offset: usize = 0;
+    const decoded: DecodedObject = try codec_decode_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    try expect(offset == object_bytes.bytes.len);
+    try expect(decoded.envelope.kind == 0 as u16);
+    try expect(decoded.payload.len == 7 as usize);
+
+    const stream: &FILE = fopen(&path_buf[0] as &const byte, "w");
+    try expect(stream != null);
+    var bad: [byte: 3] = ['b' as byte, 'a' as byte, 'd' as byte];
+    try expect(fwrite(&bad[0] as &const byte, 1 as usize, 3 as usize, stream) == 3 as usize);
+    try expect(fclose(stream) == 0);
+
+    var corrupt_arena_buf: [byte: 4096] = [];
+    var corrupt_arena: Arena = Arena{ buffer: &corrupt_arena_buf[0], size: 0, used: 0 };
+    arena_init(&corrupt_arena, &corrupt_arena_buf[0], 4096 as usize);
+    const corrupt_object: ObjectBytes = store.get(id, &corrupt_arena) catch |err| {
+        try expect(@error_id(err) == @error_id(error.StoreCorruptObject));
+        return;
+    };
+    _ = corrupt_object;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Loose Store Tests");
+    run_test("loose store roundtrip", test_loose_store_roundtrip);
+    return test_suite_end();
+}

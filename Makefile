@@ -19,8 +19,14 @@ c99:
 	$(UYA) build $(SRC) -o $(C99) --c99
 
 test:
+	$(UYA) test src/hypergit/test_object_model.uya
+	$(UYA) test src/hypergit/test_object_codec.uya
+	$(UYA) test src/hypergit/test_loose_store.uya
+	$(UYA) test src/hgx/test_repo_layout.uya
 	$(UYA) test src/hgx/test_cli_args.uya
 	./tests/test_cli_golden.sh
+	./tests/test_repo_init.sh
+	./tests/test_loose_store_concurrent.sh
 
 clean:
 	rm -f $(BIN) $(C99)
