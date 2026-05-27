@@ -1,0 +1,81 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.codec.codec_hash_payload;
+use core.ids.BlobId;
+use core.ids.Hash32;
+use core.ids.blob_id_compare;
+use core.ids.hash32_compare;
+use object.hash.hash_small_blob_payload;
+use object.small_blob.HashedSmallBlob;
+use object.small_blob.small_blob_content_hash;
+use object.small_blob.small_blob_hash_bytes;
+use object.small_blob.small_blob_payload_from_bytes;
+use object.types.SmallBlobPayload;
+use object.validate.validate_small_blob_payload;
+
+fn expect_payload_bytes(payload: &SmallBlobPayload, expected: &[byte]) !void {
+    try expect(payload.payload.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(payload.payload.ptr[i] == expected.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn test_small_blob_payload_from_bytes_copies_and_hashes_content() !void {
+    var input: [byte: 6] = ['h' as byte, 'e' as byte, 'l' as byte, 'l' as byte, 'o' as byte, '\n' as byte];
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(&arena, input[0: 6]);
+    try expect(payload.logical_size == 6u64);
+    try expect_payload_bytes(&payload, input[0: 6]);
+    const expected_hash: Hash32 = codec_hash_payload(input[0: 6]);
+    try expect(hash32_compare(&payload.content_hash, &expected_hash) == 0);
+    try validate_small_blob_payload(&payload);
+
+    input[0] = 'H' as byte;
+    try expect(payload.payload.ptr[0] == 'h' as byte);
+}
+
+fn test_small_blob_hash_bytes_matches_payload_hash() !void {
+    var bytes: [byte: 5] = [0 as byte, 1 as byte, 2 as byte, 3 as byte, 255 as byte];
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const hashed: HashedSmallBlob = try small_blob_hash_bytes(&arena, bytes[0: 5]);
+    const expected_blob_id: BlobId = try hash_small_blob_payload(&arena, &hashed.payload);
+    try expect(blob_id_compare(&hashed.blob_id, &expected_blob_id) == 0);
+    try validate_small_blob_payload(&hashed.payload);
+}
+
+fn test_small_blob_content_hash_handles_empty_payload() !void {
+    var empty: [byte: 1] = [];
+    const content_hash: Hash32 = small_blob_content_hash(empty[0: 0]);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(&arena, empty[0: 0]);
+    try expect(payload.logical_size == 0u64);
+    try expect(payload.payload.len == 0 as usize);
+    try expect(hash32_compare(&payload.content_hash, &content_hash) == 0);
+    try validate_small_blob_payload(&payload);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Small Blob Hash Tests");
+    run_test("small blob payload from bytes copies and hashes content", test_small_blob_payload_from_bytes_copies_and_hashes_content);
+    run_test("small blob hash bytes matches payload hash", test_small_blob_hash_bytes_matches_payload_hash);
+    run_test("small blob content hash handles empty payload", test_small_blob_content_hash_handles_empty_payload);
+    return test_suite_end();
+}

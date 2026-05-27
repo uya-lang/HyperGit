@@ -5,6 +5,7 @@ use std.runtime.get_argv;
 use cli.DispatchAction;
 use cli.DispatchPlan;
 use cli.plan_from_first_arg;
+use commands.add.run_add;
 use commands.help.run_help;
 use commands.version.run_version;
 use commands.status.run_status;
@@ -23,6 +24,8 @@ export fn main() i32 {
         return run_version();
     } else if plan.action == DispatchAction.Status {
         return run_status();
+    } else if plan.action == DispatchAction.Add {
+        return run_add();
     } else if plan.action == DispatchAction.Doctor {
         return run_doctor();
     } else if plan.action == DispatchAction.Init {

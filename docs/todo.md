@@ -161,10 +161,10 @@
 - [x] 实现 `StageState`。
 - [x] 实现 `StageEntry`。
 - [x] 实现 `workspace/stage.hgi`。
-- [ ] 实现工作区文件枚举。
-- [ ] 实现 small blob hash。
-- [ ] 实现 `hgx add <pathspec>`。
-- [ ] 实现 staging metadata。
+- [x] 实现工作区文件枚举。
+- [x] 实现 small blob hash。
+- [x] 实现 `hgx add <pathspec>`。
+- [x] 实现 staging metadata。
 - [ ] 实现 staged / unstaged 状态分离输出。
 - [ ] 实现 manifest root 构建。
 - [ ] 实现 commit object 构建。

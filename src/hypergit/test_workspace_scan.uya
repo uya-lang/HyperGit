@@ -1,0 +1,89 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.system;
+use object.types.ByteList;
+use workspace.scan.WorkspaceFileKind;
+use workspace.scan.WorkspaceFileList;
+use workspace.scan.workspace_scan_files;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn test_workspace_scan_skips_hgit_and_sorts_paths() !void {
+    const setup_status: i32 = system("rm -rf build/workspace-scan-test && mkdir -p build/workspace-scan-test/repo/src/nested build/workspace-scan-test/repo/.hidden build/workspace-scan-test/repo/.hgit/workspace && printf alpha > build/workspace-scan-test/repo/src/main.uya && printf beta > build/workspace-scan-test/repo/src/nested/util.uya && printf readme > build/workspace-scan-test/repo/README.md && printf hidden > build/workspace-scan-test/repo/.hidden/config.json && printf ignored > build/workspace-scan-test/repo/.hgit/workspace/stage.hgi");
+    try expect(setup_status == 0);
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    const files: WorkspaceFileList = try workspace_scan_files(&arena, "build/workspace-scan-test/repo");
+    try expect(files.len == 4 as usize);
+
+    try expect_byte_list_eq(files.ptr[0].path, literal_bytes(".hidden/config.json"));
+    try expect_byte_list_eq(files.ptr[1].path, literal_bytes("README.md"));
+    try expect_byte_list_eq(files.ptr[2].path, literal_bytes("src/main.uya"));
+    try expect_byte_list_eq(files.ptr[3].path, literal_bytes("src/nested/util.uya"));
+    try expect(files.ptr[0].kind == WorkspaceFileKind.Regular);
+    try expect(files.ptr[3].logical_size == 4u64);
+}
+
+fn test_workspace_scan_keeps_symlink_entries_without_recursing() !void {
+    const setup_status: i32 = system("rm -rf build/workspace-scan-link-test && mkdir -p build/workspace-scan-link-test/repo/dir build/workspace-scan-link-test/repo/.hgit && printf data > build/workspace-scan-link-test/repo/dir/file.txt && ln -s dir/file.txt build/workspace-scan-link-test/repo/link.txt && ln -s dir build/workspace-scan-link-test/repo/loop && printf ignored > build/workspace-scan-link-test/repo/.hgit/config.json");
+    try expect(setup_status == 0);
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    const files: WorkspaceFileList = try workspace_scan_files(&arena, "build/workspace-scan-link-test/repo");
+    try expect(files.len == 3 as usize);
+
+    try expect_byte_list_eq(files.ptr[0].path, literal_bytes("dir/file.txt"));
+    try expect_byte_list_eq(files.ptr[1].path, literal_bytes("link.txt"));
+    try expect_byte_list_eq(files.ptr[2].path, literal_bytes("loop"));
+    try expect(files.ptr[0].kind == WorkspaceFileKind.Regular);
+    try expect(files.ptr[1].kind == WorkspaceFileKind.Symlink);
+    try expect(files.ptr[2].kind == WorkspaceFileKind.Symlink);
+}
+
+fn test_workspace_scan_rejects_reserved_manifest_paths() !void {
+    const setup_status: i32 = system("rm -rf build/workspace-scan-invalid-test && mkdir -p build/workspace-scan-invalid-test/repo && printf data > build/workspace-scan-invalid-test/repo/CON");
+    try expect(setup_status == 0);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const files: WorkspaceFileList = workspace_scan_files(&arena, "build/workspace-scan-invalid-test/repo") catch |err| {
+        try expect(@error_id(err) == @error_id(error.ManifestReservedName));
+        return;
+    };
+    _ = files;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Workspace Scan Tests");
+    run_test("workspace scan skips hgit and sorts paths", test_workspace_scan_skips_hgit_and_sorts_paths);
+    run_test("workspace scan keeps symlink entries without recursing", test_workspace_scan_keeps_symlink_entries_without_recursing);
+    run_test("workspace scan rejects reserved manifest paths", test_workspace_scan_rejects_reserved_manifest_paths);
+    return test_suite_end();
+}

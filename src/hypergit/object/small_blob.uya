@@ -1,0 +1,64 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.codec.codec_hash_payload;
+use core.ids.BlobId;
+use core.ids.Hash32;
+use object.hash.hash_small_blob_payload;
+use object.types.ByteList;
+use object.types.SmallBlobPayload;
+
+error SmallBlobAlloc;
+
+export struct HashedSmallBlob {
+    blob_id: BlobId,
+    payload: SmallBlobPayload
+}
+
+fn small_blob_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.SmallBlobAlloc;
+    }
+    return raw[0: len];
+}
+
+fn small_blob_clone_payload(payload: &SmallBlobPayload) SmallBlobPayload {
+    return SmallBlobPayload{
+        logical_size: payload.logical_size,
+        content_hash: payload.content_hash,
+        payload: ByteList{ ptr: payload.payload.ptr, len: payload.payload.len },
+    };
+}
+
+export fn small_blob_content_hash(content: &[byte]) Hash32 {
+    return codec_hash_payload(content);
+}
+
+export fn small_blob_payload_from_bytes(arena: &Arena, content: &[byte]) !SmallBlobPayload {
+    const stored: &[byte] = try small_blob_arena_bytes(arena, content.len);
+    var i: usize = 0;
+    while i < content.len {
+        stored.ptr[i] = content.ptr[i];
+        i = i + 1;
+    }
+
+    return SmallBlobPayload{
+        logical_size: content.len as u64,
+        content_hash: small_blob_content_hash(stored),
+        payload: ByteList{ ptr: stored.ptr, len: stored.len },
+    };
+}
+
+export fn small_blob_hash_bytes(arena: &Arena, content: &[byte]) !HashedSmallBlob {
+    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(arena, content);
+    const blob_id: BlobId = try hash_small_blob_payload(arena, &payload);
+    return HashedSmallBlob{
+        blob_id: blob_id,
+        payload: small_blob_clone_payload(&payload),
+    };
+}

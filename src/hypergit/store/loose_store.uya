@@ -47,8 +47,8 @@ use store.object_store.ObjectReader;
 use store.object_store.ObjectStore;
 
 const STORE_PATH_MAX: usize = 4096;
-const STAT_S_IFMT: u32 = 61440u32;
-const STAT_S_IFDIR: u32 = 16384u32;
+const LOOSE_STORE_STAT_S_IFMT: u32 = 61440u32;
+const LOOSE_STORE_STAT_S_IFDIR: u32 = 16384u32;
 
 error StorePathTooLong;
 error StoreAlloc;
@@ -67,7 +67,7 @@ struct StorePath {
     len: usize = 0
 }
 
-fn errno_is_permission() bool {
+fn loose_store_errno_is_permission() bool {
     return errno == EACCES || errno == EPERM;
 }
 
@@ -159,10 +159,10 @@ fn store_path_is_dir(path: &StorePath) bool {
     if stat(store_path_cstr(path) as &const byte, &st) != 0 {
         return false;
     }
-    return (st.st_mode as u32 & STAT_S_IFMT) == STAT_S_IFDIR;
+    return (st.st_mode as u32 & LOOSE_STORE_STAT_S_IFMT) == LOOSE_STORE_STAT_S_IFDIR;
 }
 
-fn ensure_dir(path: &StorePath) !void {
+fn loose_store_ensure_dir(path: &StorePath) !void {
     if store_path_is_dir(path) {
         return;
     }
@@ -172,7 +172,7 @@ fn ensure_dir(path: &StorePath) !void {
     if errno == EEXIST && store_path_is_dir(path) {
         return;
     }
-    if errno_is_permission() {
+    if loose_store_errno_is_permission() {
         return error.StorePermissionDenied;
     }
     return error.StoreMkdirFailed;
@@ -270,7 +270,7 @@ fn load_file_bytes(arena: &Arena, path: &StorePath) !ByteList {
         if errno == ENOENT {
             return error.StoreNotFound;
         }
-        if errno_is_permission() {
+        if loose_store_errno_is_permission() {
             return error.StorePermissionDenied;
         }
         return error.StoreOpenFailed;
@@ -352,7 +352,7 @@ export struct LooseObjectStore : ObjectStore {
         var file_path: StorePath = store_path_empty();
         var temp_path: StorePath = store_path_empty();
         try build_loose_paths(&self.root, &id, &dir_path, &file_path, &temp_path);
-        try ensure_dir(&dir_path);
+        try loose_store_ensure_dir(&dir_path);
 
         const total_len: usize = CODEC_ENVELOPE_BYTES + payload.len;
         const encoded_raw: &byte = malloc(total_len) as &byte;
@@ -367,7 +367,7 @@ export struct LooseObjectStore : ObjectStore {
         try codec_encode_object(encoded, &offset, object_kind_to_u16(kind), 0 as u16, payload);
 
         const file: File = file_open(store_path_cstr(&temp_path) as &const byte, (O_WRONLY | O_CREAT | O_EXCL) as i32, S_IRWXU as u32) catch {
-            if errno_is_permission() {
+            if loose_store_errno_is_permission() {
                 return error.StorePermissionDenied;
             }
             return error.StoreWriteFailed;

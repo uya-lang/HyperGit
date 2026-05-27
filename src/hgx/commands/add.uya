@@ -1,0 +1,482 @@
+use std.io.file.File;
+use std.io.file.file_close;
+use std.io.file.file_open;
+use std.io.file.file_read;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.string.strlen;
+use std.time.now_ms;
+
+use libc.O_RDONLY;
+use libc.free;
+use libc.fprintf;
+use libc.malloc;
+use libc.stderr;
+use cli.EXIT_NOT_IMPLEMENTED;
+use cli.EXIT_OK;
+use cli.EXIT_RUNTIME_ERROR;
+use cli.EXIT_USAGE_ERROR;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.object_id_from_hash;
+use manifest.path.manifest_path_compare;
+use manifest.path.manifest_path_normalize;
+use manifest.query.ManifestPathspecList;
+use manifest.query.manifest_pathspec_list_from_slice;
+use manifest.query.manifest_pathspec_matches_any;
+use object.codec.encode_small_blob_payload;
+use object.codec.small_blob_payload_encoded_len;
+use object.hash.hash_object_payload_bytes;
+use object.small_blob.small_blob_content_hash;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use object.types.SmallBlobPayload;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_join_literal;
+use workspace.scan.WorkspaceFileEntry;
+use workspace.scan.WorkspaceFileKind;
+use workspace.scan.WorkspaceFileList;
+use workspace.scan.workspace_scan_files;
+use workspace.stage.StageEntry;
+use workspace.stage.StageEntryKind;
+use workspace.stage.StageEntryList;
+use workspace.stage.StageSnapshot;
+use workspace.stage.StageState;
+use workspace.stage.stage_entry_list_from_slice;
+use workspace.stage.stage_snapshot_init;
+use workspace.stage.stage_state_with_entry_count;
+use workspace.stage.stage_zero_commit_id;
+use workspace.stage_file.stage_file_read;
+use workspace.stage_file.stage_file_write;
+
+const ADD_ARENA_BYTES: usize = 33554432 as usize;
+const ADD_SMALL_BLOB_MAX_BYTES: u64 = 8388608u64;
+const ADD_PATH_MAX: usize = 4096;
+
+error AddAlloc;
+error AddPathTooLong;
+error AddUsage;
+error AddReadFailed;
+error AddStoreFailed;
+error AddStageReadFailed;
+error AddStageWriteFailed;
+error AddTimeFailed;
+error AddNoMatches;
+error AddLargeFileNotImplemented;
+error AddSymlinkNotImplemented;
+
+export const ADD_USAGE_TEXT: &const byte = "error: add requires at least one pathspec\n";
+export const ADD_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
+export const ADD_PERMISSION_TEXT: &const byte = "error: permission denied while staging files\n";
+export const ADD_NO_MATCH_TEXT: &const byte = "error: pathspec did not match any files\n";
+export const ADD_LARGE_FILE_TEXT: &const byte = "error: add for files larger than 8MB is not implemented yet\n";
+export const ADD_SYMLINK_TEXT: &const byte = "error: add for symlinks is not implemented yet\n";
+export const ADD_FAILURE_TEXT: &const byte = "error: failed to stage files\n";
+
+struct AddFsPath {
+    bytes: [byte: 4096] = [],
+    len: usize = 0
+}
+
+struct AddOwnedBytes {
+    raw: &byte,
+    len: usize
+}
+
+fn add_zero_object_id() ObjectId {
+    return object_id_from_hash(Hash32{ bytes: [] });
+}
+
+fn add_fs_path_from_repo_path(path: &RepoPath) !AddFsPath {
+    if path.len >= ADD_PATH_MAX {
+        return error.AddPathTooLong;
+    }
+    var out: AddFsPath = AddFsPath{ bytes: [], len: 0 };
+    var i: usize = 0;
+    while i < path.len {
+        out.bytes[i] = path.bytes[i];
+        i = i + 1;
+    }
+    out.bytes[path.len] = 0 as byte;
+    out.len = path.len;
+    return out;
+}
+
+fn add_fs_path_join(base: &AddFsPath, suffix: &[byte]) !AddFsPath {
+    var out: AddFsPath = *base;
+    var pos: usize = out.len;
+
+    if suffix.len == 0 {
+        out.bytes[pos] = 0 as byte;
+        return out;
+    }
+
+    if pos > 0 {
+        const last_index: usize = pos - 1 as usize;
+        if last_index >= ADD_PATH_MAX {
+            return error.AddPathTooLong;
+        }
+        if out.bytes[last_index] != '/' as byte {
+            if pos + 1 as usize >= ADD_PATH_MAX {
+                return error.AddPathTooLong;
+            }
+            out.bytes[pos] = '/' as byte;
+            pos = pos + 1 as usize;
+        }
+    }
+
+    if pos + suffix.len >= ADD_PATH_MAX {
+        return error.AddPathTooLong;
+    }
+    var i: usize = 0;
+    while i < suffix.len {
+        out.bytes[pos + i] = suffix.ptr[i];
+        i = i + 1;
+    }
+    pos = pos + suffix.len;
+    out.bytes[pos] = 0 as byte;
+    out.len = pos;
+    return out;
+}
+
+fn add_owned_bytes_alloc(len: usize) !AddOwnedBytes {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = malloc(want) as &byte;
+    if raw == null {
+        return error.AddAlloc;
+    }
+    return AddOwnedBytes{ raw: raw, len: len };
+}
+
+fn add_owned_bytes_slice(value: &AddOwnedBytes) &[byte] {
+    return value.raw[0: value.len];
+}
+
+fn add_owned_bytes_free(value: &AddOwnedBytes) void {
+    if value.raw != null {
+        free(value.raw as &void);
+    }
+}
+
+fn add_read_file_bytes(path: &AddFsPath, size: usize) !AddOwnedBytes {
+    const data: AddOwnedBytes = try add_owned_bytes_alloc(size);
+    errdefer {
+        add_owned_bytes_free(&data);
+    }
+
+    const file: File = file_open(&path.bytes[0] as &const byte, O_RDONLY as i32, 0u32) catch {
+        return error.AddReadFailed;
+    };
+    defer {
+        _ = file_close(&file) catch {};
+    }
+
+    var read_total: usize = 0;
+    while read_total < size {
+        const chunk: isize = file_read(&file, &data.raw[read_total], size - read_total);
+        if chunk <= 0 {
+            return error.AddReadFailed;
+        }
+        read_total = read_total + chunk as usize;
+    }
+    return data;
+}
+
+fn add_encode_small_blob_payload(payload: &SmallBlobPayload) !AddOwnedBytes {
+    const total_len: usize = small_blob_payload_encoded_len(payload);
+    const encoded: AddOwnedBytes = try add_owned_bytes_alloc(total_len);
+    var offset: usize = 0;
+    try encode_small_blob_payload(add_owned_bytes_slice(&encoded), &offset, payload);
+    if offset != total_len {
+        add_owned_bytes_free(&encoded);
+        return error.AddStoreFailed;
+    }
+    return encoded;
+}
+
+fn add_hash_small_blob_encoded(encoded: &[byte]) !ObjectId {
+    const scratch_len: usize = encoded.len + 128 as usize;
+    const scratch: &byte = malloc(scratch_len) as &byte;
+    if scratch == null {
+        return error.AddAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+    var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+    arena_init(&arena, scratch, scratch_len);
+    return try hash_object_payload_bytes(&arena, ObjectKind.SmallBlob, encoded);
+}
+
+export fn add_worktree_small_blob_id(root: &RepoPath, path: &ByteList, logical_size: u64) !ObjectId {
+    if logical_size > ADD_SMALL_BLOB_MAX_BYTES {
+        return error.AddLargeFileNotImplemented;
+    }
+
+    const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
+    const fs_path: AddFsPath = try add_fs_path_join(&root_fs_path, path.ptr[0: path.len]);
+    const file_bytes: AddOwnedBytes = try add_read_file_bytes(&fs_path, logical_size as usize);
+    defer {
+        add_owned_bytes_free(&file_bytes);
+    }
+
+    const payload: SmallBlobPayload = SmallBlobPayload{
+        logical_size: logical_size,
+        content_hash: small_blob_content_hash(add_owned_bytes_slice(&file_bytes)),
+        payload: ByteList{ ptr: file_bytes.raw, len: file_bytes.len },
+    };
+    const encoded: AddOwnedBytes = try add_encode_small_blob_payload(&payload);
+    defer {
+        add_owned_bytes_free(&encoded);
+    }
+    return try add_hash_small_blob_encoded(add_owned_bytes_slice(&encoded));
+}
+
+fn add_count_matches(files: &WorkspaceFileList, pathspecs: &ManifestPathspecList) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    while i < files.len {
+        if manifest_pathspec_matches_any(pathspecs[0], &files.ptr[i].path) {
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    return total;
+}
+
+fn add_stage_entry_clone(entry: &StageEntry) StageEntry {
+    return StageEntry{
+        path: ByteList{ ptr: entry.path.ptr, len: entry.path.len },
+        kind: entry.kind,
+        base_object: entry.base_object,
+        has_staged_object: entry.has_staged_object,
+        staged_object: entry.staged_object,
+        file_mode: entry.file_mode,
+    };
+}
+
+fn add_load_existing_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapshot {
+    const snapshot: StageSnapshot = stage_file_read(repo_path_cstr(stage_path) as &const byte, arena) catch |err| {
+        if @error_id(err) == @error_id(error.StageFileNotFound) {
+            const empty_state: StageState = stage_state_with_entry_count(stage_zero_commit_id(), 0u64, 0i64);
+            return stage_snapshot_init(empty_state, StageEntryList{ ptr: null, len: 0 });
+        }
+        return error.AddStageReadFailed;
+    };
+    return snapshot;
+}
+
+fn add_merge_entries(arena: &Arena, existing: StageEntryList, updates: &StageEntry, update_len: usize) !StageEntryList {
+    const max_len: usize = existing.len + update_len;
+    const raw: &StageEntry = arena_alloc(arena, @size_of(StageEntry) as usize * max_len) as &StageEntry;
+    if raw == null {
+        return error.AddAlloc;
+    }
+
+    var existing_index: usize = 0;
+    var update_index: usize = 0;
+    var out_index: usize = 0;
+    while existing_index < existing.len && update_index < update_len {
+        const cmp: i32 = manifest_path_compare(&existing.ptr[existing_index].path, &updates[update_index].path);
+        if cmp < 0 {
+            raw[out_index] = add_stage_entry_clone(&existing.ptr[existing_index]);
+            existing_index = existing_index + 1;
+        } else if cmp > 0 {
+            raw[out_index] = add_stage_entry_clone(&updates[update_index]);
+            update_index = update_index + 1;
+        } else {
+            raw[out_index] = add_stage_entry_clone(&updates[update_index]);
+            existing_index = existing_index + 1;
+            update_index = update_index + 1;
+        }
+        out_index = out_index + 1;
+    }
+
+    while existing_index < existing.len {
+        raw[out_index] = add_stage_entry_clone(&existing.ptr[existing_index]);
+        existing_index = existing_index + 1;
+        out_index = out_index + 1;
+    }
+    while update_index < update_len {
+        raw[out_index] = add_stage_entry_clone(&updates[update_index]);
+        update_index = update_index + 1;
+        out_index = out_index + 1;
+    }
+
+    return stage_entry_list_from_slice(raw[0: out_index]);
+}
+
+export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) !usize {
+    const arena_storage: &byte = malloc(ADD_ARENA_BYTES) as &byte;
+    if arena_storage == null {
+        return error.AddAlloc;
+    }
+    defer {
+        free(arena_storage as &void);
+    }
+
+    var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+    arena_init(&arena, arena_storage, ADD_ARENA_BYTES);
+
+    const scanned_files: WorkspaceFileList = try workspace_scan_files(&arena, repo_path_cstr(root) as &const byte);
+    const matched_count: usize = add_count_matches(&scanned_files, &pathspecs);
+    if matched_count == 0 {
+        return error.AddNoMatches;
+    }
+
+    const stage_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STAGE_REL);
+    const existing_snapshot: StageSnapshot = try add_load_existing_snapshot(&stage_path, &arena);
+
+    const raw_updates: &StageEntry = arena_alloc(&arena, @size_of(StageEntry) as usize * matched_count) as &StageEntry;
+    if raw_updates == null {
+        return error.AddAlloc;
+    }
+
+    const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
+    const store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
+    const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
+
+    var update_index: usize = 0;
+    var file_index: usize = 0;
+    while file_index < scanned_files.len {
+        const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
+        if !manifest_pathspec_matches_any(pathspecs, &file_entry.path) {
+            file_index = file_index + 1;
+            continue;
+        }
+
+        if file_entry.kind == WorkspaceFileKind.Symlink {
+            return error.AddSymlinkNotImplemented;
+        }
+        if file_entry.logical_size > ADD_SMALL_BLOB_MAX_BYTES {
+            return error.AddLargeFileNotImplemented;
+        }
+
+        const fs_path: AddFsPath = try add_fs_path_join(&root_fs_path, file_entry.path.ptr[0: file_entry.path.len]);
+        const file_bytes: AddOwnedBytes = try add_read_file_bytes(&fs_path, file_entry.logical_size as usize);
+        defer {
+            add_owned_bytes_free(&file_bytes);
+        }
+
+        const payload: SmallBlobPayload = SmallBlobPayload{
+            logical_size: file_entry.logical_size,
+            content_hash: small_blob_content_hash(add_owned_bytes_slice(&file_bytes)),
+            payload: ByteList{ ptr: file_bytes.raw, len: file_bytes.len },
+        };
+        const encoded: AddOwnedBytes = try add_encode_small_blob_payload(&payload);
+        defer {
+            add_owned_bytes_free(&encoded);
+        }
+
+        const stored_id: ObjectId = store.put(ObjectKind.SmallBlob, add_owned_bytes_slice(&encoded)) catch {
+            return error.AddStoreFailed;
+        };
+        raw_updates[update_index] = StageEntry{
+            path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
+            kind: StageEntryKind.Add,
+            base_object: add_zero_object_id(),
+            has_staged_object: true,
+            staged_object: ObjectId{ hash: stored_id.hash },
+            file_mode: file_entry.file_mode,
+        };
+        update_index = update_index + 1;
+        file_index = file_index + 1;
+    }
+
+    const merged_entries: StageEntryList = try add_merge_entries(&arena, existing_snapshot.entries, raw_updates, update_index);
+    const current_ms: u64 = now_ms() catch {
+        return error.AddTimeFailed;
+    };
+    const state: StageState = stage_state_with_entry_count(existing_snapshot.state.base_commit, merged_entries.len as u64, current_ms as i64);
+    const snapshot: StageSnapshot = stage_snapshot_init(state, merged_entries);
+    stage_file_write(repo_path_cstr(&stage_path) as &const byte, &snapshot) catch {
+        return error.AddStageWriteFailed;
+    };
+    return update_index;
+}
+
+export fn run_add() i32 {
+    const argc: i32 = get_argc();
+    if argc <= 2 {
+        fprintf(stderr, "%s" as *byte, ADD_USAGE_TEXT);
+        return EXIT_USAGE_ERROR;
+    }
+
+    const pathspec_count: usize = (argc - 2) as usize;
+    const pathspec_storage: &byte = malloc(ADD_ARENA_BYTES) as &byte;
+    if pathspec_storage == null {
+        fprintf(stderr, "%s" as *byte, ADD_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    defer {
+        free(pathspec_storage as &void);
+    }
+    var pathspec_arena: Arena = Arena{ buffer: pathspec_storage, size: 0, used: 0 };
+    arena_init(&pathspec_arena, pathspec_storage, ADD_ARENA_BYTES);
+
+    const raw_specs: &ByteList = arena_alloc(&pathspec_arena, @size_of(ByteList) as usize * pathspec_count) as &ByteList;
+    if raw_specs == null {
+        fprintf(stderr, "%s" as *byte, ADD_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+
+    var i: usize = 0;
+    while i < pathspec_count {
+        const raw_arg: &byte = get_argv(i as i32 + 2);
+        const normalized: ByteList = manifest_path_normalize(&pathspec_arena, (raw_arg as &byte)[0: strlen(raw_arg as &const byte)]) catch {
+            fprintf(stderr, "%s" as *byte, ADD_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        raw_specs[i] = ByteList{ ptr: normalized.ptr, len: normalized.len };
+        i = i + 1;
+    }
+
+    const root: RepoPath = repo_find_root_from_cwd() catch |err| {
+        if @error_id(err) == @error_id(error.RepoNotFound) {
+            fprintf(stderr, "%s" as *byte, ADD_NOT_REPO_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, ADD_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, ADD_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const pathspecs: ManifestPathspecList = manifest_pathspec_list_from_slice(raw_specs[0: pathspec_count]);
+    _ = add_stage_pathspecs(&root, pathspecs) catch |err| {
+        if @error_id(err) == @error_id(error.AddNoMatches) {
+            fprintf(stderr, "%s" as *byte, ADD_NO_MATCH_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.AddLargeFileNotImplemented) {
+            fprintf(stderr, "%s" as *byte, ADD_LARGE_FILE_TEXT);
+            return EXIT_NOT_IMPLEMENTED;
+        }
+        if @error_id(err) == @error_id(error.AddSymlinkNotImplemented) {
+            fprintf(stderr, "%s" as *byte, ADD_SYMLINK_TEXT);
+            return EXIT_NOT_IMPLEMENTED;
+        }
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, ADD_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, ADD_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    return EXIT_OK;
+}

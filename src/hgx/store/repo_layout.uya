@@ -122,7 +122,7 @@ fn repo_path_from_cstr(text: &byte) !RepoPath {
     return out;
 }
 
-fn repo_path_join_literal(base: &RepoPath, literal: &const byte) !RepoPath {
+export fn repo_path_join_literal(base: &RepoPath, literal: &const byte) !RepoPath {
     var out: RepoPath = repo_path_empty();
     repo_path_copy_bytes(base, &out, base.len);
     var pos: usize = base.len;

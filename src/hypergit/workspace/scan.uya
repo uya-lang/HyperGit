@@ -1,0 +1,384 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.string.strlen;
+
+use libc.DIR;
+use libc.Dirent;
+use libc.Stat;
+use libc.closedir;
+use libc.errno;
+use libc.opendir;
+use libc.readdir;
+use libc.EACCES;
+use libc.EPERM;
+use manifest.path.manifest_path_compare;
+use manifest.path.manifest_path_normalize;
+use object.types.ByteList;
+use syscall.sys_lstat;
+
+const WORKSPACE_SCAN_PATH_MAX: usize = 4096;
+const WORKSPACE_SCAN_STAT_S_IFMT: u32 = 61440u32;
+const WORKSPACE_SCAN_STAT_S_IFDIR: u32 = 16384u32;
+const WORKSPACE_SCAN_STAT_S_IFREG: u32 = 32768u32;
+const WORKSPACE_SCAN_STAT_S_IFLNK: u32 = 40960u32;
+
+error WorkspaceScanAlloc;
+error WorkspaceScanRootInvalid;
+error WorkspaceScanPathTooLong;
+error WorkspaceScanOpenFailed;
+error WorkspaceScanPermissionDenied;
+error WorkspaceScanStatFailed;
+error WorkspaceScanUnsupportedFileType;
+error WorkspaceScanCountMismatch;
+error WorkspaceScanPathConflict;
+
+export enum WorkspaceFileKind {
+    Regular,
+    Symlink
+}
+
+export struct WorkspaceFileEntry {
+    path: ByteList,
+    kind: WorkspaceFileKind,
+    file_mode: u32,
+    logical_size: u64
+}
+
+export struct WorkspaceFileList {
+    ptr: &WorkspaceFileEntry,
+    len: usize
+}
+
+struct WorkspaceScanPath {
+    bytes: [byte: 4096] = [],
+    len: usize = 0
+}
+
+export fn workspace_file_list_from_slice(slice: &[WorkspaceFileEntry]) WorkspaceFileList {
+    return WorkspaceFileList{ ptr: slice.ptr, len: slice.len };
+}
+
+fn workspace_scan_path_empty() WorkspaceScanPath {
+    return WorkspaceScanPath{ bytes: [], len: 0 };
+}
+
+fn workspace_scan_path_from_cstr(text: &const byte) !WorkspaceScanPath {
+    if text == null {
+        return error.WorkspaceScanRootInvalid;
+    }
+    const len: usize = strlen(text);
+    if len >= WORKSPACE_SCAN_PATH_MAX {
+        return error.WorkspaceScanPathTooLong;
+    }
+
+    var out: WorkspaceScanPath = workspace_scan_path_empty();
+    var i: usize = 0;
+    while i < len {
+        out.bytes[i] = text[i];
+        i = i + 1;
+    }
+    out.bytes[len] = 0 as byte;
+    out.len = len;
+    return out;
+}
+
+fn workspace_scan_path_join(base: &WorkspaceScanPath, suffix: &[byte]) !WorkspaceScanPath {
+    var out: WorkspaceScanPath = *base;
+    var pos: usize = out.len;
+
+    if suffix.len == 0 {
+        out.bytes[pos] = 0 as byte;
+        return out;
+    }
+
+    if pos > 0 {
+        const last_index: usize = pos - 1 as usize;
+        if last_index >= WORKSPACE_SCAN_PATH_MAX {
+            return error.WorkspaceScanPathTooLong;
+        }
+        if out.bytes[last_index] != '/' as byte {
+            if pos + 1 as usize >= WORKSPACE_SCAN_PATH_MAX {
+                return error.WorkspaceScanPathTooLong;
+            }
+            out.bytes[pos] = '/' as byte;
+            pos = pos + 1 as usize;
+        }
+    }
+
+    if pos + suffix.len >= WORKSPACE_SCAN_PATH_MAX {
+        return error.WorkspaceScanPathTooLong;
+    }
+    var i: usize = 0;
+    while i < suffix.len {
+        out.bytes[pos + i] = suffix.ptr[i];
+        i = i + 1;
+    }
+    pos = pos + suffix.len;
+    out.bytes[pos] = 0 as byte;
+    out.len = pos;
+    return out;
+}
+
+fn workspace_scan_mode_type(mode: u32) u32 {
+    return mode & WORKSPACE_SCAN_STAT_S_IFMT;
+}
+
+fn workspace_scan_errno_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn workspace_scan_dirent_name_len(entry: &Dirent) usize {
+    var len: usize = 0;
+    while entry.d_name[len] != 0 as byte {
+        len = len + 1;
+    }
+    return len;
+}
+
+fn workspace_scan_dirent_equals(entry: &Dirent, text: &const byte) bool {
+    var i: usize = 0;
+    while true {
+        const left: byte = entry.d_name[i];
+        const right: byte = text[i];
+        if left != right {
+            return false;
+        }
+        if left == 0 as byte {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn workspace_scan_dirent_is_dot(entry: &Dirent) bool {
+    if entry.d_name[0] != '.' as byte {
+        return false;
+    }
+    if entry.d_name[1] == 0 as byte {
+        return true;
+    }
+    if entry.d_name[1] == '.' as byte && entry.d_name[2] == 0 as byte {
+        return true;
+    }
+    return false;
+}
+
+fn workspace_scan_kind_from_mode(mode: u32) !WorkspaceFileKind {
+    const kind: u32 = workspace_scan_mode_type(mode);
+    if kind == WORKSPACE_SCAN_STAT_S_IFREG {
+        return WorkspaceFileKind.Regular;
+    }
+    if kind == WORKSPACE_SCAN_STAT_S_IFLNK {
+        return WorkspaceFileKind.Symlink;
+    }
+    return error.WorkspaceScanUnsupportedFileType;
+}
+
+fn workspace_scan_logical_size(st: &Stat) u64 {
+    if st.st_size < 0 {
+        return 0u64;
+    }
+    return st.st_size as u64;
+}
+
+fn workspace_scan_count_files(root: &WorkspaceScanPath, relative: &WorkspaceScanPath) !usize {
+    const current_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
+    const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
+    if dir == null {
+        if workspace_scan_errno_permission() {
+            return error.WorkspaceScanPermissionDenied;
+        }
+        return error.WorkspaceScanOpenFailed;
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    var total: usize = 0;
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            return total;
+        }
+        if workspace_scan_dirent_is_dot(entry) {
+            continue;
+        }
+        if relative.len == 0 && workspace_scan_dirent_equals(entry, ".hgit") {
+            continue;
+        }
+
+        const name_len: usize = workspace_scan_dirent_name_len(entry);
+        const child_relative: WorkspaceScanPath = try workspace_scan_path_join(relative, entry.d_name[0: name_len]);
+        const child_path: WorkspaceScanPath = try workspace_scan_path_join(root, child_relative.bytes[0: child_relative.len]);
+
+        var st: Stat = Stat{};
+        _ = sys_lstat(&child_path.bytes[0] as &const byte, &st) catch {
+            return error.WorkspaceScanStatFailed;
+        };
+
+        const mode_type: u32 = workspace_scan_mode_type(st.st_mode as u32);
+        if mode_type == WORKSPACE_SCAN_STAT_S_IFDIR {
+            total = total + (try workspace_scan_count_files(root, &child_relative));
+            continue;
+        }
+
+        _ = try workspace_scan_kind_from_mode(st.st_mode as u32);
+        total = total + 1 as usize;
+    }
+    return total;
+}
+
+fn workspace_scan_collect_files(arena: &Arena, root: &WorkspaceScanPath, relative: &WorkspaceScanPath, entries: &WorkspaceFileEntry, next_index: &usize) !void {
+    const current_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
+    const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
+    if dir == null {
+        if workspace_scan_errno_permission() {
+            return error.WorkspaceScanPermissionDenied;
+        }
+        return error.WorkspaceScanOpenFailed;
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            return;
+        }
+        if workspace_scan_dirent_is_dot(entry) {
+            continue;
+        }
+        if relative.len == 0 && workspace_scan_dirent_equals(entry, ".hgit") {
+            continue;
+        }
+
+        const name_len: usize = workspace_scan_dirent_name_len(entry);
+        const child_relative: WorkspaceScanPath = try workspace_scan_path_join(relative, entry.d_name[0: name_len]);
+        const child_path: WorkspaceScanPath = try workspace_scan_path_join(root, child_relative.bytes[0: child_relative.len]);
+
+        var st: Stat = Stat{};
+        _ = sys_lstat(&child_path.bytes[0] as &const byte, &st) catch {
+            return error.WorkspaceScanStatFailed;
+        };
+
+        const mode_type: u32 = workspace_scan_mode_type(st.st_mode as u32);
+        if mode_type == WORKSPACE_SCAN_STAT_S_IFDIR {
+            try workspace_scan_collect_files(arena, root, &child_relative, entries, next_index);
+            continue;
+        }
+
+        const normalized_path: ByteList = try manifest_path_normalize(arena, child_relative.bytes[0: child_relative.len]);
+        entries[*next_index] = WorkspaceFileEntry{
+            path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
+            kind: try workspace_scan_kind_from_mode(st.st_mode as u32),
+            file_mode: st.st_mode as u32,
+            logical_size: workspace_scan_logical_size(&st),
+        };
+        *next_index = *next_index + 1 as usize;
+    }
+    return;
+}
+
+fn min_usize(left: usize, right: usize) usize {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+fn workspace_scan_entry_compare(left: &WorkspaceFileEntry, right: &WorkspaceFileEntry) i32 {
+    return manifest_path_compare(&left.path, &right.path);
+}
+
+fn workspace_scan_sort_entries(arena: &Arena, entries: &WorkspaceFileEntry, len: usize) !void {
+    if len <= 1 as usize {
+        return;
+    }
+
+    const bytes_len: usize = @size_of(WorkspaceFileEntry) as usize * len;
+    const scratch: &WorkspaceFileEntry = arena_alloc(arena, bytes_len) as &WorkspaceFileEntry;
+    if scratch == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var width: usize = 1;
+    while width < len {
+        var start: usize = 0;
+        while start < len {
+            const mid: usize = min_usize(start + width, len);
+            const end: usize = min_usize(mid + width, len);
+
+            var left: usize = start;
+            var right: usize = mid;
+            var out: usize = start;
+            while left < mid && right < end {
+                if workspace_scan_entry_compare(&entries[left], &entries[right]) <= 0 {
+                    scratch[out] = entries[left];
+                    left = left + 1;
+                } else {
+                    scratch[out] = entries[right];
+                    right = right + 1;
+                }
+                out = out + 1;
+            }
+            while left < mid {
+                scratch[out] = entries[left];
+                left = left + 1;
+                out = out + 1;
+            }
+            while right < end {
+                scratch[out] = entries[right];
+                right = right + 1;
+                out = out + 1;
+            }
+
+            var i: usize = start;
+            while i < end {
+                entries[i] = scratch[i];
+                i = i + 1;
+            }
+            start = end;
+        }
+        width = width * 2 as usize;
+    }
+}
+
+fn workspace_scan_validate_unique_paths(entries: &WorkspaceFileEntry, len: usize) !void {
+    if len <= 1 as usize {
+        return;
+    }
+
+    var i: usize = 1;
+    while i < len {
+        if workspace_scan_entry_compare(&entries[i - 1 as usize], &entries[i]) == 0 {
+            return error.WorkspaceScanPathConflict;
+        }
+        i = i + 1;
+    }
+}
+
+export fn workspace_scan_files(arena: &Arena, root_path: &const byte) !WorkspaceFileList {
+    const root: WorkspaceScanPath = try workspace_scan_path_from_cstr(root_path);
+    const empty_relative: WorkspaceScanPath = workspace_scan_path_empty();
+    const file_count: usize = try workspace_scan_count_files(&root, &empty_relative);
+    if file_count == 0 {
+        return WorkspaceFileList{ ptr: null, len: 0 };
+    }
+
+    const raw_entries: &WorkspaceFileEntry = arena_alloc(arena, @size_of(WorkspaceFileEntry) as usize * file_count) as &WorkspaceFileEntry;
+    if raw_entries == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var next_index: usize = 0;
+    try workspace_scan_collect_files(arena, &root, &empty_relative, raw_entries, &next_index);
+    if next_index != file_count {
+        return error.WorkspaceScanCountMismatch;
+    }
+
+    try workspace_scan_sort_entries(arena, raw_entries, file_count);
+    try workspace_scan_validate_unique_paths(raw_entries, file_count);
+    return workspace_file_list_from_slice(raw_entries[0: file_count]);
+}

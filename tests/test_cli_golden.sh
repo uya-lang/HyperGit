@@ -36,4 +36,5 @@ run_case() {
 }
 
 run_case unknown 2 tests/golden/unknown.stderr bogus
+run_case add_usage 2 tests/golden/add_usage.stderr add
 run_case doctor 3 tests/golden/doctor.stderr doctor

@@ -9,6 +9,7 @@ export enum DispatchAction {
     Help,
     Version,
     Status,
+    Add,
     Doctor,
     Init,
     Unknown
@@ -55,6 +56,14 @@ export fn plan_from_first_arg(argc: i32, first_arg: &byte) DispatchPlan {
     if same_arg(first_arg, "status") {
         return DispatchPlan {
             action: DispatchAction.Status,
+            exit_code: EXIT_OK,
+            subject: first_arg,
+        };
+    }
+
+    if same_arg(first_arg, "add") {
+        return DispatchPlan {
+            action: DispatchAction.Add,
             exit_code: EXIT_OK,
             subject: first_arg,
         };
