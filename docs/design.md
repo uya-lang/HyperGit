@@ -34,7 +34,7 @@ Git 的优秀之处是：
 6. **协议以对象传输为中心，而不是以“用户当前需要的视图”为中心**  
    现代 Git 已经有 `partial clone`、`sparse-checkout`、`commit-graph`、`multi-pack-index`、`Scalar` 等优化，但它们更像增强层，而不是最初的数据模型设计。Git 官方 `sparse-checkout` 允许只检出部分目录；Scalar 通过 `partial clone`、`background maintenance`、`sparse-checkout` 等特性优化大仓库；`multi-pack-index` 用于跨多个 `packfile` 加速对象查找。([Git][1])
 
-## 2. 新系统总体架构：ParaGit / MegaGit
+## 2. 新系统总体架构：HyperGit
 
 我会设计一个类似下面的架构：
 
@@ -226,6 +226,8 @@ BlobMeta {
     chunking_strategy: fixed | content_defined
     chunks: [ChunkRef]
     content_fingerprint
+    encryption_profile
+    dedupe_scope
 }
 ```
 
@@ -234,10 +236,11 @@ BlobMeta {
 ```text
 ChunkRef {
     chunk_id: Hash
+    storage_id: Hash
     offset: u64
     logical_size: u32
-    compressed_size: u32
-    checksum
+    stored_size: u32
+    ciphertext_checksum
     storage_tier
 }
 ```
@@ -246,8 +249,8 @@ ChunkRef {
 
 ```text
 Chunk {
-    chunk_id: Hash
-    compressed_payload
+    storage_id: Hash
+    encrypted_payload
 }
 ```
 
@@ -332,9 +335,9 @@ chunks: not downloaded
 当用户真的打开文件、构建系统需要文件、或者用户显式执行命令时，才下载内容：
 
 ```bash
-mg hydrate assets/model/v3/model.bin
-mg hydrate assets/models/**
-mg dehydrate assets/models/**
+hgx hydrate assets/model/v3/model.bin
+hgx hydrate assets/models/**
+hgx dehydrate assets/models/**
 ```
 
 这点看起来像 Git LFS 的 pointer + pull，但本质区别是：
@@ -366,10 +369,11 @@ offset -> chunk range -> fetch needed chunks only
 ```text
 1. 扫描文件
 2. 并行切 chunk
-3. 并行计算 hash
-4. 查询远端已有 chunk
-5. 只上传缺失 chunk
-6. 写入 BlobMeta
+3. 并行计算 logical_chunk_id / storage_id
+4. 并行压缩并加密
+5. 查询远端已有 chunk
+6. 只上传缺失 chunk
+7. 写入 BlobMeta
 ```
 
 下载流程：
@@ -379,8 +383,8 @@ offset -> chunk range -> fetch needed chunks only
 2. 选择需要的 chunk
 3. 按 storage locality 分组
 4. 并行下载
-5. 并行校验
-6. 并行解压
+5. 并行校验密文完整性
+6. 并行解密与解压
 7. 顺序组装或按需映射
 ```
 
@@ -390,8 +394,9 @@ offset -> chunk range -> fetch needed chunks only
 def upload_large_file(path):
     chunks = content_defined_chunk(path)
 
-    missing = remote.find_missing_chunks(
-        [chunk.hash for chunk in chunks]
+    missing = remote.find_missing_chunks_in_scope(
+        scope_token=current_repo.dedupe_scope_token,
+        chunk_storage_ids=[chunk.storage_id for chunk in chunks]
     )
 
     parallel_upload(missing)
@@ -422,7 +427,7 @@ def upload_large_file(path):
 例如：
 
 ```bash
-mg diff model.bin
+hgx diff model.bin
 ```
 
 输出不应该是传统文本 diff，而更接近：
@@ -460,14 +465,33 @@ both changed different blob -> conflict
 
 #### 3.3.6 去重、冷热分层与安全策略
 
-大文件系统最重要的能力之一是去重，至少分三层：
+大文件系统最重要的能力之一是去重，但去重边界必须先于“全局共享”来定义。HyperGit 里，去重不直接建立在“全组织裸 hash 可见”上，而是建立在**授权后的 dedupe scope** 上：
+
+```text
+Repo scope    -> 默认，只在单仓库内 dedupe
+Tenant scope  -> 同一业务租户内 dedupe
+Org scope     -> 明确授权的组织级共享对象池
+```
+
+对象标识也分成两层：
+
+```text
+logical_chunk_id   = SHA256(plaintext_chunk)
+physical_storage_id = HMAC-SHA256(scope_secret, plaintext_chunk)
+```
+
+- `logical_chunk_id` 用于内容完整性校验、manifest 引用和跨版本比较。
+- `physical_storage_id` 只在服务端存储层和被授权的 dedupe scope 内可见，用于物理去重。
+- 客户端不会对“全局对象库”发起裸存在性探测；缺块查询必须携带 scope token，服务端也只能在该授权 scope 内回答是否缺失。
+
+在这个前提下，去重至少分三层：
 
 1. **Chunk 级去重**  
-   相同 chunk 只存一次：`chunk_id = hash(chunk_content)`。
+   相同 chunk 只存一次，但物理去重键是 `physical_storage_id`，不是裸内容 hash。
 2. **跨文件去重**  
    两个文件共享部分内容时，也能复用 chunk。
 3. **跨仓库去重**  
-   企业内部多个仓库共用 SDK、数据集、基础模型时，可以使用组织级 chunk store。
+   企业内部多个仓库共用 SDK、数据集、基础模型时，可以在显式授权的 tenant/org scope 内使用共享 chunk store，而不是默认全组织互相探测。
 
 Chunk 还应该支持冷热分层：
 
@@ -500,17 +524,28 @@ retention
 ```text
 /data/customer/**
     require role: data-team
+    dedupe-scope: tenant:data-platform
     audit: enabled
     local-cache-ttl: 24h
 ```
 
-chunk 内容可以独立加密：
+chunk 内容可以独立压缩和加密，但顺序必须固定为“先压缩，再加密，再存储”：
 
 ```text
-chunk_content -> encrypt -> compress/store
+plaintext_chunk
+    -> compress
+    -> encrypt(chunk_key)
+    -> store(ciphertext)
 ```
 
-`BlobMeta` 只记录加密 key reference，而不是直接存 key。
+校验链也要分层：
+
+```text
+logical_chunk_id    -> 约束明文内容身份
+ciphertext_checksum -> 约束传输与落盘完整性
+```
+
+`BlobMeta` 只记录加密 key reference，而不是直接存 key；真正的数据面校验先验证密文完整性，再解密并验证 `logical_chunk_id`。
 
 #### 3.3.7 与 Git LFS 的区别和默认阈值
 
@@ -590,10 +625,11 @@ diff = "archive-index"
 
 ### 3.4 发布视图与一致性模型
 
-如果索引成为核心读路径，就必须先定义一致性边界。系统需要明确区分三类数据：
+如果索引成为核心读路径，就必须先定义一致性边界。系统需要明确区分四类数据：
 
 - **权威对象**：`Commit`、`Manifest`、`Blob Metadata`、`Chunk`，是最终事实来源。
-- **强一致服务索引**：`commit graph`、`tree segment map`、`changed path bloom`、基础 path posting list，必须和 ref 发布保持同一快照。
+- **最小同步发布索引**：`commit graph delta`、`manifest shard locator`、`changed path bloom`、changed-path 的 L0 posting list；它们必须和 ref 发布保持同一快照。
+- **延迟构建的服务加速索引**：完整 `tree segment map`、大范围 path fanout cache、模块聚合 posting，可在 ref 发布后补齐，但查询必须能回退到权威对象路径。
 - **异步分析索引**：`DependencyIndex`、深度 `LineageIndex`、热度统计、预取提示，可以落后于最新提交，但必须显式带版本。
 
 查询不直接对“最新对象集合”执行，而是对一个已发布视图执行：
@@ -614,10 +650,11 @@ PublishedView {
 
 约束如下：
 
-1. `push` 先上传权威对象，再构建强一致服务索引，最后原子发布 `PublishedView`；ref 在此之前对外不可见。
+1. `push` 先上传权威对象，再构建**最小同步发布索引**并生成 `PublishedView`，最后原子发布 ref；只有这一小组索引会阻塞 ref 可见性。
 2. 多步操作必须绑定同一个 `view_id`；一次 `checkout`、`diff`、`merge`、`blame`、IDE 浏览会话不能在中途漂到另一个索引快照上。
-3. 异步分析索引允许滞后，但查询结果必须返回自己的 watermark；若所需索引未追平，则退化到较慢但正确的权威对象路径。
-4. 任意索引都必须可从权威对象重建；索引损坏只能影响性能，不能改变仓库事实。
+3. 延迟构建的服务加速索引和异步分析索引都允许滞后，但查询结果必须返回自己的 watermark；若所需索引未追平，则退化到较慢但正确的权威对象路径。
+4. 同步发布阶段必须有明确预算，例如“单次 push 只同步触达 changed shards”；超过预算的二级索引自动转入后台任务，不能无限期阻塞提交发布。
+5. 任意索引都必须可从权威对象重建；索引损坏只能影响性能，不能改变仓库事实。
 
 ## 4. 存储层设计
 
@@ -1041,9 +1078,9 @@ PathHistoryIndex {
 让下面操作变成索引查询：
 
 ```bash
-log -- src/payment/foo.go
-blame src/payment/foo.go
-diff main...feature -- src/payment
+hgx log -- src/payment/foo.go
+hgx blame src/payment/foo.go
+hgx diff main...feature -- src/payment
 ```
 
 ### 7.3 Build / Ownership Index
@@ -1067,9 +1104,9 @@ DependencyIndex {
 这让系统能支持：
 
 ```bash
-megagit affected-tests
-megagit affected-owners
-megagit affected-builds
+hgx affected tests
+hgx affected owners
+hgx affected builds
 ```
 
 ## 8. 并发写入与引用模型
@@ -1111,11 +1148,11 @@ Push 流程：
 
 1. 客户端上传新对象。
 2. 服务端校验对象完整性。
-3. 服务端构建强一致服务索引并生成 `PublishedView`。
+3. 服务端只构建最小同步发布索引，并生成 `PublishedView`。
 4. 服务端校验权限、策略、CI gate。
 5. CAS 更新 `ref -> (target_commit, published_view)`。
-6. 失败则返回最新 ref，让客户端 rebase/merge。
-7. 可选分析索引继续异步追平，但不会改变第 5 步已经发布的读视图。
+6. 延迟服务索引和分析索引在后台继续追平，并把 watermark 绑定到同一个 `view_id`。
+7. 若第 5 步失败，则返回最新 ref，让客户端 rebase/merge；后台索引任务也必须按 `view_id` 幂等收敛，避免对失败发布做无用放大。
 
 ## 9. GC / Compaction 设计
 
@@ -1172,21 +1209,21 @@ GetPackSegments(object_ids, view)
 
 ## 11. 命令层体验
 
-用户命令保持类似 Git：
+用户命令保持类似 Git。本文统一假设 CLI 名称为 `hgx`：
 
 ```bash
-mg clone repo
-mg checkout main
-mg status
-mg diff
-mg commit
-mg push
+hgx clone repo
+hgx checkout main
+hgx status
+hgx diff
+hgx commit
+hgx push
 ```
 
 但默认行为不同：
 
 ```bash
-mg clone repo
+hgx clone repo
 ```
 
 只下载：
@@ -1199,13 +1236,13 @@ mg clone repo
 新增命令：
 
 ```bash
-mg sparse add src/payment
-mg sparse remove legacy/
-mg prefetch //team/payment
-mg hydrate src/payment/**
-mg dehydrate third_party/**
-mg affected tests
-mg doctor performance
+hgx sparse add src/payment
+hgx sparse remove legacy/
+hgx prefetch //team/payment
+hgx hydrate src/payment/**
+hgx dehydrate third_party/**
+hgx affected tests
+hgx doctor performance
 ```
 
 ## 12. 关键算法示例
@@ -1273,7 +1310,7 @@ def fetch_objects(object_ids):
 
 ### 第一层：Git Compatible Mode
 
-支持：
+这是一个兼容网关，不是把 native 对象模型原样暴露给 Git 客户端。它支持：
 
 ```bash
 git clone
@@ -1281,7 +1318,12 @@ git fetch
 git push
 ```
 
-服务端可以导出标准 Git object view。
+约束与语义如下：
+
+- `git clone` / `git fetch` 读取的是某个 `PublishedView` 的确定性 Git 导出结果，导出对象 id 在该兼容视图内稳定，但不要求与 native object id 相同。
+- `git push` 只允许进入开启兼容模式的 refs；服务端先把 Git tree/blob/commit 导入 native manifest/object 模型，再走同一套 ref CAS 发布流程。
+- native chunked blob 在兼容导出时按策略降级：小对象导出为普通 Git blob，大对象导出为普通 blob 或 Git LFS pointer，取决于仓库策略。
+- virtual workspace、server-side diff、范围读取、路径级查询等 native 能力不会透传给 Git 客户端；兼容层的目标是互操作，不是保留全部语义。
 
 ### 第二层：Enhanced Git Mode
 
@@ -1297,7 +1339,7 @@ git push
 
 这和 Scalar 的方向一致：Scalar 是通过配置高级 Git 特性、后台维护、减少网络传输来优化大仓库使用体验。([Git][3])
 
-### 第三层：Native Mega Mode
+### 第三层：Native HyperGit Mode
 
 启用新协议：
 
