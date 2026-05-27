@@ -1,0 +1,184 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+
+use libc.free;
+use libc.fprintf;
+use libc.malloc;
+use libc.stderr;
+use libc.stdout;
+use cli.EXIT_OK;
+use cli.EXIT_RUNTIME_ERROR;
+use cli.EXIT_USAGE_ERROR;
+use core.ids.CommitId;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.ObjectId;
+use core.ids.commit_id_encode_hex;
+use object.codec.decode_commit_object;
+use object.types.ByteList;
+use object.types.CommitPayload;
+use store.head_ref.repo_head_ref_exists;
+use store.head_ref.repo_read_head_commit;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_join_literal;
+use store.repo_layout.repo_read_config;
+
+const LOG_ARENA_BYTES: usize = 33554432 as usize;
+
+export const LOG_USAGE_TEXT: &const byte = "error: log does not take any arguments\n";
+export const LOG_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
+export const LOG_PERMISSION_TEXT: &const byte = "error: permission denied while reading commit log\n";
+export const LOG_EMPTY_TEXT: &const byte = "error: no commits yet\n";
+export const LOG_FAILURE_TEXT: &const byte = "error: failed to read commit log\n";
+
+fn log_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len + 1 as usize;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.CommitAlloc;
+    }
+    return raw[0: want];
+}
+
+fn log_byte_list_cstr(arena: &Arena, value: &ByteList) !&byte {
+    const out: &[byte] = try log_arena_bytes(arena, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1;
+    }
+    out.ptr[value.len] = 0 as byte;
+    return out.ptr;
+}
+
+fn log_print_commit(arena: &Arena, commit_id: &CommitId, payload: &CommitPayload, first_entry: bool) !void {
+    if !first_entry {
+        fprintf(stdout, "\n" as *byte);
+    }
+
+    var hex: [byte: 65] = [];
+    _ = try commit_id_encode_hex(commit_id, hex[0: HASH32_HEX_BYTES]);
+    hex[HASH32_HEX_BYTES] = 0 as byte;
+
+    const author_name: &byte = try log_byte_list_cstr(arena, &payload.author.name);
+    const author_email: &byte = try log_byte_list_cstr(arena, &payload.author.email);
+    const message: &byte = try log_byte_list_cstr(arena, &payload.message);
+
+    fprintf(stdout, "commit %s\n" as *byte, &hex[0]);
+    fprintf(stdout, "Author: %s <%s>\n" as *byte, author_name, author_email);
+    fprintf(stdout, "\n    %s\n" as *byte, message);
+}
+
+export fn run_log() i32 {
+    if get_argc() != 2 {
+        fprintf(stderr, "%s" as *byte, LOG_USAGE_TEXT);
+        return EXIT_USAGE_ERROR;
+    }
+
+    const root: RepoPath = repo_find_root_from_cwd() catch |err| {
+        if @error_id(err) == @error_id(error.RepoNotFound) {
+            fprintf(stderr, "%s" as *byte, LOG_NOT_REPO_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, LOG_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const config: RepoConfig = repo_read_config(&root) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, LOG_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const has_head: bool = repo_head_ref_exists(&root, &config) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, LOG_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    if !has_head {
+        fprintf(stderr, "%s" as *byte, LOG_EMPTY_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+
+    const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
+        fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            fprintf(stderr, "%s" as *byte, LOG_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const arena_storage: &byte = malloc(LOG_ARENA_BYTES) as &byte;
+    if arena_storage == null {
+        fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    defer {
+        free(arena_storage as &void);
+    }
+    var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+    arena_init(&arena, arena_storage, LOG_ARENA_BYTES);
+
+    var current: CommitId = repo_read_head_commit(&root, &config) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, LOG_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    var first_entry: bool = true;
+    while true {
+        const object_bytes: ObjectBytes = store.get(ObjectId{ hash: current.id.hash }, &arena) catch |err| {
+            if @error_id(err) == @error_id(error.StorePermissionDenied) {
+                fprintf(stderr, "%s" as *byte, LOG_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        var offset: usize = 0;
+        const payload: CommitPayload = decode_commit_object(&arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+            fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        log_print_commit(&arena, &current, &payload, first_entry) catch {
+            fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        if payload.parents.len == 0 {
+            return EXIT_OK;
+        }
+        current = payload.parents.ptr[0];
+        first_entry = false;
+    }
+
+    return EXIT_OK;
+}

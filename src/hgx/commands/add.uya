@@ -19,23 +19,32 @@ use cli.EXIT_NOT_IMPLEMENTED;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
 use cli.EXIT_USAGE_ERROR;
+use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.ObjectId;
+use core.ids.commit_id_compare;
+use core.ids.object_id_compare;
 use core.ids.object_id_from_hash;
+use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_path_compare;
 use manifest.path.manifest_path_normalize;
 use manifest.query.ManifestPathspecList;
 use manifest.query.manifest_pathspec_list_from_slice;
 use manifest.query.manifest_pathspec_matches_any;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
 use object.codec.encode_small_blob_payload;
+use object.codec.decode_commit_object;
 use object.codec.small_blob_payload_encoded_len;
 use object.hash.hash_object_payload_bytes;
 use object.small_blob.small_blob_content_hash;
 use object.types.ByteList;
+use object.types.CommitPayload;
 use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
 use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
 use store.repo_layout.RepoPath;
@@ -267,6 +276,20 @@ fn add_stage_entry_clone(entry: &StageEntry) StageEntry {
     };
 }
 
+fn add_byte_list_equal(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
 fn add_load_existing_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapshot {
     const snapshot: StageSnapshot = stage_file_read(repo_path_cstr(stage_path) as &const byte, arena) catch |err| {
         if @error_id(err) == @error_id(error.StageFileNotFound) {
@@ -276,6 +299,46 @@ fn add_load_existing_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapsh
         return error.AddStageReadFailed;
     };
     return snapshot;
+}
+
+fn add_load_base_inputs(arena: &Arena, store: &LooseObjectStore, base_commit: &CommitId) !ManifestLeafInputList {
+    const zero_commit: CommitId = stage_zero_commit_id();
+    if commit_id_compare(base_commit, &zero_commit) == 0 {
+        return ManifestLeafInputList{ ptr: null, len: 0 };
+    }
+
+    const object_bytes: ObjectBytes = store.get(base_commit.id, arena) catch {
+        return error.AddStoreFailed;
+    };
+    var offset: usize = 0;
+    const payload: CommitPayload = decode_commit_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.AddStoreFailed;
+    };
+    return manifest_load_flatten(arena, store, &payload.manifest_root) catch {
+        return error.AddStoreFailed;
+    };
+}
+
+fn add_find_base_entry(base_inputs: ManifestLeafInputList, path: &ByteList) isize {
+    var i: usize = 0;
+    while i < base_inputs.len {
+        if add_byte_list_equal(&base_inputs.ptr[i].path, path) {
+            return i as isize;
+        }
+        i = i + 1 as usize;
+    }
+    return -1;
+}
+
+fn add_workspace_has_path(files: &WorkspaceFileList, path: &ByteList) bool {
+    var i: usize = 0;
+    while i < files.len {
+        if add_byte_list_equal(&files.ptr[i].path, path) {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
 }
 
 fn add_merge_entries(arena: &Arena, existing: StageEntryList, updates: &StageEntry, update_len: usize) !StageEntryList {
@@ -331,21 +394,35 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     arena_init(&arena, arena_storage, ADD_ARENA_BYTES);
 
     const scanned_files: WorkspaceFileList = try workspace_scan_files(&arena, repo_path_cstr(root) as &const byte);
-    const matched_count: usize = add_count_matches(&scanned_files, &pathspecs);
-    if matched_count == 0 {
-        return error.AddNoMatches;
-    }
 
     const stage_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STAGE_REL);
     const existing_snapshot: StageSnapshot = try add_load_existing_snapshot(&stage_path, &arena);
 
-    const raw_updates: &StageEntry = arena_alloc(&arena, @size_of(StageEntry) as usize * matched_count) as &StageEntry;
+    const matched_count: usize = add_count_matches(&scanned_files, &pathspecs);
+
+    const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
+    const store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
+    const base_inputs: ManifestLeafInputList = try add_load_base_inputs(&arena, &store, &existing_snapshot.state.base_commit);
+
+    var delete_match_count: usize = 0;
+    var base_index: usize = 0;
+    while base_index < base_inputs.len {
+        if manifest_pathspec_matches_any(pathspecs, &base_inputs.ptr[base_index].path) && !add_workspace_has_path(&scanned_files, &base_inputs.ptr[base_index].path) {
+            delete_match_count = delete_match_count + 1 as usize;
+        }
+        base_index = base_index + 1 as usize;
+    }
+
+    const max_updates: usize = matched_count + delete_match_count;
+    if max_updates == 0 {
+        return error.AddNoMatches;
+    }
+
+    const raw_updates: &StageEntry = arena_alloc(&arena, @size_of(StageEntry) as usize * max_updates) as &StageEntry;
     if raw_updates == null {
         return error.AddAlloc;
     }
 
-    const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
-    const store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
     const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
 
     var update_index: usize = 0;
@@ -383,16 +460,54 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         const stored_id: ObjectId = store.put(ObjectKind.SmallBlob, add_owned_bytes_slice(&encoded)) catch {
             return error.AddStoreFailed;
         };
-        raw_updates[update_index] = StageEntry{
-            path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
-            kind: StageEntryKind.Add,
-            base_object: add_zero_object_id(),
-            has_staged_object: true,
-            staged_object: ObjectId{ hash: stored_id.hash },
-            file_mode: file_entry.file_mode,
-        };
+        const base_entry_index: isize = add_find_base_entry(ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len }, &file_entry.path);
+        if base_entry_index >= 0 as isize {
+            const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_entry_index as usize];
+            if object_id_compare(&stored_id, &base_entry.object_id) == 0 && file_entry.file_mode == base_entry.mode {
+                file_index = file_index + 1;
+                continue;
+            }
+            raw_updates[update_index] = StageEntry{
+                path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
+                kind: StageEntryKind.Modify,
+                base_object: ObjectId{ hash: base_entry.object_id.hash },
+                has_staged_object: true,
+                staged_object: ObjectId{ hash: stored_id.hash },
+                file_mode: file_entry.file_mode,
+            };
+        } else {
+            raw_updates[update_index] = StageEntry{
+                path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
+                kind: StageEntryKind.Add,
+                base_object: add_zero_object_id(),
+                has_staged_object: true,
+                staged_object: ObjectId{ hash: stored_id.hash },
+                file_mode: file_entry.file_mode,
+            };
+        }
         update_index = update_index + 1;
         file_index = file_index + 1;
+    }
+
+    base_index = 0;
+    while base_index < base_inputs.len {
+        const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_index];
+        if manifest_pathspec_matches_any(pathspecs, &base_entry.path) && !add_workspace_has_path(&scanned_files, &base_entry.path) {
+            raw_updates[update_index] = StageEntry{
+                path: ByteList{ ptr: base_entry.path.ptr, len: base_entry.path.len },
+                kind: StageEntryKind.Delete,
+                base_object: ObjectId{ hash: base_entry.object_id.hash },
+                has_staged_object: false,
+                staged_object: add_zero_object_id(),
+                file_mode: base_entry.mode,
+            };
+            update_index = update_index + 1 as usize;
+        }
+        base_index = base_index + 1 as usize;
+    }
+
+    if update_index == 0 {
+        return 0 as usize;
     }
 
     const merged_entries: StageEntryList = try add_merge_entries(&arena, existing_snapshot.entries, raw_updates, update_index);

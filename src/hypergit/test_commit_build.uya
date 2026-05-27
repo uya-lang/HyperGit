@@ -1,0 +1,165 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use libc.system;
+use core.ids.Hash32;
+use core.ids.CommitId;
+use core.ids.ManifestId;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use core.ids.manifest_id_from_object;
+use core.ids.commit_id_compare;
+use core.ids.manifest_id_compare;
+use object.codec.decode_commit_object;
+use object.hash.hash_commit_payload;
+use object.commit_build.commit_object_build_and_store;
+use object.types.ByteList;
+use object.types.BloomFilter;
+use object.types.ModuleBitmap;
+use object.types.Identity;
+use object.types.CommitPayload;
+use object.types.byte_list_from_slice;
+use object.types.commit_id_list_from_slice;
+use store.object_store.ObjectBytes;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn make_commit_id(seed: byte) CommitId {
+    return commit_id_from_object(object_id_from_hash(make_hash(seed)));
+}
+
+fn make_manifest_id(seed: byte) ManifestId {
+    return manifest_id_from_object(object_id_from_hash(make_hash(seed)));
+}
+
+fn empty_bloom() BloomFilter {
+    return BloomFilter{ bytes: ByteList{ ptr: null, len: 0 } };
+}
+
+fn empty_module_bitmap() ModuleBitmap {
+    return ModuleBitmap{ bytes: ByteList{ ptr: null, len: 0 } };
+}
+
+fn test_commit_object_build_and_store_roundtrip() !void {
+    try expect(system("rm -rf build/commit-build-test && mkdir -p build/commit-build-test/objects/loose") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/commit-build-test/objects/loose");
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    var name: [byte: 5] = ['a' as byte, 'l' as byte, 'i' as byte, 'c' as byte, 'e' as byte];
+    var mail: [byte: 17] = ['a' as byte, 'l' as byte, 'i' as byte, 'c' as byte, 'e' as byte, '@' as byte, 'e' as byte, 'x' as byte, 'a' as byte, 'm' as byte, 'p' as byte, 'l' as byte, 'e' as byte, '.' as byte, 'c' as byte, 'o' as byte, 'm' as byte];
+    var message: [byte: 12] = ['f' as byte, 'i' as byte, 'r' as byte, 's' as byte, 't' as byte, ' ' as byte, 'c' as byte, 'o' as byte, 'm' as byte, 'm' as byte, 'i' as byte, 't' as byte];
+    var empty_parents: [CommitId: 1] = [make_commit_id(1 as byte)];
+    const author: Identity = Identity{
+        name: byte_list_from_slice(name[0: 5]),
+        email: byte_list_from_slice(mail[0: 17]),
+    };
+    const committer: Identity = Identity{
+        name: byte_list_from_slice(name[0: 5]),
+        email: byte_list_from_slice(mail[0: 17]),
+    };
+    const payload: CommitPayload = CommitPayload{
+        parents: commit_id_list_from_slice(empty_parents[0: 0]),
+        author: author,
+        committer: committer,
+        message: byte_list_from_slice(message[0: 12]),
+        timestamp_ms: 1234i64,
+        manifest_root: make_manifest_id(9 as byte),
+        changed_path_bloom: empty_bloom(),
+        module_bitmap: empty_module_bitmap(),
+        generation: 1u64,
+    };
+
+    const commit_id: CommitId = try commit_object_build_and_store(&arena, &store, &payload);
+    const expected_id: CommitId = try hash_commit_payload(&arena, &payload);
+    try expect(commit_id_compare(&commit_id, &expected_id) == 0);
+    try expect(try store.has(commit_id.id));
+
+    var read_arena_buf: [byte: 32768] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 32768 as usize);
+
+    const object_bytes: ObjectBytes = try store.get(commit_id.id, &read_arena);
+    var offset: usize = 0;
+    const decoded: CommitPayload = try decode_commit_object(&read_arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    try expect(offset == object_bytes.bytes.len);
+    try expect(decoded.parents.len == 0 as usize);
+    try expect(manifest_id_compare(&decoded.manifest_root, &payload.manifest_root) == 0);
+    try expect(decoded.message.len == payload.message.len);
+
+    const dedup_id: CommitId = try commit_object_build_and_store(&arena, &store, &payload);
+    try expect(commit_id_compare(&commit_id, &dedup_id) == 0);
+}
+
+fn test_commit_object_build_preserves_parent_metadata() !void {
+    try expect(system("rm -rf build/commit-build-parent && mkdir -p build/commit-build-parent/objects/loose") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/commit-build-parent/objects/loose");
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    var name: [byte: 3] = ['b' as byte, 'o' as byte, 'b' as byte];
+    var mail: [byte: 15] = ['b' as byte, 'o' as byte, 'b' as byte, '@' as byte, 'e' as byte, 'x' as byte, 'a' as byte, 'm' as byte, 'p' as byte, 'l' as byte, 'e' as byte, '.' as byte, 'c' as byte, 'o' as byte, 'm' as byte];
+    var message: [byte: 6] = ['s' as byte, 'e' as byte, 'c' as byte, 'o' as byte, 'n' as byte, 'd' as byte];
+    var parents: [CommitId: 1] = [make_commit_id(44 as byte)];
+    const author: Identity = Identity{
+        name: byte_list_from_slice(name[0: 3]),
+        email: byte_list_from_slice(mail[0: 15]),
+    };
+    const committer: Identity = Identity{
+        name: byte_list_from_slice(name[0: 3]),
+        email: byte_list_from_slice(mail[0: 15]),
+    };
+    const payload: CommitPayload = CommitPayload{
+        parents: commit_id_list_from_slice(parents[0: 1]),
+        author: author,
+        committer: committer,
+        message: byte_list_from_slice(message[0: 6]),
+        timestamp_ms: 5678i64,
+        manifest_root: make_manifest_id(45 as byte),
+        changed_path_bloom: empty_bloom(),
+        module_bitmap: empty_module_bitmap(),
+        generation: 2u64,
+    };
+
+    const commit_id: CommitId = try commit_object_build_and_store(&arena, &store, &payload);
+
+    var read_arena_buf: [byte: 32768] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 32768 as usize);
+
+    const object_bytes: ObjectBytes = try store.get(commit_id.id, &read_arena);
+    var offset: usize = 0;
+    const decoded: CommitPayload = try decode_commit_object(&read_arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    try expect(decoded.parents.len == 1 as usize);
+    try expect(commit_id_compare(&decoded.parents.ptr[0], &parents[0]) == 0);
+    try expect(decoded.generation == 2u64);
+    try expect(decoded.timestamp_ms == 5678i64);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Commit Build Tests");
+    run_test("commit object build and store roundtrip", test_commit_object_build_and_store_roundtrip);
+    run_test("commit object build preserves parent metadata", test_commit_object_build_preserves_parent_metadata);
+    return test_suite_end();
+}

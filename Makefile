@@ -24,19 +24,29 @@ test:
 	$(UYA) test src/hypergit/test_manifest_path.uya
 	$(UYA) test src/hypergit/test_manifest_trie.uya
 	$(UYA) test src/hypergit/test_manifest_shard.uya
+	$(UYA) test src/hypergit/test_manifest_root.uya
 	$(UYA) test src/hypergit/test_manifest_query.uya
 	$(UYA) test src/hypergit/test_manifest_diff.uya
+	$(UYA) test src/hypergit/test_commit_build.uya
 	$(UYA) test src/hypergit/test_stage_state.uya
 	$(UYA) test src/hypergit/test_stage_file.uya
 	$(UYA) test src/hypergit/test_small_blob_hash.uya
 	$(UYA) test src/hypergit/test_workspace_scan.uya
 	$(UYA) test src/hypergit/test_loose_store.uya
 	$(UYA) test src/hgx/test_repo_layout.uya
+	$(UYA) test src/hgx/test_head_ref.uya
+	$(UYA) test src/hgx/test_commit_partial_stage.uya
 	$(UYA) test src/hgx/test_cli_args.uya
 	./tests/test_cli_golden.sh
 	./tests/test_add_stage.sh
+	./tests/test_add_delete.sh
+	./tests/test_commit_first.sh
+	./tests/test_commit_second_parent.sh
+	./tests/test_log_first.sh
 	./tests/test_repo_init.sh
 	./tests/test_status_empty.sh
+	./tests/test_status_clean.sh
+	./tests/test_status_split.sh
 	./tests/test_loose_store_concurrent.sh
 
 clean:

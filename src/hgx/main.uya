@@ -6,7 +6,9 @@ use cli.DispatchAction;
 use cli.DispatchPlan;
 use cli.plan_from_first_arg;
 use commands.add.run_add;
+use commands.commit.run_commit;
 use commands.help.run_help;
+use commands.log.run_log;
 use commands.version.run_version;
 use commands.status.run_status;
 use commands.doctor.run_doctor;
@@ -26,6 +28,10 @@ export fn main() i32 {
         return run_status();
     } else if plan.action == DispatchAction.Add {
         return run_add();
+    } else if plan.action == DispatchAction.Commit {
+        return run_commit();
+    } else if plan.action == DispatchAction.Log {
+        return run_log();
     } else if plan.action == DispatchAction.Doctor {
         return run_doctor();
     } else if plan.action == DispatchAction.Init {

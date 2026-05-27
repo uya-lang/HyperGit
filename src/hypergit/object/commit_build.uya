@@ -1,0 +1,18 @@
+use std.mem.arena.Arena;
+
+use core.ids.CommitId;
+use core.ids.ObjectId;
+use core.ids.commit_id_from_object;
+use object.codec.commit_payload_to_canonical;
+use object.types.ByteList;
+use object.types.CommitPayload;
+use object.types.ObjectKind;
+use object.validate.validate_commit_payload;
+use store.loose_store.LooseObjectStore;
+
+export fn commit_object_build_and_store(arena: &Arena, store: &LooseObjectStore, payload: &CommitPayload) !CommitId {
+    try validate_commit_payload(payload);
+    const encoded: ByteList = try commit_payload_to_canonical(arena, payload);
+    const object_id: ObjectId = try store.put(ObjectKind.Commit, encoded.ptr[0: encoded.len]);
+    return commit_id_from_object(object_id);
+}

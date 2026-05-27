@@ -1,30 +1,101 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+
 use libc.Stat;
 use libc.errno;
+use libc.free;
 use libc.fprintf;
+use libc.malloc;
 use libc.stat;
 use libc.stderr;
 use libc.stdout;
 use libc.EACCES;
 use libc.EPERM;
 
+use commands.add.add_worktree_small_blob_id;
 use cli.EXIT_NOT_IMPLEMENTED;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
+use core.ids.CommitId;
+use core.ids.ObjectId;
+use core.ids.object_id_compare;
+use manifest.load.manifest_load_flatten;
+use manifest.path.manifest_path_compare;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use object.codec.decode_commit_object;
+use object.types.ByteList;
+use object.types.CommitPayload;
+use store.head_ref.repo_read_head_commit;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
 use store.repo_layout.HGIT_REFS_HEADS_REL;
+use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
 use store.repo_layout.REPO_PATH_MAX;
 use store.repo_layout.RepoConfig;
 use store.repo_layout.RepoPath;
 use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_join_literal;
 use store.repo_layout.repo_read_config;
 use store.repo_layout.repo_path_cstr;
+use workspace.scan.WorkspaceFileEntry;
+use workspace.scan.WorkspaceFileKind;
+use workspace.scan.WorkspaceFileList;
+use workspace.scan.workspace_scan_files;
+use workspace.stage.StageEntry;
+use workspace.stage.StageEntryKind;
+use workspace.stage.StageEntryList;
+use workspace.stage.StageSnapshot;
+use workspace.stage.stage_empty_snapshot;
+use workspace.stage.stage_entry_has_staged_content;
+use workspace.stage_file.stage_file_read;
 
-export const STATUS_EMPTY_TEXT: &const byte = "On branch %s\n\nNo commits yet\n\nnothing to commit\n";
+const STATUS_ARENA_BYTES: usize = 33554432 as usize;
+
+error StatusAlloc;
+error StatusPathTooLong;
+error StatusStageReadFailed;
+error StatusWorkspaceScanFailed;
+error StatusWorkspaceReadFailed;
+
+enum StatusChangeKind {
+    NewFile,
+    Modified,
+    Deleted
+}
+
+struct StatusChange {
+    path: ByteList,
+    kind: StatusChangeKind
+}
+
+struct StatusChangeList {
+    ptr: &StatusChange,
+    len: usize
+}
+
+struct StatusPrintablePath {
+    bytes: [byte: 4096] = []
+}
+
+export const STATUS_BRANCH_TEXT: &const byte = "On branch %s\n";
+export const STATUS_NO_COMMITS_TEXT: &const byte = "\nNo commits yet\n";
+export const STATUS_NOTHING_TO_COMMIT_TEXT: &const byte = "\nnothing to commit\n";
 export const STATUS_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
 export const STATUS_PERMISSION_TEXT: &const byte = "error: permission denied while reading repository status\n";
 export const STATUS_ROOT_FAILURE_TEXT: &const byte = "error: failed to locate repository root\n";
 export const STATUS_CONFIG_FAILURE_TEXT: &const byte = "error: failed to read repository config\n";
 export const STATUS_HEAD_FAILURE_TEXT: &const byte = "error: failed to inspect repository head\n";
 export const STATUS_NONEMPTY_TEXT: &const byte = "error: 'status' beyond an empty repository is not implemented yet\n";
+export const STATUS_FAILURE_TEXT: &const byte = "error: failed to inspect repository status\n";
+export const STATUS_STAGED_HEADER_TEXT: &const byte = "Changes to be committed:\n";
+export const STATUS_UNSTAGED_HEADER_TEXT: &const byte = "Changes not staged for commit:\n";
+export const STATUS_NEW_FILE_LABEL: &const byte = "new file";
+export const STATUS_MODIFIED_LABEL: &const byte = "modified";
+export const STATUS_DELETED_LABEL: &const byte = "deleted";
 
 fn status_errno_permission() bool {
     return errno == EACCES || errno == EPERM;
@@ -88,6 +159,237 @@ fn status_head_ref_exists(root: &RepoPath, config: &RepoConfig) !bool {
     return stat(repo_path_cstr(&head_path) as &const byte, &st) == 0;
 }
 
+fn status_workspace_matches_manifest(arena: &Arena, root: &RepoPath, manifest_inputs: ManifestLeafInputList) !bool {
+    const worktree: WorkspaceFileList = status_load_workspace_files(root, arena) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.StatusWorkspaceScanFailed;
+    };
+
+    if worktree.len != manifest_inputs.len {
+        return false;
+    }
+
+    var i: usize = 0;
+    while i < worktree.len {
+        const worktree_entry: &WorkspaceFileEntry = &worktree.ptr[i];
+        var found: bool = false;
+        var j: usize = 0;
+        while j < manifest_inputs.len {
+            const manifest_entry: &ManifestLeafInputEntry = &manifest_inputs.ptr[j];
+            if !status_byte_list_equal(&worktree_entry.path, &manifest_entry.path) {
+                j = j + 1 as usize;
+                continue;
+            }
+            if worktree_entry.kind != WorkspaceFileKind.Regular || worktree_entry.file_mode != manifest_entry.mode {
+                return false;
+            }
+            const worktree_id: ObjectId = add_worktree_small_blob_id(root, &worktree_entry.path, worktree_entry.logical_size) catch {
+                return false;
+            };
+            if object_id_compare(&worktree_id, &manifest_entry.object_id) != 0 {
+                return false;
+            }
+            found = true;
+            break;
+        }
+        if !found {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn status_change_list_from_slice(slice: &[StatusChange]) StatusChangeList {
+    return StatusChangeList{ ptr: slice.ptr, len: slice.len };
+}
+
+fn status_zero_change_list() StatusChangeList {
+    return StatusChangeList{ ptr: null, len: 0 };
+}
+
+fn status_byte_list_equal(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn status_copy_path_to_cstr(path: &ByteList, out: &StatusPrintablePath) !&byte {
+    if path.len >= REPO_PATH_MAX {
+        return error.StatusPathTooLong;
+    }
+
+    var i: usize = 0;
+    while i < path.len {
+        out.bytes[i] = path.ptr[i];
+        i = i + 1;
+    }
+    out.bytes[path.len] = 0 as byte;
+    return &out.bytes[0];
+}
+
+fn status_change_label(kind: StatusChangeKind) &const byte {
+    if kind == StatusChangeKind.NewFile {
+        return STATUS_NEW_FILE_LABEL;
+    }
+    if kind == StatusChangeKind.Deleted {
+        return STATUS_DELETED_LABEL;
+    }
+    return STATUS_MODIFIED_LABEL;
+}
+
+fn status_stage_change_kind(entry: &StageEntry) StatusChangeKind {
+    if entry.kind == StageEntryKind.Add {
+        return StatusChangeKind.NewFile;
+    }
+    if entry.kind == StageEntryKind.Delete {
+        return StatusChangeKind.Deleted;
+    }
+    return StatusChangeKind.Modified;
+}
+
+fn status_append_change(raw: &StatusChange, next_index: &usize, path: &ByteList, kind: StatusChangeKind) void {
+    raw[*next_index] = StatusChange{
+        path: ByteList{ ptr: path.ptr, len: path.len },
+        kind: kind,
+    };
+    *next_index = *next_index + 1 as usize;
+}
+
+fn status_load_stage_snapshot(root: &RepoPath, arena: &Arena) !StageSnapshot {
+    const stage_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STAGE_REL);
+    return stage_file_read(repo_path_cstr(&stage_path) as &const byte, arena) catch |err| {
+        if @error_id(err) == @error_id(error.StageFileNotFound) {
+            return stage_empty_snapshot(0i64);
+        }
+        return error.StatusStageReadFailed;
+    };
+}
+
+fn status_load_workspace_files(root: &RepoPath, arena: &Arena) !WorkspaceFileList {
+    return workspace_scan_files(arena, repo_path_cstr(root) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.WorkspaceScanPermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.StatusWorkspaceScanFailed;
+    };
+}
+
+fn status_stage_entry_matches_worktree(root: &RepoPath, entry: &StageEntry, file_entry: &WorkspaceFileEntry) !bool {
+    if entry.kind == StageEntryKind.Delete {
+        return false;
+    }
+    if file_entry.kind != WorkspaceFileKind.Regular {
+        return false;
+    }
+    if entry.file_mode != file_entry.file_mode {
+        return false;
+    }
+    if !stage_entry_has_staged_content(entry) {
+        return true;
+    }
+
+    const worktree_id: ObjectId = add_worktree_small_blob_id(root, &file_entry.path, file_entry.logical_size) catch |err| {
+        if @error_id(err) == @error_id(error.AddLargeFileNotImplemented) || @error_id(err) == @error_id(error.AddSymlinkNotImplemented) {
+            return false;
+        }
+        return error.StatusWorkspaceReadFailed;
+    };
+    return object_id_compare(&worktree_id, &entry.staged_object) == 0;
+}
+
+fn status_collect_unstaged_changes(arena: &Arena, root: &RepoPath, staged: StageEntryList, worktree: &WorkspaceFileList) !StatusChangeList {
+    const max_len: usize = staged.len + worktree.len;
+    if max_len == 0 {
+        return status_zero_change_list();
+    }
+
+    const raw: &StatusChange = arena_alloc(arena, @size_of(StatusChange) as usize * max_len) as &StatusChange;
+    if raw == null {
+        return error.StatusAlloc;
+    }
+
+    var stage_index: usize = 0;
+    var worktree_index: usize = 0;
+    var out_index: usize = 0;
+    while stage_index < staged.len && worktree_index < worktree.len {
+        const stage_entry: &StageEntry = &staged.ptr[stage_index];
+        const worktree_entry: &WorkspaceFileEntry = &worktree.ptr[worktree_index];
+        const cmp: i32 = manifest_path_compare(&stage_entry.path, &worktree_entry.path);
+        if cmp < 0 {
+            if stage_entry.kind != StageEntryKind.Delete {
+                status_append_change(raw, &out_index, &stage_entry.path, StatusChangeKind.Deleted);
+            }
+            stage_index = stage_index + 1 as usize;
+            continue;
+        }
+        if cmp > 0 {
+            status_append_change(raw, &out_index, &worktree_entry.path, StatusChangeKind.NewFile);
+            worktree_index = worktree_index + 1 as usize;
+            continue;
+        }
+
+        if stage_entry.kind == StageEntryKind.Delete {
+            status_append_change(raw, &out_index, &worktree_entry.path, StatusChangeKind.NewFile);
+        } else {
+            const matches: bool = try status_stage_entry_matches_worktree(root, stage_entry, worktree_entry);
+            if !matches {
+                status_append_change(raw, &out_index, &worktree_entry.path, StatusChangeKind.Modified);
+            }
+        }
+        stage_index = stage_index + 1 as usize;
+        worktree_index = worktree_index + 1 as usize;
+    }
+
+    while stage_index < staged.len {
+        const stage_entry: &StageEntry = &staged.ptr[stage_index];
+        if stage_entry.kind != StageEntryKind.Delete {
+            status_append_change(raw, &out_index, &stage_entry.path, StatusChangeKind.Deleted);
+        }
+        stage_index = stage_index + 1 as usize;
+    }
+    while worktree_index < worktree.len {
+        status_append_change(raw, &out_index, &worktree.ptr[worktree_index].path, StatusChangeKind.NewFile);
+        worktree_index = worktree_index + 1 as usize;
+    }
+
+    return status_change_list_from_slice(raw[0: out_index]);
+}
+
+fn status_print_change_line(kind: StatusChangeKind, path: &ByteList) !void {
+    var printable: StatusPrintablePath = StatusPrintablePath{ bytes: [] };
+    const path_cstr: &byte = try status_copy_path_to_cstr(path, &printable);
+    fprintf(stdout, "  %s:   %s\n" as *byte, status_change_label(kind), path_cstr);
+}
+
+fn status_print_staged_section(staged: StageEntryList) !void {
+    fprintf(stdout, "%s" as *byte, STATUS_STAGED_HEADER_TEXT);
+    var i: usize = 0;
+    while i < staged.len {
+        try status_print_change_line(status_stage_change_kind(&staged.ptr[i]), &staged.ptr[i].path);
+        i = i + 1 as usize;
+    }
+}
+
+fn status_print_change_section(header: &const byte, changes: StatusChangeList) !void {
+    fprintf(stdout, "%s" as *byte, header);
+    var i: usize = 0;
+    while i < changes.len {
+        try status_print_change_line(changes.ptr[i].kind, &changes.ptr[i].path);
+        i = i + 1 as usize;
+    }
+}
+
 export fn run_status() i32 {
     const root: RepoPath = repo_find_root_from_cwd() catch |err| {
         if @error_id(err) == @error_id(error.RepoNotFound) {
@@ -116,11 +418,131 @@ export fn run_status() i32 {
         return EXIT_RUNTIME_ERROR;
     };
 
+    const arena_storage: &byte = malloc(STATUS_ARENA_BYTES) as &byte;
+    if arena_storage == null {
+        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    defer {
+        free(arena_storage as &void);
+    }
+
+    var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+    arena_init(&arena, arena_storage, STATUS_ARENA_BYTES);
+
     if has_head {
+        const staged: StageSnapshot = status_load_stage_snapshot(&root, &arena) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        if staged.entries.len > 0 {
+            fprintf(stderr, "%s" as *byte, STATUS_NONEMPTY_TEXT);
+            return EXIT_NOT_IMPLEMENTED;
+        }
+
+        const head_commit: CommitId = repo_read_head_commit(&root, &config) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch |err| {
+            if @error_id(err) == @error_id(error.StorePermissionDenied) {
+                fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const object_bytes: ObjectBytes = store.get(head_commit.id, &arena) catch {
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        var offset: usize = 0;
+        const payload: CommitPayload = decode_commit_object(&arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const manifest_inputs: ManifestLeafInputList = manifest_load_flatten(&arena, &store, &payload.manifest_root) catch {
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const matches_head: bool = status_workspace_matches_manifest(&arena, &root, manifest_inputs) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        if matches_head {
+            fprintf(stdout, STATUS_BRANCH_TEXT as *byte, &config.default_branch[0]);
+            fprintf(stdout, "%s" as *byte, STATUS_NOTHING_TO_COMMIT_TEXT);
+            return EXIT_OK;
+        }
+
         fprintf(stderr, "%s" as *byte, STATUS_NONEMPTY_TEXT);
         return EXIT_NOT_IMPLEMENTED;
     }
 
-    fprintf(stdout, STATUS_EMPTY_TEXT as *byte, &config.default_branch[0]);
+    const staged: StageSnapshot = status_load_stage_snapshot(&root, &arena) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const worktree: WorkspaceFileList = status_load_workspace_files(&root, &arena) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const unstaged: StatusChangeList = status_collect_unstaged_changes(&arena, &root, staged.entries, &worktree) catch {
+        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    fprintf(stdout, STATUS_BRANCH_TEXT as *byte, &config.default_branch[0]);
+    fprintf(stdout, "%s" as *byte, STATUS_NO_COMMITS_TEXT);
+
+    if staged.entries.len == 0 && unstaged.len == 0 {
+        fprintf(stdout, "%s" as *byte, STATUS_NOTHING_TO_COMMIT_TEXT);
+        return EXIT_OK;
+    }
+
+    fprintf(stdout, "\n" as *byte);
+    var printed_section: bool = false;
+    if staged.entries.len > 0 {
+        status_print_staged_section(staged.entries) catch {
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        printed_section = true;
+    }
+    if unstaged.len > 0 {
+        if printed_section {
+            fprintf(stdout, "\n" as *byte);
+        }
+        status_print_change_section(STATUS_UNSTAGED_HEADER_TEXT, unstaged) catch {
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+    }
     return EXIT_OK;
 }

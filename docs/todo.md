@@ -165,17 +165,17 @@
 - [x] 实现 small blob hash。
 - [x] 实现 `hgx add <pathspec>`。
 - [x] 实现 staging metadata。
-- [ ] 实现 staged / unstaged 状态分离输出。
-- [ ] 实现 manifest root 构建。
-- [ ] 实现 commit object 构建。
-- [ ] 实现 `refs/heads/main` 更新。
-- [ ] 实现 `hgx commit -m`。
-- [ ] 实现 `hgx log`。
-- [ ] 测试首个 commit。
-- [ ] 测试第二个 commit parent 正确。
-- [ ] 测试 partial stage 只提交被 staged 的路径。
-- [ ] 测试 add 删除文件。
-- [ ] 测试 status 不误报未改文件。
+- [x] 实现 staged / unstaged 状态分离输出。
+- [x] 实现 manifest root 构建。
+- [x] 实现 commit object 构建。
+- [x] 实现 `refs/heads/main` 更新。
+- [x] 实现 `hgx commit -m`。
+- [x] 实现 `hgx log`。
+- [x] 测试首个 commit。
+- [x] 测试第二个 commit parent 正确。
+- [x] 测试 partial stage 只提交被 staged 的路径。
+- [x] 测试 add 删除文件。
+- [x] 测试 status 不误报未改文件。
 
 ## 10. Commit Graph Index
 

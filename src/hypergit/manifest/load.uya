@@ -1,0 +1,122 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.ids.ManifestId;
+use object.codec.decode_manifest_node_object;
+use object.types.ByteList;
+use object.types.ManifestEntry;
+use object.types.ManifestNodePayload;
+use store.loose_store.LooseObjectStore;
+use store.object_store.ObjectBytes;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+
+error ManifestLoadAlloc;
+error ManifestLoadDecodeFailed;
+
+fn manifest_load_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.ManifestLoadAlloc;
+    }
+    return raw[0: len];
+}
+
+fn manifest_load_copy_byte_list(arena: &Arena, value: &ByteList) !ByteList {
+    const out: &[byte] = try manifest_load_arena_bytes(arena, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn manifest_load_join_path(arena: &Arena, prefix: &ByteList, suffix: &ByteList) !ByteList {
+    if prefix.len == 0 {
+        return try manifest_load_copy_byte_list(arena, suffix);
+    }
+
+    const total_len: usize = prefix.len + 1 as usize + suffix.len;
+    const out: &[byte] = try manifest_load_arena_bytes(arena, total_len);
+    var i: usize = 0;
+    while i < prefix.len {
+        out.ptr[i] = prefix.ptr[i];
+        i = i + 1;
+    }
+    out.ptr[prefix.len] = '/' as byte;
+    i = 0;
+    while i < suffix.len {
+        out.ptr[prefix.len + 1 as usize + i] = suffix.ptr[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: out.ptr, len: total_len };
+}
+
+fn manifest_load_decode(arena: &Arena, store: &LooseObjectStore, id: &ManifestId) !ManifestNodePayload {
+    const object_bytes: ObjectBytes = store.get(id.id, arena) catch {
+        return error.ManifestLoadDecodeFailed;
+    };
+    var offset: usize = 0;
+    return decode_manifest_node_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.ManifestLoadDecodeFailed;
+    };
+}
+
+fn manifest_load_count_entries(arena: &Arena, store: &LooseObjectStore, id: &ManifestId) !usize {
+    const payload: ManifestNodePayload = try manifest_load_decode(arena, store, id);
+    var total: usize = payload.entries.len;
+    var i: usize = 0;
+    while i < payload.children.len {
+        total = total + (try manifest_load_count_entries(arena, store, &payload.children.ptr[i].child_id));
+        i = i + 1;
+    }
+    return total;
+}
+
+fn manifest_load_collect_entries(arena: &Arena, store: &LooseObjectStore, id: &ManifestId, out: &ManifestLeafInputEntry, next_index: &usize) !void {
+    const payload: ManifestNodePayload = try manifest_load_decode(arena, store, id);
+
+    var i: usize = 0;
+    while i < payload.entries.len {
+        const entry: &ManifestEntry = &payload.entries.ptr[i];
+        out[*next_index] = ManifestLeafInputEntry{
+            path: try manifest_load_join_path(arena, &payload.prefix.bytes, &entry.name),
+            kind: entry.kind,
+            mode: entry.mode,
+            object_id: entry.object_id,
+            logical_size: entry.logical_size,
+            content_type: entry.content_type,
+            policy_id: entry.policy_id,
+        };
+        *next_index = *next_index + 1 as usize;
+        i = i + 1 as usize;
+    }
+
+    i = 0;
+    while i < payload.children.len {
+        try manifest_load_collect_entries(arena, store, &payload.children.ptr[i].child_id, out, next_index);
+        i = i + 1 as usize;
+    }
+}
+
+export fn manifest_load_flatten(arena: &Arena, store: &LooseObjectStore, root_id: &ManifestId) !ManifestLeafInputList {
+    const total_entries: usize = try manifest_load_count_entries(arena, store, root_id);
+    if total_entries == 0 {
+        return ManifestLeafInputList{ ptr: null, len: 0 };
+    }
+
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(arena, @size_of(ManifestLeafInputEntry) as usize * total_entries) as &ManifestLeafInputEntry;
+    if raw_inputs == null {
+        return error.ManifestLoadAlloc;
+    }
+
+    var next_index: usize = 0;
+    try manifest_load_collect_entries(arena, store, root_id, raw_inputs, &next_index);
+    return manifest_leaf_input_list_from_slice(raw_inputs[0: next_index]);
+}

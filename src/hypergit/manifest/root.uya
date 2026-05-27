@@ -1,0 +1,168 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.manifest_id_from_object;
+use manifest.path.manifest_path_compare;
+use manifest.shard.ManifestNodePayloadList;
+use manifest.shard.manifest_shard_needs_split;
+use manifest.shard.manifest_shard_split;
+use manifest.trie.ManifestChildInput;
+use manifest.trie.ManifestChildInputList;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_child_input_list_from_slice;
+use manifest.trie.manifest_internal_build;
+use manifest.trie.manifest_leaf_build;
+use object.codec.manifest_node_payload_to_canonical;
+use object.types.ByteList;
+use object.types.ManifestNodePayload;
+use object.types.ObjectKind;
+use store.loose_store.LooseObjectStore;
+
+error ManifestRootAlloc;
+error ManifestRootEmpty;
+
+struct ManifestPayloadRange {
+    min_path: ByteList,
+    max_path: ByteList
+}
+
+fn manifest_root_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.ManifestRootAlloc;
+    }
+    return raw[0: len];
+}
+
+fn manifest_root_copy_byte_list(arena: &Arena, value: &ByteList) !ByteList {
+    const out: &[byte] = try manifest_root_arena_bytes(arena, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn manifest_root_join_path(arena: &Arena, prefix: &ByteList, suffix: &ByteList) !ByteList {
+    if prefix.len == 0 {
+        return try manifest_root_copy_byte_list(arena, suffix);
+    }
+    if suffix.len == 0 {
+        return try manifest_root_copy_byte_list(arena, prefix);
+    }
+
+    const total_len: usize = prefix.len + 1 as usize + suffix.len;
+    const out: &[byte] = try manifest_root_arena_bytes(arena, total_len);
+    var i: usize = 0;
+    while i < prefix.len {
+        out.ptr[i] = prefix.ptr[i];
+        i = i + 1;
+    }
+    out.ptr[prefix.len] = '/' as byte;
+    i = 0;
+    while i < suffix.len {
+        out.ptr[prefix.len + 1 as usize + i] = suffix.ptr[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: out.ptr, len: total_len };
+}
+
+fn manifest_root_payload_range(arena: &Arena, payload: &ManifestNodePayload) !ManifestPayloadRange {
+    var has_range: bool = false;
+    var min_path: ByteList = ByteList{ ptr: null, len: 0 };
+    var max_path: ByteList = ByteList{ ptr: null, len: 0 };
+
+    if payload.entries.len > 0 {
+        min_path = try manifest_root_join_path(arena, &payload.prefix.bytes, &payload.entries.ptr[0].name);
+        max_path = try manifest_root_join_path(
+            arena,
+            &payload.prefix.bytes,
+            &payload.entries.ptr[payload.entries.len - 1 as usize].name,
+        );
+        has_range = true;
+    }
+
+    if payload.children.len > 0 {
+        const child_min: ByteList = try manifest_root_join_path(arena, &payload.prefix.bytes, &payload.children.ptr[0].min_name);
+        const child_max: ByteList = try manifest_root_join_path(
+            arena,
+            &payload.prefix.bytes,
+            &payload.children.ptr[payload.children.len - 1 as usize].max_name,
+        );
+        if !has_range || manifest_path_compare(&child_min, &min_path) < 0 {
+            min_path = child_min;
+        }
+        if !has_range || manifest_path_compare(&child_max, &max_path) > 0 {
+            max_path = child_max;
+        }
+        has_range = true;
+    }
+
+    if !has_range {
+        return error.ManifestRootEmpty;
+    }
+    return ManifestPayloadRange{
+        min_path: min_path,
+        max_path: max_path,
+    };
+}
+
+fn manifest_root_store_payload(arena: &Arena, store: &LooseObjectStore, payload: &ManifestNodePayload) !ManifestId {
+    const encoded: ByteList = try manifest_node_payload_to_canonical(arena, payload);
+    const object_id: ObjectId = try store.put(ObjectKind.ManifestNode, encoded.ptr[0: encoded.len]);
+    return manifest_id_from_object(object_id);
+}
+
+fn manifest_root_store_children(arena: &Arena, store: &LooseObjectStore, siblings: &ManifestNodePayloadList) !ManifestChildInputList {
+    const raw_children: &ManifestChildInput = arena_alloc(arena, @size_of(ManifestChildInput) as usize * siblings.len) as &ManifestChildInput;
+    if raw_children == null {
+        return error.ManifestRootAlloc;
+    }
+
+    var i: usize = 0;
+    while i < siblings.len {
+        const child_payload: &ManifestNodePayload = &siblings.ptr[i];
+        const child_id: ManifestId = try manifest_root_store_payload(arena, store, child_payload);
+        const child_range: ManifestPayloadRange = try manifest_root_payload_range(arena, child_payload);
+        raw_children[i].min_path = child_range.min_path;
+        raw_children[i].max_path = child_range.max_path;
+        var hash_index: usize = 0;
+        while hash_index < 32 as usize {
+            raw_children[i].child_hash.bytes[hash_index] = child_id.id.hash.bytes[hash_index];
+            hash_index = hash_index + 1;
+        }
+        raw_children[i].child_id = manifest_id_from_object(ObjectId{ hash: raw_children[i].child_hash });
+        i = i + 1;
+    }
+    return manifest_child_input_list_from_slice(raw_children[0: siblings.len]);
+}
+
+fn manifest_root_finalize_payload(arena: &Arena, store: &LooseObjectStore, payload: &ManifestNodePayload) !ManifestId {
+    if !manifest_shard_needs_split(payload) {
+        return try manifest_root_store_payload(arena, store, payload);
+    }
+
+    const siblings: ManifestNodePayloadList = try manifest_shard_split(arena, payload);
+    const child_inputs: ManifestChildInputList = try manifest_root_store_children(arena, store, &siblings);
+    const next_payload: ManifestNodePayload = try manifest_internal_build(
+        arena,
+        &payload.prefix.bytes,
+        ManifestLeafInputList{ ptr: null, len: 0 },
+        ManifestChildInputList{ ptr: child_inputs.ptr, len: child_inputs.len },
+    );
+    return try manifest_root_finalize_payload(arena, store, &next_payload);
+}
+
+export fn manifest_root_build_and_store(arena: &Arena, store: &LooseObjectStore, inputs: ManifestLeafInputList) !ManifestId {
+    const root_prefix: ByteList = ByteList{ ptr: null, len: 0 };
+    const root_payload: ManifestNodePayload = try manifest_leaf_build(arena, &root_prefix, inputs);
+    return try manifest_root_finalize_payload(arena, store, &root_payload);
+}

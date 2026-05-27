@@ -1,0 +1,145 @@
+use libc.Stat;
+use libc.errno;
+use libc.fprintf;
+use libc.stat;
+use libc.EACCES;
+use libc.EPERM;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.fwrite;
+
+use core.ids.CommitId;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.commit_id_decode_hex;
+use core.ids.commit_id_encode_hex;
+use store.repo_layout.HGIT_REFS_HEADS_REL;
+use store.repo_layout.REPO_PATH_MAX;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_path_cstr;
+
+const HEAD_REF_BYTES_MAX: usize = HASH32_HEX_BYTES + 2 as usize;
+
+error HeadRefOpenFailed;
+error HeadRefReadFailed;
+error HeadRefWriteFailed;
+error HeadRefInvalid;
+
+fn head_ref_errno_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn head_ref_path_copy_bytes(path: &RepoPath, out: &RepoPath, limit: usize) void {
+    var i: usize = 0;
+    while i < limit {
+        out.bytes[i] = path.bytes[i];
+        i = i + 1;
+    }
+}
+
+export fn repo_head_ref_path(root: &RepoPath, config: &RepoConfig) !RepoPath {
+    var out: RepoPath = RepoPath{ bytes: [], len: 0 };
+    head_ref_path_copy_bytes(root, &out, root.len);
+    var pos: usize = root.len;
+
+    if pos > 0 {
+        const last_index: usize = pos - 1 as usize;
+        if last_index >= REPO_PATH_MAX {
+            return error.RepoPathTooLong;
+        }
+        if out.bytes[last_index] != '/' as byte {
+            if pos + 1 as usize >= REPO_PATH_MAX {
+                return error.RepoPathTooLong;
+            }
+            out.bytes[pos] = '/' as byte;
+            pos = pos + 1 as usize;
+        }
+    }
+
+    const refs_len: usize = 16 as usize;
+    if pos + refs_len + 1 as usize + config.default_branch_len >= REPO_PATH_MAX {
+        return error.RepoPathTooLong;
+    }
+
+    var i: usize = 0;
+    while i < refs_len {
+        out.bytes[pos + i] = HGIT_REFS_HEADS_REL[i];
+        i = i + 1;
+    }
+    pos = pos + refs_len;
+    out.bytes[pos] = '/' as byte;
+    pos = pos + 1 as usize;
+
+    i = 0;
+    while i < config.default_branch_len {
+        out.bytes[pos + i] = config.default_branch[i];
+        i = i + 1;
+    }
+    pos = pos + config.default_branch_len;
+    out.bytes[pos] = 0 as byte;
+    out.len = pos;
+    return out;
+}
+
+export fn repo_head_ref_exists(root: &RepoPath, config: &RepoConfig) !bool {
+    const head_path: RepoPath = try repo_head_ref_path(root, config);
+    var st: Stat = Stat{};
+    if stat(repo_path_cstr(&head_path) as &const byte, &st) == 0 {
+        return true;
+    }
+    if head_ref_errno_permission() {
+        return error.RepoPermissionDenied;
+    }
+    return false;
+}
+
+export fn repo_write_head_commit(root: &RepoPath, config: &RepoConfig, commit_id: &CommitId) !void {
+    const head_path: RepoPath = try repo_head_ref_path(root, config);
+    const stream: &FILE = fopen(repo_path_cstr(&head_path) as &const byte, "w");
+    if stream == null {
+        if head_ref_errno_permission() {
+            return error.RepoPermissionDenied;
+        }
+        return error.HeadRefOpenFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var buf: [byte: HEAD_REF_BYTES_MAX] = [];
+    _ = try commit_id_encode_hex(commit_id, buf[0: HASH32_HEX_BYTES]);
+    buf[HASH32_HEX_BYTES] = '\n' as byte;
+    const total_len: usize = HASH32_HEX_BYTES + 1 as usize;
+    if fwrite(&buf[0] as &const byte, 1 as usize, total_len, stream) != total_len {
+        return error.HeadRefWriteFailed;
+    }
+}
+
+export fn repo_read_head_commit(root: &RepoPath, config: &RepoConfig) !CommitId {
+    const head_path: RepoPath = try repo_head_ref_path(root, config);
+    const stream: &FILE = fopen(repo_path_cstr(&head_path) as &const byte, "r");
+    if stream == null {
+        if head_ref_errno_permission() {
+            return error.RepoPermissionDenied;
+        }
+        return error.HeadRefOpenFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var data: [byte: HEAD_REF_BYTES_MAX] = [];
+    const count: usize = fread(&data[0], 1 as usize, HEAD_REF_BYTES_MAX, stream);
+    if count < HASH32_HEX_BYTES {
+        return error.HeadRefReadFailed;
+    }
+    if count > HASH32_HEX_BYTES + 1 as usize {
+        return error.HeadRefInvalid;
+    }
+    if count == HASH32_HEX_BYTES + 1 as usize && data[HASH32_HEX_BYTES] != '\n' as byte {
+        return error.HeadRefInvalid;
+    }
+    return try commit_id_decode_hex(data[0: HASH32_HEX_BYTES]);
+}

@@ -172,7 +172,7 @@ fn path_suffix_after_prefix(path: &ByteList, prefix: &ByteList) !ByteList {
     return ByteList{ ptr: suffix.ptr, len: suffix.len };
 }
 
-fn min_usize(left: usize, right: usize) usize {
+fn manifest_min_usize(left: usize, right: usize) usize {
     if left < right {
         return left;
     }
@@ -200,8 +200,8 @@ fn sort_leaf_indexes(arena: &Arena, inputs: &ManifestLeafInputList) !&usize {
     while width < inputs.len {
         var start: usize = 0;
         while start < inputs.len {
-            const mid: usize = min_usize(start + width, inputs.len);
-            const end: usize = min_usize(mid + width, inputs.len);
+            const mid: usize = manifest_min_usize(start + width, inputs.len);
+            const end: usize = manifest_min_usize(mid + width, inputs.len);
 
             var left: usize = start;
             var right: usize = mid;
@@ -264,8 +264,8 @@ fn sort_child_indexes(arena: &Arena, inputs: &ManifestChildInputList) !&usize {
     while width < inputs.len {
         var start: usize = 0;
         while start < inputs.len {
-            const mid: usize = min_usize(start + width, inputs.len);
-            const end: usize = min_usize(mid + width, inputs.len);
+            const mid: usize = manifest_min_usize(start + width, inputs.len);
+            const end: usize = manifest_min_usize(mid + width, inputs.len);
 
             var left: usize = start;
             var right: usize = mid;

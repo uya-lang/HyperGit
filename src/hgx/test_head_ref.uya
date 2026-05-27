@@ -1,0 +1,69 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+
+use libc.chdir;
+use libc.system;
+use core.ids.Hash32;
+use core.ids.CommitId;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use core.ids.commit_id_compare;
+use store.head_ref.repo_head_ref_exists;
+use store.head_ref.repo_read_head_commit;
+use store.head_ref.repo_write_head_commit;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoInitResult;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_current_dir;
+use store.repo_layout.repo_init_current_dir;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_read_config;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn make_commit_id(seed: byte) CommitId {
+    return commit_id_from_object(object_id_from_hash(make_hash(seed)));
+}
+
+fn test_head_ref_write_read_and_overwrite() !void {
+    try expect(system("rm -rf build/head-ref-test && mkdir -p build/head-ref-test/repo") == 0);
+
+    const original_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("build/head-ref-test/repo") == 0);
+
+    const init_result: RepoInitResult = try repo_init_current_dir();
+    const config: RepoConfig = try repo_read_config(&init_result.repo_root);
+    try expect(!(try repo_head_ref_exists(&init_result.repo_root, &config)));
+
+    const first_commit: CommitId = make_commit_id(10 as byte);
+    try repo_write_head_commit(&init_result.repo_root, &config, &first_commit);
+    try expect(try repo_head_ref_exists(&init_result.repo_root, &config));
+
+    const read_first: CommitId = try repo_read_head_commit(&init_result.repo_root, &config);
+    try expect(commit_id_compare(&read_first, &first_commit) == 0);
+
+    const second_commit: CommitId = make_commit_id(20 as byte);
+    try repo_write_head_commit(&init_result.repo_root, &config, &second_commit);
+
+    const read_second: CommitId = try repo_read_head_commit(&init_result.repo_root, &config);
+    try expect(commit_id_compare(&read_second, &second_commit) == 0);
+
+    try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Head Ref Tests");
+    run_test("head ref write read and overwrite", test_head_ref_write_read_and_overwrite);
+    return test_suite_end();
+}

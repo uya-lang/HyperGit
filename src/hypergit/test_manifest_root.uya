@@ -1,0 +1,207 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.system;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.root.manifest_root_build_and_store;
+use manifest.shard.MANIFEST_LEAF_HARD_ENTRIES;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.codec.decode_manifest_node_object;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ManifestNodePayload;
+use store.object_store.ObjectBytes;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn make_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(make_hash(seed));
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(make_object_id(seed));
+}
+
+fn expect_byte_list_text(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn path_from_literal(arena: &Arena, text: &[byte]) !ByteList {
+    const raw: &byte = arena_alloc(arena, text.len);
+    if raw == null {
+        return error.AssertionFailed;
+    }
+    var i: usize = 0;
+    while i < text.len {
+        raw[i] = text.ptr[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: raw, len: text.len };
+}
+
+fn make_leaf_input(arena: &Arena, text: &[byte], seed: byte) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try path_from_literal(arena, text),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id(seed),
+        logical_size: seed as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id(seed + 40 as byte),
+    };
+}
+
+fn generated_path(arena: &Arena, index: usize) !ByteList {
+    const total_len: usize = 13 as usize;
+    const raw: &byte = arena_alloc(arena, total_len);
+    if raw == null {
+        return error.AssertionFailed;
+    }
+
+    raw[0] = 'f' as byte;
+    raw[1] = 'i' as byte;
+    raw[2] = 'l' as byte;
+    raw[3] = 'e' as byte;
+    raw[4] = ('0' as byte) + ((index / 10000 as usize) % 10 as usize) as byte;
+    raw[5] = ('0' as byte) + ((index / 1000 as usize) % 10 as usize) as byte;
+    raw[6] = ('0' as byte) + ((index / 100 as usize) % 10 as usize) as byte;
+    raw[7] = ('0' as byte) + ((index / 10 as usize) % 10 as usize) as byte;
+    raw[8] = ('0' as byte) + (index % 10 as usize) as byte;
+    raw[9] = '.' as byte;
+    raw[10] = 'u' as byte;
+    raw[11] = 'y' as byte;
+    raw[12] = 'a' as byte;
+    return ByteList{ ptr: raw, len: total_len };
+}
+
+fn make_generated_input(arena: &Arena, index: usize) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try generated_path(arena, index),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id(index as byte),
+        logical_size: index as u64,
+        content_type: ContentType.Unknown,
+        policy_id: make_policy_id((index + 80 as usize) as byte),
+    };
+}
+
+fn read_manifest(store: &LooseObjectStore, id: ManifestId, arena: &Arena) !ManifestNodePayload {
+    const object_bytes: ObjectBytes = try store.get(id.id, arena);
+    var offset: usize = 0;
+    return try decode_manifest_node_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+}
+
+fn test_manifest_root_store_leaf_payload() !void {
+    try expect(system("rm -rf build/manifest-root-leaf && mkdir -p build/manifest-root-leaf/objects/loose") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/manifest-root-leaf/objects/loose");
+
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    const input0: ManifestLeafInputEntry = try make_leaf_input(&input_arena, literal_bytes("docs/readme.md"), 11 as byte);
+    const input1: ManifestLeafInputEntry = try make_leaf_input(&input_arena, literal_bytes("src/main.uya"), 12 as byte);
+    const input2: ManifestLeafInputEntry = try make_leaf_input(&input_arena, literal_bytes("src/util.uya"), 13 as byte);
+    var inputs: [ManifestLeafInputEntry: 3] = [input0, input1, input2];
+
+    var build_arena_buf: [byte: 65536] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 65536 as usize);
+
+    const root_id: ManifestId = try manifest_root_build_and_store(&build_arena, &store, manifest_leaf_input_list_from_slice(inputs[0: 3]));
+    try expect(try store.has(root_id.id));
+
+    var read_arena_buf: [byte: 65536] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 65536 as usize);
+
+    const payload: ManifestNodePayload = try read_manifest(&store, root_id, &read_arena);
+    try expect(payload.entry_count == 3u32);
+    try expect(payload.child_count == 0u32);
+    try expect(payload.prefix.bytes.len == 0 as usize);
+    try expect_byte_list_text(payload.entries.ptr[0].name, literal_bytes("docs/readme.md"));
+    try expect_byte_list_text(payload.entries.ptr[1].name, literal_bytes("src/main.uya"));
+    try expect_byte_list_text(payload.entries.ptr[2].name, literal_bytes("src/util.uya"));
+}
+
+fn test_manifest_root_splits_large_leaf_into_internal_root() !void {
+    try expect(system("rm -rf build/manifest-root-split && mkdir -p build/manifest-root-split/objects/loose") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/manifest-root-split/objects/loose");
+
+    const total_entries: usize = MANIFEST_LEAF_HARD_ENTRIES + 1 as usize;
+    var input_arena_buf: [byte: 524288] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 524288 as usize);
+
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(&input_arena, @size_of(ManifestLeafInputEntry) as usize * total_entries) as &ManifestLeafInputEntry;
+    try expect(raw_inputs != null);
+
+    var i: usize = 0;
+    while i < total_entries {
+        raw_inputs[i] = try make_generated_input(&input_arena, i);
+        i = i + 1;
+    }
+
+    var build_arena_buf: [byte: 33554432] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 33554432 as usize);
+
+    const inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(raw_inputs[0: total_entries]);
+    const root_id: ManifestId = try manifest_root_build_and_store(&build_arena, &store, inputs);
+
+    var read_arena_buf: [byte: 8388608] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 8388608 as usize);
+
+    const root_payload: ManifestNodePayload = try read_manifest(&store, root_id, &read_arena);
+    try expect(root_payload.entry_count == 0u32);
+    try expect(root_payload.child_count > 1u32);
+
+    try expect(try store.has(root_payload.children.ptr[0].child_id.id));
+    const first_child: ManifestNodePayload = try read_manifest(&store, root_payload.children.ptr[0].child_id, &read_arena);
+    try expect(first_child.entry_count > 0u32 || first_child.child_count > 0u32);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Manifest Root Tests");
+    run_test("manifest root stores leaf payload", test_manifest_root_store_leaf_payload);
+    run_test("manifest root splits large leaf into internal root", test_manifest_root_splits_large_leaf_into_internal_root);
+    return test_suite_end();
+}

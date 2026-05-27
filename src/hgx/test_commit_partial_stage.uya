@@ -1,0 +1,120 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.chdir;
+use libc.system;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.BlobId;
+use core.ids.object_id_compare;
+use manifest.load.manifest_load_flatten;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use object.codec.decode_commit_object;
+use object.hash.hash_small_blob_payload;
+use object.small_blob.small_blob_payload_from_bytes;
+use object.types.ByteList;
+use object.types.CommitPayload;
+use object.types.SmallBlobPayload;
+use store.head_ref.repo_read_head_commit;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_current_dir;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_read_config;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn byte_list_equal(left: &ByteList, right: &[byte]) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn expected_small_blob_object_id(arena: &Arena, text: &const byte) !ObjectId {
+    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(arena, literal_bytes(text));
+    const blob_id: BlobId = try hash_small_blob_payload(arena, &payload);
+    return blob_id.id;
+}
+
+fn test_partial_stage_commit_keeps_unstaged_paths_from_base() !void {
+    try expect(system("rm -rf build/commit-partial-stage && mkdir -p build/commit-partial-stage/repo build/commit-partial-stage/bin") == 0);
+    try expect(system("$HOME/uya/uya/bin/uya build src/hgx/main.uya -o build/commit-partial-stage/bin/hgx >/dev/null 2>&1") == 0);
+    try expect(system("cd build/commit-partial-stage/repo && ../bin/hgx init >/dev/null 2>&1 && mkdir -p src docs && printf one >src/main.uya && printf readme >docs/readme.md && ../bin/hgx add src docs >/dev/null 2>&1 && HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' ../bin/hgx commit -m first >/dev/null 2>&1 && printf two >src/main.uya && printf updated-readme >docs/readme.md && ../bin/hgx add src >/dev/null 2>&1 && HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' ../bin/hgx commit -m second >/dev/null 2>&1") == 0);
+
+    const original_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("build/commit-partial-stage/repo") == 0);
+
+    const root: RepoPath = try repo_find_root_from_cwd();
+    const config: RepoConfig = try repo_read_config(&root);
+    const head_commit: CommitId = try repo_read_head_commit(&root, &config);
+    const store: LooseObjectStore = try loose_store_open(".hgit/objects/loose");
+
+    var arena_buf: [byte: 33554432] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 33554432 as usize);
+
+    const object_bytes: ObjectBytes = try store.get(head_commit.id, &arena);
+    var offset: usize = 0;
+    const payload: CommitPayload = try decode_commit_object(&arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    const manifest_entries: ManifestLeafInputList = try manifest_load_flatten(&arena, &store, &payload.manifest_root);
+    try expect(manifest_entries.len == 2 as usize);
+
+    const expected_main: ObjectId = try expected_small_blob_object_id(&arena, "two");
+    const expected_docs: ObjectId = try expected_small_blob_object_id(&arena, "readme");
+
+    var saw_main: bool = false;
+    var saw_docs: bool = false;
+    var i: usize = 0;
+    while i < manifest_entries.len {
+        const entry: &ManifestLeafInputEntry = &manifest_entries.ptr[i];
+        if byte_list_equal(&entry.path, literal_bytes("src/main.uya")) {
+            saw_main = true;
+            try expect(object_id_compare(&entry.object_id, &expected_main) == 0);
+        } else if byte_list_equal(&entry.path, literal_bytes("docs/readme.md")) {
+            saw_docs = true;
+            try expect(object_id_compare(&entry.object_id, &expected_docs) == 0);
+        }
+        i = i + 1 as usize;
+    }
+    try expect(saw_main);
+    try expect(saw_docs);
+
+    try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Partial Stage Commit Tests");
+    run_test("partial stage commit keeps unstaged paths from base", test_partial_stage_commit_keeps_unstaged_paths_from_base);
+    return test_suite_end();
+}
