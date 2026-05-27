@@ -1,0 +1,11 @@
+use libc.write_stdout_bytes;
+use std.string.strlen;
+
+use cli.EXIT_OK;
+
+export const VERSION_TEXT: &const byte = "hgx 0.1.0-dev\n";
+
+export fn run_version() i32 {
+    _ = write_stdout_bytes(VERSION_TEXT, strlen(VERSION_TEXT));
+    return EXIT_OK;
+}

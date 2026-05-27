@@ -1,0 +1,370 @@
+use std.crypto.blake3.blake3_digest;
+
+use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
+use core.ids.hash32_compare;
+
+export error CodecUnexpectedEof;
+export error CodecInvalidMagic;
+export error CodecUnsupportedVersion;
+export error CodecHashMismatch;
+export error CodecNonCanonical;
+export error CodecBufferTooSmall;
+
+export const CODEC_MAGIC: u32 = 0x31434748u32;
+export const CODEC_VERSION: u16 = 1u16;
+export const CODEC_ENVELOPE_BYTES: usize = 50;
+
+export struct ByteSpan {
+    ptr: &byte,
+    len: usize
+}
+
+export struct ObjectEnvelope {
+    magic: u32,
+    version: u16,
+    kind: u16,
+    flags: u16,
+    payload_len: u64,
+    payload_hash: Hash32
+}
+
+export struct DecodedObject {
+    envelope: ObjectEnvelope,
+    payload: ByteSpan
+}
+
+export fn byte_span_from_slice(slice: &[byte]) ByteSpan {
+    return ByteSpan{ ptr: slice.ptr, len: slice.len };
+}
+
+fn ensure_read(input: &[byte], offset: usize, need: usize) !void {
+    if offset + need > input.len {
+        return error.CodecUnexpectedEof;
+    }
+}
+
+fn ensure_write(output: &[byte], offset: usize, need: usize) !void {
+    if offset + need > output.len {
+        return error.CodecBufferTooSmall;
+    }
+}
+
+fn varuint_encoded_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1;
+    while temp >= 128u64 {
+        temp = temp >> 7;
+        count = count + 1;
+    }
+    return count;
+}
+
+export fn codec_encode_u8(output: &[byte], offset: &usize, value: byte) !void {
+    try ensure_write(output, *offset, 1);
+    output.ptr[*offset] = value;
+    *offset = *offset + 1;
+}
+
+export fn codec_decode_u8(input: &[byte], offset: &usize) !byte {
+    try ensure_read(input, *offset, 1);
+    const value: byte = input.ptr[*offset];
+    *offset = *offset + 1;
+    return value;
+}
+
+export fn codec_encode_u16(output: &[byte], offset: &usize, value: u16) !void {
+    try ensure_write(output, *offset, 2);
+    output.ptr[*offset] = (value & 255 as u16) as byte;
+    output.ptr[*offset + 1] = ((value >> 8) & 255 as u16) as byte;
+    *offset = *offset + 2;
+}
+
+export fn codec_decode_u16(input: &[byte], offset: &usize) !u16 {
+    try ensure_read(input, *offset, 2);
+    const b0: u16 = input.ptr[*offset] as u16;
+    const b1: u16 = input.ptr[*offset + 1] as u16;
+    *offset = *offset + 2;
+    return b0 | (b1 << 8);
+}
+
+export fn codec_encode_u32(output: &[byte], offset: &usize, value: u32) !void {
+    try ensure_write(output, *offset, 4);
+    output.ptr[*offset] = (value & 255u32) as byte;
+    output.ptr[*offset + 1] = ((value >> 8) & 255u32) as byte;
+    output.ptr[*offset + 2] = ((value >> 16) & 255u32) as byte;
+    output.ptr[*offset + 3] = ((value >> 24) & 255u32) as byte;
+    *offset = *offset + 4;
+}
+
+export fn codec_decode_u32(input: &[byte], offset: &usize) !u32 {
+    try ensure_read(input, *offset, 4);
+    const b0: u32 = input.ptr[*offset] as u32;
+    const b1: u32 = input.ptr[*offset + 1] as u32;
+    const b2: u32 = input.ptr[*offset + 2] as u32;
+    const b3: u32 = input.ptr[*offset + 3] as u32;
+    *offset = *offset + 4;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+export fn codec_encode_u64(output: &[byte], offset: &usize, value: u64) !void {
+    try ensure_write(output, *offset, 8);
+    var shift: i32 = 0;
+    while shift < 64 {
+        output.ptr[*offset + (shift as usize / 8)] = ((value >> shift) & 255u64) as byte;
+        shift = shift + 8;
+    }
+    *offset = *offset + 8;
+}
+
+export fn codec_decode_u64(input: &[byte], offset: &usize) !u64 {
+    try ensure_read(input, *offset, 8);
+    var value: u64 = 0u64;
+    var shift: i32 = 0;
+    while shift < 64 {
+        value = value | ((input.ptr[*offset + (shift as usize / 8)] as u64) << shift);
+        shift = shift + 8;
+    }
+    *offset = *offset + 8;
+    return value;
+}
+
+export fn codec_encode_i64(output: &[byte], offset: &usize, value: i64) !void {
+    return codec_encode_u64(output, offset, value as u64);
+}
+
+export fn codec_decode_i64(input: &[byte], offset: &usize) !i64 {
+    return (try codec_decode_u64(input, offset)) as i64;
+}
+
+export fn codec_encode_varuint(output: &[byte], offset: &usize, value: u64) !void {
+    var temp: u64 = value;
+    while temp >= 128u64 {
+        try codec_encode_u8(output, offset, ((temp & 127u64) as byte) | 128 as byte);
+        temp = temp >> 7;
+    }
+    try codec_encode_u8(output, offset, temp as byte);
+}
+
+export fn codec_decode_varuint(input: &[byte], offset: &usize) !u64 {
+    var value: u64 = 0u64;
+    var shift: i32 = 0;
+    const start: usize = *offset;
+
+    while true {
+        const byte_value: byte = try codec_decode_u8(input, offset);
+        const payload: u64 = (byte_value & 127 as byte) as u64;
+
+        if shift >= 64 || (shift == 63 && payload > 1u64) {
+            return error.CodecNonCanonical;
+        }
+
+        value = value | (payload << shift);
+        if (byte_value & 128 as byte) == 0 as byte {
+            break;
+        }
+        shift = shift + 7;
+        if shift > 63 {
+            return error.CodecNonCanonical;
+        }
+    }
+
+    if *offset - start != varuint_encoded_len(value) {
+        return error.CodecNonCanonical;
+    }
+    return value;
+}
+
+export fn codec_encode_bytes(output: &[byte], offset: &usize, value: &[byte]) !void {
+    try codec_encode_varuint(output, offset, value.len as u64);
+    try ensure_write(output, *offset, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        output.ptr[*offset + i] = value.ptr[i];
+        i = i + 1;
+    }
+    *offset = *offset + value.len;
+}
+
+export fn codec_decode_bytes(input: &[byte], offset: &usize) !ByteSpan {
+    const len_u64: u64 = try codec_decode_varuint(input, offset);
+    const len: usize = len_u64 as usize;
+    try ensure_read(input, *offset, len);
+    const span: ByteSpan = ByteSpan{ ptr: &input.ptr[*offset], len: len };
+    *offset = *offset + len;
+    return span;
+}
+
+export fn codec_encode_enum_u16(output: &[byte], offset: &usize, value: u16) !void {
+    return codec_encode_u16(output, offset, value);
+}
+
+export fn codec_decode_enum_u16(input: &[byte], offset: &usize, max_value: u16) !u16 {
+    const value: u16 = try codec_decode_u16(input, offset);
+    if value > max_value {
+        return error.CodecNonCanonical;
+    }
+    return value;
+}
+
+export fn codec_encode_u16_list(output: &[byte], offset: &usize, values: &[u16]) !void {
+    try codec_encode_varuint(output, offset, values.len as u64);
+    var i: usize = 0;
+    while i < values.len {
+        try codec_encode_u16(output, offset, values.ptr[i]);
+        i = i + 1;
+    }
+}
+
+export fn codec_decode_u16_list(input: &[byte], offset: &usize, values: &[u16]) !usize {
+    const count_u64: u64 = try codec_decode_varuint(input, offset);
+    const count: usize = count_u64 as usize;
+    if count > values.len {
+        return error.CodecBufferTooSmall;
+    }
+    var i: usize = 0;
+    while i < count {
+        values.ptr[i] = try codec_decode_u16(input, offset);
+        i = i + 1;
+    }
+    return count;
+}
+
+export fn codec_compare_bytes(left: ByteSpan, right: ByteSpan) i32 {
+    var i: usize = 0;
+    var limit: usize = left.len;
+    if right.len < limit {
+        limit = right.len;
+    }
+
+    while i < limit {
+        if left.ptr[i] < right.ptr[i] {
+            return -1;
+        }
+        if left.ptr[i] > right.ptr[i] {
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    if left.len < right.len {
+        return -1;
+    }
+    if left.len > right.len {
+        return 1;
+    }
+    return 0;
+}
+
+export fn codec_validate_canonical_map_order(keys: &[ByteSpan]) !void {
+    if keys.len < 2 {
+        return;
+    }
+
+    var i: usize = 1;
+    while i < keys.len {
+        if codec_compare_bytes(keys.ptr[i - 1], keys.ptr[i]) >= 0 {
+            return error.CodecNonCanonical;
+        }
+        i = i + 1;
+    }
+}
+
+export fn codec_hash_payload(payload: &[byte]) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    blake3_digest(payload, hash.bytes[0: HASH32_BYTES]);
+    return hash;
+}
+
+export fn codec_make_envelope(kind: u16, flags: u16, payload: &[byte]) ObjectEnvelope {
+    return ObjectEnvelope{
+        magic: CODEC_MAGIC,
+        version: CODEC_VERSION,
+        kind: kind,
+        flags: flags,
+        payload_len: payload.len as u64,
+        payload_hash: codec_hash_payload(payload),
+    };
+}
+
+export fn codec_encode_hash32(output: &[byte], offset: &usize, hash: &Hash32) !void {
+    try ensure_write(output, *offset, HASH32_BYTES);
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        output.ptr[*offset + i] = hash.bytes[i];
+        i = i + 1;
+    }
+    *offset = *offset + HASH32_BYTES;
+}
+
+export fn codec_decode_hash32(input: &[byte], offset: &usize) !Hash32 {
+    try ensure_read(input, *offset, HASH32_BYTES);
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = input.ptr[*offset + i];
+        i = i + 1;
+    }
+    *offset = *offset + HASH32_BYTES;
+    return hash;
+}
+
+export fn codec_encode_envelope(output: &[byte], offset: &usize, envelope: &ObjectEnvelope) !void {
+    try codec_encode_u32(output, offset, envelope.magic);
+    try codec_encode_u16(output, offset, envelope.version);
+    try codec_encode_u16(output, offset, envelope.kind);
+    try codec_encode_u16(output, offset, envelope.flags);
+    try codec_encode_u64(output, offset, envelope.payload_len);
+    try codec_encode_hash32(output, offset, &envelope.payload_hash);
+}
+
+export fn codec_decode_envelope(input: &[byte], offset: &usize) !ObjectEnvelope {
+    const magic: u32 = try codec_decode_u32(input, offset);
+    if magic != CODEC_MAGIC {
+        return error.CodecInvalidMagic;
+    }
+
+    const version: u16 = try codec_decode_u16(input, offset);
+    if version != CODEC_VERSION {
+        return error.CodecUnsupportedVersion;
+    }
+
+    return ObjectEnvelope{
+        magic: magic,
+        version: version,
+        kind: try codec_decode_u16(input, offset),
+        flags: try codec_decode_u16(input, offset),
+        payload_len: try codec_decode_u64(input, offset),
+        payload_hash: try codec_decode_hash32(input, offset),
+    };
+}
+
+export fn codec_encode_object(output: &[byte], offset: &usize, kind: u16, flags: u16, payload: &[byte]) !void {
+    const envelope: ObjectEnvelope = codec_make_envelope(kind, flags, payload);
+    try codec_encode_envelope(output, offset, &envelope);
+    try ensure_write(output, *offset, payload.len);
+    var i: usize = 0;
+    while i < payload.len {
+        output.ptr[*offset + i] = payload.ptr[i];
+        i = i + 1;
+    }
+    *offset = *offset + payload.len;
+}
+
+export fn codec_decode_object(input: &[byte], offset: &usize) !DecodedObject {
+    const envelope: ObjectEnvelope = try codec_decode_envelope(input, offset);
+    const payload_len: usize = envelope.payload_len as usize;
+    try ensure_read(input, *offset, payload_len);
+    const payload: &[byte] = input[*offset: payload_len];
+    *offset = *offset + payload_len;
+
+    const computed_hash: Hash32 = codec_hash_payload(payload);
+    if hash32_compare(&computed_hash, &envelope.payload_hash) != 0 {
+        return error.CodecHashMismatch;
+    }
+
+    return DecodedObject{
+        envelope: envelope,
+        payload: byte_span_from_slice(payload),
+    };
+}

@@ -1,0 +1,11 @@
+use libc.stderr;
+use libc.fprintf;
+
+use cli.EXIT_NOT_IMPLEMENTED;
+
+export const INIT_TEXT: &const byte = "error: 'init' is not implemented yet\n";
+
+export fn run_init() i32 {
+    fprintf(stderr, "%s" as *byte, INIT_TEXT);
+    return EXIT_NOT_IMPLEMENTED;
+}

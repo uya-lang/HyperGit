@@ -1,0 +1,228 @@
+use std.crypto.blake3.blake3_digest;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.string.strlen;
+
+export const HASH32_BYTES: usize = 32;
+export const HASH32_HEX_BYTES: usize = 64;
+
+error BufferTooSmall;
+error InvalidHexLength;
+error InvalidHexDigit;
+error HashScratchAlloc;
+
+export struct Hash32 {
+    bytes: [byte: 32] = []
+}
+
+export struct ObjectId {
+    hash: Hash32
+}
+
+export struct CommitId {
+    id: ObjectId
+}
+
+export struct ManifestId {
+    id: ObjectId
+}
+
+export struct BlobId {
+    id: ObjectId
+}
+
+export struct PublishedViewId {
+    hash: Hash32
+}
+
+export struct PolicyId {
+    id: ObjectId
+}
+
+fn hex_digit_lower(value: byte) byte {
+    if value < 10 as byte {
+        return (48 + value) as byte;
+    }
+    return (87 + value) as byte;
+}
+
+fn parse_hex_digit(value: byte) !byte {
+    if value >= '0' as byte && value <= '9' as byte {
+        return value - ('0' as byte);
+    }
+    if value >= 'a' as byte && value <= 'f' as byte {
+        return 10 as byte + (value - ('a' as byte));
+    }
+    if value >= 'A' as byte && value <= 'F' as byte {
+        return 10 as byte + (value - ('A' as byte));
+    }
+    return error.InvalidHexDigit;
+}
+
+export fn hash32_compare(left: &Hash32, right: &Hash32) i32 {
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        if left.bytes[i] < right.bytes[i] {
+            return -1;
+        }
+        if left.bytes[i] > right.bytes[i] {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+export fn object_id_compare(left: &ObjectId, right: &ObjectId) i32 {
+    return hash32_compare(&left.hash, &right.hash);
+}
+
+export fn commit_id_compare(left: &CommitId, right: &CommitId) i32 {
+    return object_id_compare(&left.id, &right.id);
+}
+
+export fn manifest_id_compare(left: &ManifestId, right: &ManifestId) i32 {
+    return object_id_compare(&left.id, &right.id);
+}
+
+export fn blob_id_compare(left: &BlobId, right: &BlobId) i32 {
+    return object_id_compare(&left.id, &right.id);
+}
+
+export fn published_view_id_compare(left: &PublishedViewId, right: &PublishedViewId) i32 {
+    return hash32_compare(&left.hash, &right.hash);
+}
+
+export fn policy_id_compare(left: &PolicyId, right: &PolicyId) i32 {
+    return object_id_compare(&left.id, &right.id);
+}
+
+export fn hash32_encode_hex(hash: &Hash32, out: &[byte]) !usize {
+    if out.len < HASH32_HEX_BYTES {
+        return error.BufferTooSmall;
+    }
+
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        const value: byte = hash.bytes[i];
+        out.ptr[i * 2] = hex_digit_lower((value >> 4) & 15 as byte);
+        out.ptr[i * 2 + 1] = hex_digit_lower(value & 15 as byte);
+        i = i + 1;
+    }
+    return HASH32_HEX_BYTES;
+}
+
+export fn hash32_decode_hex(text: &[byte]) !Hash32 {
+    if text.len != HASH32_HEX_BYTES {
+        return error.InvalidHexLength;
+    }
+
+    var out: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        const hi: byte = try parse_hex_digit(text.ptr[i * 2]);
+        const lo: byte = try parse_hex_digit(text.ptr[i * 2 + 1]);
+        out.bytes[i] = ((hi << 4) | lo) as byte;
+        i = i + 1;
+    }
+    return out;
+}
+
+export fn object_id_from_hash(hash: Hash32) ObjectId {
+    return ObjectId{ hash: hash };
+}
+
+export fn commit_id_from_object(id: ObjectId) CommitId {
+    return CommitId{ id: id };
+}
+
+export fn manifest_id_from_object(id: ObjectId) ManifestId {
+    return ManifestId{ id: id };
+}
+
+export fn blob_id_from_object(id: ObjectId) BlobId {
+    return BlobId{ id: id };
+}
+
+export fn published_view_id_from_hash(hash: Hash32) PublishedViewId {
+    return PublishedViewId{ hash: hash };
+}
+
+export fn policy_id_from_object(id: ObjectId) PolicyId {
+    return PolicyId{ id: id };
+}
+
+export fn object_id_encode_hex(id: &ObjectId, out: &[byte]) !usize {
+    return hash32_encode_hex(&id.hash, out);
+}
+
+export fn commit_id_encode_hex(id: &CommitId, out: &[byte]) !usize {
+    return object_id_encode_hex(&id.id, out);
+}
+
+export fn manifest_id_encode_hex(id: &ManifestId, out: &[byte]) !usize {
+    return object_id_encode_hex(&id.id, out);
+}
+
+export fn blob_id_encode_hex(id: &BlobId, out: &[byte]) !usize {
+    return object_id_encode_hex(&id.id, out);
+}
+
+export fn published_view_id_encode_hex(id: &PublishedViewId, out: &[byte]) !usize {
+    return hash32_encode_hex(&id.hash, out);
+}
+
+export fn policy_id_encode_hex(id: &PolicyId, out: &[byte]) !usize {
+    return object_id_encode_hex(&id.id, out);
+}
+
+export fn object_id_decode_hex(text: &[byte]) !ObjectId {
+    return ObjectId{ hash: try hash32_decode_hex(text) };
+}
+
+export fn commit_id_decode_hex(text: &[byte]) !CommitId {
+    return CommitId{ id: try object_id_decode_hex(text) };
+}
+
+export fn manifest_id_decode_hex(text: &[byte]) !ManifestId {
+    return ManifestId{ id: try object_id_decode_hex(text) };
+}
+
+export fn blob_id_decode_hex(text: &[byte]) !BlobId {
+    return BlobId{ id: try object_id_decode_hex(text) };
+}
+
+export fn published_view_id_decode_hex(text: &[byte]) !PublishedViewId {
+    return PublishedViewId{ hash: try hash32_decode_hex(text) };
+}
+
+export fn policy_id_decode_hex(text: &[byte]) !PolicyId {
+    return PolicyId{ id: try object_id_decode_hex(text) };
+}
+
+export fn hash_domain_payload(arena: &Arena, domain: &const byte, payload: &[byte]) !Hash32 {
+    const domain_len: usize = strlen(domain);
+    const total_len: usize = domain_len + 1 + payload.len;
+    const scratch: &byte = arena_alloc(arena, total_len);
+    if scratch == null {
+        return error.HashScratchAlloc;
+    }
+
+    const combined: &[byte] = scratch[0: total_len];
+    var i: usize = 0;
+    while i < domain_len {
+        combined.ptr[i] = domain[i];
+        i = i + 1;
+    }
+    combined.ptr[domain_len] = 0 as byte;
+
+    i = 0;
+    while i < payload.len {
+        combined.ptr[domain_len + 1 + i] = payload.ptr[i];
+        i = i + 1;
+    }
+
+    var digest: Hash32 = Hash32{ bytes: [] };
+    blake3_digest(combined, digest.bytes[0: HASH32_BYTES]);
+    return digest;
+}

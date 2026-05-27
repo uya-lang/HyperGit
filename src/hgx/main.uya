@@ -1,0 +1,30 @@
+use std.runtime.entry;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+
+use cli.DispatchAction;
+use cli.DispatchPlan;
+use cli.plan_from_first_arg;
+use commands.help.run_help;
+use commands.version.run_version;
+use commands.doctor.run_doctor;
+use commands.init.run_init;
+use commands.errors.run_unknown_command;
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    const first_arg: &byte = get_argv(1);
+    const plan: DispatchPlan = plan_from_first_arg(argc, first_arg);
+
+    if plan.action == DispatchAction.Help {
+        return run_help();
+    } else if plan.action == DispatchAction.Version {
+        return run_version();
+    } else if plan.action == DispatchAction.Doctor {
+        return run_doctor();
+    } else if plan.action == DispatchAction.Init {
+        return run_init();
+    }
+
+    return run_unknown_command(plan.subject);
+}

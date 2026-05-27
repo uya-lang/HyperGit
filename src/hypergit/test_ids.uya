@@ -1,0 +1,128 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.assert_eq_i32;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.CommitId;
+use core.ids.ManifestId;
+use core.ids.BlobId;
+use core.ids.PublishedViewId;
+use core.ids.PolicyId;
+use core.ids.HASH32_BYTES;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use core.ids.manifest_id_from_object;
+use core.ids.blob_id_from_object;
+use core.ids.published_view_id_from_hash;
+use core.ids.policy_id_from_object;
+use core.ids.object_id_compare;
+use core.ids.commit_id_compare;
+use core.ids.manifest_id_compare;
+use core.ids.blob_id_compare;
+use core.ids.published_view_id_compare;
+use core.ids.policy_id_compare;
+use core.ids.object_id_encode_hex;
+use core.ids.object_id_decode_hex;
+use core.ids.commit_id_encode_hex;
+use core.ids.commit_id_decode_hex;
+use core.ids.manifest_id_encode_hex;
+use core.ids.manifest_id_decode_hex;
+use core.ids.blob_id_encode_hex;
+use core.ids.blob_id_decode_hex;
+use core.ids.published_view_id_encode_hex;
+use core.ids.published_view_id_decode_hex;
+use core.ids.policy_id_encode_hex;
+use core.ids.policy_id_decode_hex;
+use core.ids.hash_domain_payload;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn test_object_id_roundtrip() !void {
+    const object_id: ObjectId = object_id_from_hash(make_hash(0 as byte));
+    var encoded: [byte: 64] = [];
+    const written: usize = try object_id_encode_hex(&object_id, encoded[0: HASH32_HEX_BYTES]);
+    try assert_eq_i32(written as i32, HASH32_HEX_BYTES as i32);
+
+    const decoded: ObjectId = try object_id_decode_hex(encoded[0: HASH32_HEX_BYTES]);
+    try assert_eq_i32(object_id_compare(&object_id, &decoded), 0);
+}
+
+fn test_wrapped_id_roundtrip() !void {
+    const commit_id: CommitId = commit_id_from_object(object_id_from_hash(make_hash(5 as byte)));
+    const manifest_id: ManifestId = manifest_id_from_object(object_id_from_hash(make_hash(5 as byte)));
+    const blob_id: BlobId = blob_id_from_object(object_id_from_hash(make_hash(5 as byte)));
+    const published_view_id: PublishedViewId = published_view_id_from_hash(make_hash(9 as byte));
+    const policy_id: PolicyId = policy_id_from_object(object_id_from_hash(make_hash(5 as byte)));
+    var encoded: [byte: 64] = [];
+
+    _ = try commit_id_encode_hex(&commit_id, encoded[0: HASH32_HEX_BYTES]);
+    const commit_roundtrip: CommitId = try commit_id_decode_hex(encoded[0: HASH32_HEX_BYTES]);
+    try assert_eq_i32(commit_id_compare(&commit_id, &commit_roundtrip), 0);
+
+    _ = try manifest_id_encode_hex(&manifest_id, encoded[0: HASH32_HEX_BYTES]);
+    const manifest_roundtrip: ManifestId = try manifest_id_decode_hex(encoded[0: HASH32_HEX_BYTES]);
+    try assert_eq_i32(manifest_id_compare(&manifest_id, &manifest_roundtrip), 0);
+
+    _ = try blob_id_encode_hex(&blob_id, encoded[0: HASH32_HEX_BYTES]);
+    const blob_roundtrip: BlobId = try blob_id_decode_hex(encoded[0: HASH32_HEX_BYTES]);
+    try assert_eq_i32(blob_id_compare(&blob_id, &blob_roundtrip), 0);
+
+    _ = try published_view_id_encode_hex(&published_view_id, encoded[0: HASH32_HEX_BYTES]);
+    const view_roundtrip: PublishedViewId = try published_view_id_decode_hex(encoded[0: HASH32_HEX_BYTES]);
+    try assert_eq_i32(published_view_id_compare(&published_view_id, &view_roundtrip), 0);
+
+    _ = try policy_id_encode_hex(&policy_id, encoded[0: HASH32_HEX_BYTES]);
+    const policy_roundtrip: PolicyId = try policy_id_decode_hex(encoded[0: HASH32_HEX_BYTES]);
+    try assert_eq_i32(policy_id_compare(&policy_id, &policy_roundtrip), 0);
+}
+
+fn test_id_compare_order() !void {
+    const left: ObjectId = object_id_from_hash(make_hash(1 as byte));
+    const right: ObjectId = object_id_from_hash(make_hash(2 as byte));
+    try expect(object_id_compare(&left, &right) < 0);
+    try expect(object_id_compare(&right, &left) > 0);
+}
+
+fn test_hash_domain_isolation() !void {
+    var arena_buf: [byte: 1024] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1024 as usize);
+
+    var payload_buf: [byte: 7] = [];
+    payload_buf[0] = 'p' as byte;
+    payload_buf[1] = 'a' as byte;
+    payload_buf[2] = 'y' as byte;
+    payload_buf[3] = 'l' as byte;
+    payload_buf[4] = 'o' as byte;
+    payload_buf[5] = 'a' as byte;
+    payload_buf[6] = 'd' as byte;
+    const payload: &[byte] = payload_buf[0: 7];
+
+    const commit_hash: Hash32 = try hash_domain_payload(&arena, "hypergit.commit.v1", payload);
+    const manifest_hash: Hash32 = try hash_domain_payload(&arena, "hypergit.manifest.v1", payload);
+    try expect(commit_hash.bytes[0] != manifest_hash.bytes[0] || commit_hash.bytes[1] != manifest_hash.bytes[1] || commit_hash.bytes[2] != manifest_hash.bytes[2] || commit_hash.bytes[3] != manifest_hash.bytes[3]);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Core ID Tests");
+    run_test("object id roundtrip", test_object_id_roundtrip);
+    run_test("wrapped id roundtrip", test_wrapped_id_roundtrip);
+    run_test("id compare order", test_id_compare_order);
+    run_test("hash domain isolation", test_hash_domain_isolation);
+    return test_suite_end();
+}

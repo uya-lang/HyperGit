@@ -1,0 +1,74 @@
+use std.string.strcmp;
+
+export const EXIT_OK: i32 = 0;
+export const EXIT_USAGE_ERROR: i32 = 2;
+export const EXIT_NOT_IMPLEMENTED: i32 = 3;
+
+export enum DispatchAction {
+    Help,
+    Version,
+    Doctor,
+    Init,
+    Unknown
+}
+
+export struct DispatchPlan {
+    action: DispatchAction,
+    exit_code: i32,
+    subject: &byte
+}
+
+fn same_arg(actual: &byte, expected: &const byte) bool {
+    if actual == null {
+        return false;
+    }
+    return strcmp(actual as &const byte, expected) == 0;
+}
+
+export fn plan_from_first_arg(argc: i32, first_arg: &byte) DispatchPlan {
+    if argc <= 1 || first_arg == null {
+        return DispatchPlan {
+            action: DispatchAction.Help,
+            exit_code: EXIT_OK,
+            subject: null,
+        };
+    }
+
+    if same_arg(first_arg, "-h") || same_arg(first_arg, "--help") || same_arg(first_arg, "help") {
+        return DispatchPlan {
+            action: DispatchAction.Help,
+            exit_code: EXIT_OK,
+            subject: first_arg,
+        };
+    }
+
+    if same_arg(first_arg, "-v") || same_arg(first_arg, "--version") || same_arg(first_arg, "version") {
+        return DispatchPlan {
+            action: DispatchAction.Version,
+            exit_code: EXIT_OK,
+            subject: first_arg,
+        };
+    }
+
+    if same_arg(first_arg, "doctor") {
+        return DispatchPlan {
+            action: DispatchAction.Doctor,
+            exit_code: EXIT_NOT_IMPLEMENTED,
+            subject: first_arg,
+        };
+    }
+
+    if same_arg(first_arg, "init") {
+        return DispatchPlan {
+            action: DispatchAction.Init,
+            exit_code: EXIT_NOT_IMPLEMENTED,
+            subject: first_arg,
+        };
+    }
+
+    return DispatchPlan {
+        action: DispatchAction.Unknown,
+        exit_code: EXIT_USAGE_ERROR,
+        subject: first_arg,
+    };
+}

@@ -10,81 +10,81 @@
 - [x] 编写系统设计文档：`docs/design.md`。
 - [x] 编写分阶段 TODO 文档：`docs/todo.md`。
 - [x] 更新项目入口文档：`readme.md`。
-- [ ] 在 `docs/design.md` 冻结 object codec v1 前补充二进制字段编码表。
-- [ ] 在 `docs/design.md` 补充 path normalization 跨平台规则表。
-- [ ] 在 `docs/design.md` 补充 manifest shard split / merge 的精确阈值。
-- [ ] 在 `docs/design.md` 补充错误码命名规范。
+- [x] 在 `docs/design.md` 冻结 object codec v1 前补充二进制字段编码表。
+- [x] 在 `docs/design.md` 补充 path normalization 跨平台规则表。
+- [x] 在 `docs/design.md` 补充 manifest shard split / merge 的精确阈值。
+- [x] 在 `docs/design.md` 补充错误码命名规范。
 - [x] 在 `docs/design.md` 明确对象 `ObjectId` / `ManifestId` 不进入自身 canonical payload。
 - [x] 在 `docs/design.md` 补充 staging/index 设计，明确 `commit` 只消费 stage snapshot。
 - [x] 对齐 `bin/` 与 `build/` 产物目录约束。
 
 ## 1. 工程骨架
 
-- [ ] 创建 `src/hgx/main.uya`。
-- [ ] 创建 `src/hgx/commands/` 命令目录。
-- [ ] 创建 `src/hypergit/core/` 核心类型目录。
-- [ ] 创建 `src/hypergit/object/` 对象模型目录。
-- [ ] 创建 `src/hypergit/store/` 存储目录。
-- [ ] 创建 `src/hypergit/manifest/` manifest 目录。
-- [ ] 创建 `src/hypergit/index/` 索引目录。
-- [ ] 创建 `src/hypergit/workspace/` 工作区目录。
-- [ ] 创建 `src/hypergit/exec/` 并行执行目录。
-- [ ] 创建 `src/hypergit/protocol/` 协议目录。
-- [ ] 创建 `src/hypergit/large/` 大文件目录。
-- [ ] 创建 `src/hypergit/merge/` merge 目录。
-- [ ] 创建 `tests/` Uya 测试目录。
-- [ ] 创建 `bench/` 基准目录。
-- [ ] 创建 `bin/` 和 `build/` 输出目录并加入忽略规则。
-- [ ] 创建最小构建脚本或 Makefile。
-- [ ] 确保 `~/uya/uya/bin/uya check src/hgx/main.uya` 可运行。
-- [ ] 确保 `~/uya/uya/bin/uya build src/hgx/main.uya -o bin/hgx` 可运行。
+- [x] 创建 `src/hgx/main.uya`。
+- [x] 创建 `src/hgx/commands/` 命令目录。
+- [x] 创建 `src/hypergit/core/` 核心类型目录。
+- [x] 创建 `src/hypergit/object/` 对象模型目录。
+- [x] 创建 `src/hypergit/store/` 存储目录。
+- [x] 创建 `src/hypergit/manifest/` manifest 目录。
+- [x] 创建 `src/hypergit/index/` 索引目录。
+- [x] 创建 `src/hypergit/workspace/` 工作区目录。
+- [x] 创建 `src/hypergit/exec/` 并行执行目录。
+- [x] 创建 `src/hypergit/protocol/` 协议目录。
+- [x] 创建 `src/hypergit/large/` 大文件目录。
+- [x] 创建 `src/hypergit/merge/` merge 目录。
+- [x] 创建 `tests/` Uya 测试目录。
+- [x] 创建 `bench/` 基准目录。
+- [x] 创建 `bin/` 和 `build/` 输出目录并加入忽略规则。
+- [x] 创建最小构建脚本或 Makefile。
+- [x] 确保 `~/uya/uya/bin/uya check src/hgx/main.uya` 可运行。
+- [x] 确保 `~/uya/uya/bin/uya build src/hgx/main.uya -o bin/hgx` 可运行。
 
 ## 2. CLI MVP
 
-- [ ] 实现 `hgx --help`。
-- [ ] 实现 `hgx --version`。
-- [ ] 实现命令分派器。
-- [ ] 实现未知命令错误。
-- [ ] 实现统一退出码。
-- [ ] 实现 `hgx doctor` 占位命令。
-- [ ] 实现 `hgx init` 占位命令。
-- [ ] 为 CLI 参数解析写单元测试。
-- [ ] 为错误输出写 golden 测试。
+- [x] 实现 `hgx --help`。
+- [x] 实现 `hgx --version`。
+- [x] 实现命令分派器。
+- [x] 实现未知命令错误。
+- [x] 实现统一退出码。
+- [x] 实现 `hgx doctor` 占位命令。
+- [x] 实现 `hgx init` 占位命令。
+- [x] 为 CLI 参数解析写单元测试。
+- [x] 为错误输出写 golden 测试。
 
 ## 3. Core Types
 
-- [ ] 实现 `Hash32`。
-- [ ] 实现 `ObjectId`。
-- [ ] 实现 `CommitId`。
-- [ ] 实现 `ManifestId`。
-- [ ] 实现 `BlobId`。
-- [ ] 实现 `PublishedViewId`。
-- [ ] 实现 `PolicyId`。
-- [ ] 实现 ID 字节比较。
-- [ ] 实现 ID 十六进制编码。
-- [ ] 实现 ID 十六进制解析。
-- [ ] 实现 domain-separated hash helper。
-- [ ] 接入 `std.crypto.blake3` 或 `std.crypto.sha256`。
-- [ ] 为 ID roundtrip 写测试。
-- [ ] 为 hash domain 隔离写测试。
+- [x] 实现 `Hash32`。
+- [x] 实现 `ObjectId`。
+- [x] 实现 `CommitId`。
+- [x] 实现 `ManifestId`。
+- [x] 实现 `BlobId`。
+- [x] 实现 `PublishedViewId`。
+- [x] 实现 `PolicyId`。
+- [x] 实现 ID 字节比较。
+- [x] 实现 ID 十六进制编码。
+- [x] 实现 ID 十六进制解析。
+- [x] 实现 domain-separated hash helper。
+- [x] 接入 `std.crypto.blake3` 或 `std.crypto.sha256`。
+- [x] 为 ID roundtrip 写测试。
+- [x] 为 hash domain 隔离写测试。
 
 ## 4. Canonical Codec v1
 
-- [ ] 定义 codec magic。
-- [ ] 定义 object envelope。
-- [ ] 实现 fixed integer encode/decode。
-- [ ] 实现 varuint encode/decode。
-- [ ] 实现 byte slice encode/decode。
-- [ ] 实现 enum encode/decode。
-- [ ] 实现 list encode/decode。
-- [ ] 实现 canonical map ordering helper。
-- [ ] 实现 payload hash 校验。
-- [ ] 实现版本不兼容错误。
-- [ ] 实现截断输入错误。
-- [ ] 实现 non-canonical 输入错误。
-- [ ] 为每个 primitive 写 roundtrip 测试。
-- [ ] 为损坏 magic/version/hash 写错误测试。
-- [ ] 为随机截断 payload 写健壮性测试。
+- [x] 定义 codec magic。
+- [x] 定义 object envelope。
+- [x] 实现 fixed integer encode/decode。
+- [x] 实现 varuint encode/decode。
+- [x] 实现 byte slice encode/decode。
+- [x] 实现 enum encode/decode。
+- [x] 实现 list encode/decode。
+- [x] 实现 canonical map ordering helper。
+- [x] 实现 payload hash 校验。
+- [x] 实现版本不兼容错误。
+- [x] 实现截断输入错误。
+- [x] 实现 non-canonical 输入错误。
+- [x] 为每个 primitive 写 roundtrip 测试。
+- [x] 为损坏 magic/version/hash 写错误测试。
+- [x] 为随机截断 payload 写健壮性测试。
 
 ## 5. Object Model
 

@@ -1,0 +1,10 @@
+use libc.stderr;
+use libc.fprintf;
+
+use cli.EXIT_USAGE_ERROR;
+
+export fn run_unknown_command(command: &byte) i32 {
+    fprintf(stderr, "error: unknown command '%s'\n" as *byte, command);
+    fprintf(stderr, "run 'hgx --help' for usage.\n" as *byte);
+    return EXIT_USAGE_ERROR;
+}

@@ -1,0 +1,11 @@
+use libc.stderr;
+use libc.fprintf;
+
+use cli.EXIT_NOT_IMPLEMENTED;
+
+export const DOCTOR_TEXT: &const byte = "error: 'doctor' is not implemented yet\n";
+
+export fn run_doctor() i32 {
+    fprintf(stderr, "%s" as *byte, DOCTOR_TEXT);
+    return EXIT_NOT_IMPLEMENTED;
+}

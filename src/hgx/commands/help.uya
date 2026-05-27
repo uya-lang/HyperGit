@@ -1,0 +1,11 @@
+use libc.write_stdout_bytes;
+use std.string.strlen;
+
+use cli.EXIT_OK;
+
+export const HELP_TEXT: &const byte = "HyperGit\nUsage: hgx <command>\n\nCommands:\n  init      Initialize a HyperGit repository (placeholder)\n  doctor    Inspect repository health (placeholder)\n\nFlags:\n  -h, --help     Show help\n  -v, --version  Show version\n";
+
+export fn run_help() i32 {
+    _ = write_stdout_bytes(HELP_TEXT, strlen(HELP_TEXT));
+    return EXIT_OK;
+}

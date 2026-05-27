@@ -1,0 +1,63 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.assert_eq_i32;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.string.strcmp;
+
+use cli.DispatchAction;
+use cli.DispatchPlan;
+use cli.EXIT_NOT_IMPLEMENTED;
+use cli.EXIT_OK;
+use cli.EXIT_USAGE_ERROR;
+use cli.plan_from_first_arg;
+
+fn test_default_help() !void {
+    const plan: DispatchPlan = plan_from_first_arg(1, null);
+    try expect(plan.action == DispatchAction.Help);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
+    try expect(plan.subject == null);
+}
+
+fn test_help_flag() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "--help");
+    try expect(plan.action == DispatchAction.Help);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
+}
+
+fn test_version_flag() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "-v");
+    try expect(plan.action == DispatchAction.Version);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
+}
+
+fn test_doctor_placeholder() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "doctor");
+    try expect(plan.action == DispatchAction.Doctor);
+    try assert_eq_i32(plan.exit_code, EXIT_NOT_IMPLEMENTED);
+}
+
+fn test_init_placeholder() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "init");
+    try expect(plan.action == DispatchAction.Init);
+    try assert_eq_i32(plan.exit_code, EXIT_NOT_IMPLEMENTED);
+}
+
+fn test_unknown_command() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "status");
+    try expect(plan.action == DispatchAction.Unknown);
+    try assert_eq_i32(plan.exit_code, EXIT_USAGE_ERROR);
+    try expect(strcmp(plan.subject as &const byte, "status") == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("CLI Parse Tests");
+    run_test("default help", test_default_help);
+    run_test("help flag", test_help_flag);
+    run_test("version flag", test_version_flag);
+    run_test("doctor placeholder", test_doctor_placeholder);
+    run_test("init placeholder", test_init_placeholder);
+    run_test("unknown command", test_unknown_command);
+    return test_suite_end();
+}

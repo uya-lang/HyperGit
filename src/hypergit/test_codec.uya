@@ -1,0 +1,258 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.assert_eq_i32;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+
+use core.codec.ByteSpan;
+use core.codec.ObjectEnvelope;
+use core.codec.DecodedObject;
+use core.codec.CODEC_MAGIC;
+use core.codec.CODEC_VERSION;
+use core.codec.CODEC_ENVELOPE_BYTES;
+use core.codec.byte_span_from_slice;
+use core.codec.codec_encode_u8;
+use core.codec.codec_decode_u8;
+use core.codec.codec_encode_u16;
+use core.codec.codec_decode_u16;
+use core.codec.codec_encode_u32;
+use core.codec.codec_decode_u32;
+use core.codec.codec_encode_u64;
+use core.codec.codec_decode_u64;
+use core.codec.codec_encode_i64;
+use core.codec.codec_decode_i64;
+use core.codec.codec_encode_varuint;
+use core.codec.codec_decode_varuint;
+use core.codec.codec_encode_bytes;
+use core.codec.codec_decode_bytes;
+use core.codec.codec_encode_enum_u16;
+use core.codec.codec_decode_enum_u16;
+use core.codec.codec_encode_u16_list;
+use core.codec.codec_decode_u16_list;
+use core.codec.codec_compare_bytes;
+use core.codec.codec_validate_canonical_map_order;
+use core.codec.codec_encode_object;
+use core.codec.codec_decode_object;
+
+fn bytes_equal(left: ByteSpan, right: ByteSpan) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn copy_bytes(dst: &[byte], src: &[byte], count: usize) void {
+    var i: usize = 0;
+    while i < count {
+        dst.ptr[i] = src.ptr[i];
+        i = i + 1;
+    }
+}
+
+fn fill_payload(payload: &[byte]) void {
+    payload.ptr[0] = 'p' as byte;
+    payload.ptr[1] = 'a' as byte;
+    payload.ptr[2] = 'y' as byte;
+    payload.ptr[3] = 'l' as byte;
+    payload.ptr[4] = 'o' as byte;
+    payload.ptr[5] = 'a' as byte;
+    payload.ptr[6] = 'd' as byte;
+}
+
+fn test_fixed_integer_roundtrip() !void {
+    var buf: [byte: 32] = [];
+    var offset: usize = 0;
+    try codec_encode_u8(buf[0: 32], &offset, 7 as byte);
+    try codec_encode_u16(buf[0: 32], &offset, 0x1234 as u16);
+    try codec_encode_u32(buf[0: 32], &offset, 0x89abcdefu32);
+    try codec_encode_u64(buf[0: 32], &offset, 0x0123456789abcdefu64);
+    try codec_encode_i64(buf[0: 32], &offset, -42);
+
+    var read_offset: usize = 0;
+    try assert_eq_i32((try codec_decode_u8(buf[0: offset], &read_offset)) as i32, 7);
+    try assert_eq_i32((try codec_decode_u16(buf[0: offset], &read_offset)) as i32, 0x1234);
+    try expect((try codec_decode_u32(buf[0: offset], &read_offset)) == 0x89abcdefu32);
+    try expect((try codec_decode_u64(buf[0: offset], &read_offset)) == 0x0123456789abcdefu64);
+    try assert_eq_i32((try codec_decode_i64(buf[0: offset], &read_offset)) as i32, -42);
+}
+
+fn test_varuint_roundtrip() !void {
+    var buf: [byte: 32] = [];
+    var offset: usize = 0;
+    try codec_encode_varuint(buf[0: 32], &offset, 0u64);
+    try codec_encode_varuint(buf[0: 32], &offset, 127u64);
+    try codec_encode_varuint(buf[0: 32], &offset, 128u64);
+    try codec_encode_varuint(buf[0: 32], &offset, 300u64);
+
+    var read_offset: usize = 0;
+    try expect((try codec_decode_varuint(buf[0: offset], &read_offset)) == 0u64);
+    try expect((try codec_decode_varuint(buf[0: offset], &read_offset)) == 127u64);
+    try expect((try codec_decode_varuint(buf[0: offset], &read_offset)) == 128u64);
+    try expect((try codec_decode_varuint(buf[0: offset], &read_offset)) == 300u64);
+}
+
+fn test_bytes_enum_and_list_roundtrip() !void {
+    var payload: [byte: 7] = [];
+    fill_payload(payload[0: 7]);
+    const payload_slice: &[byte] = payload[0: 7];
+    var list_values: [u16: 3] = [3 as u16, 7 as u16, 11 as u16];
+    var buf: [byte: 64] = [];
+    var offset: usize = 0;
+
+    try codec_encode_bytes(buf[0: 64], &offset, payload_slice);
+    try codec_encode_enum_u16(buf[0: 64], &offset, 5 as u16);
+    try codec_encode_u16_list(buf[0: 64], &offset, list_values[0: 3]);
+
+    var read_offset: usize = 0;
+    const decoded_payload: ByteSpan = try codec_decode_bytes(buf[0: offset], &read_offset);
+    try expect(bytes_equal(decoded_payload, byte_span_from_slice(payload_slice)));
+    try assert_eq_i32((try codec_decode_enum_u16(buf[0: offset], &read_offset, 10 as u16)) as i32, 5);
+
+    var decoded_values: [u16: 3] = [];
+    const count: usize = try codec_decode_u16_list(buf[0: offset], &read_offset, decoded_values[0: 3]);
+    try assert_eq_i32(count as i32, 3);
+    try assert_eq_i32(decoded_values[0] as i32, 3);
+    try assert_eq_i32(decoded_values[1] as i32, 7);
+    try assert_eq_i32(decoded_values[2] as i32, 11);
+}
+
+fn test_map_order_and_stable_object_encoding() !void {
+    var a_buf: [byte: 1] = ['a' as byte];
+    var b_buf: [byte: 1] = ['b' as byte];
+    var keys: [ByteSpan: 2] = [
+        byte_span_from_slice(a_buf[0: 1]),
+        byte_span_from_slice(b_buf[0: 1]),
+    ];
+    try codec_validate_canonical_map_order(keys[0: 2]);
+    try expect(codec_compare_bytes(keys[0], keys[1]) < 0);
+
+    var payload: [byte: 7] = [];
+    fill_payload(payload[0: 7]);
+    const payload_slice: &[byte] = payload[0: 7];
+    var left: [byte: 128] = [];
+    var right: [byte: 128] = [];
+    var left_offset: usize = 0;
+    var right_offset: usize = 0;
+    try codec_encode_object(left[0: 128], &left_offset, 2 as u16, 0 as u16, payload_slice);
+    try codec_encode_object(right[0: 128], &right_offset, 2 as u16, 0 as u16, payload_slice);
+    try assert_eq_i32(left_offset as i32, right_offset as i32);
+    try expect(bytes_equal(byte_span_from_slice(left[0: left_offset]), byte_span_from_slice(right[0: right_offset])));
+}
+
+fn test_magic_version_and_hash_errors() !void {
+    var payload: [byte: 7] = [];
+    fill_payload(payload[0: 7]);
+    const payload_slice: &[byte] = payload[0: 7];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+    try codec_encode_object(buf[0: 128], &offset, 9 as u16, 1 as u16, payload_slice);
+
+    var magic_buf: [byte: 128] = [];
+    copy_bytes(magic_buf[0: 128], buf[0: 128], offset);
+    magic_buf[0] = magic_buf[0] ^ 1 as byte;
+    var read_offset: usize = 0;
+    const decoded_magic: DecodedObject = codec_decode_object(magic_buf[0: offset], &read_offset) catch |err| {
+        try expect(@error_id(err) == @error_id(error.CodecInvalidMagic));
+        return;
+    };
+    _ = decoded_magic;
+    return error.AssertionFailed;
+}
+
+fn test_version_error() !void {
+    var payload: [byte: 7] = [];
+    fill_payload(payload[0: 7]);
+    const payload_slice: &[byte] = payload[0: 7];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+    try codec_encode_object(buf[0: 128], &offset, 9 as u16, 1 as u16, payload_slice);
+
+    var version_buf: [byte: 128] = [];
+    copy_bytes(version_buf[0: 128], buf[0: 128], offset);
+    version_buf[4] = 2 as byte;
+    version_buf[5] = 0 as byte;
+    var read_offset: usize = 0;
+    const decoded_version: DecodedObject = codec_decode_object(version_buf[0: offset], &read_offset) catch |err| {
+        try expect(@error_id(err) == @error_id(error.CodecUnsupportedVersion));
+        return;
+    };
+    _ = decoded_version;
+    return error.AssertionFailed;
+}
+
+fn test_hash_error() !void {
+    var payload: [byte: 7] = [];
+    fill_payload(payload[0: 7]);
+    const payload_slice: &[byte] = payload[0: 7];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+    try codec_encode_object(buf[0: 128], &offset, 9 as u16, 1 as u16, payload_slice);
+
+    var hash_buf: [byte: 128] = [];
+    copy_bytes(hash_buf[0: 128], buf[0: 128], offset);
+    if offset == 0 || offset > 128 {
+        return error.AssertionFailed;
+    }
+    const last_index: usize = offset - 1;
+    if last_index >= 128 {
+        return error.AssertionFailed;
+    }
+    hash_buf[last_index] = hash_buf[last_index] ^ 1 as byte;
+    var read_offset: usize = 0;
+    const decoded_hash: DecodedObject = codec_decode_object(hash_buf[0: offset], &read_offset) catch |err| {
+        try expect(@error_id(err) == @error_id(error.CodecHashMismatch));
+        return;
+    };
+    _ = decoded_hash;
+    return error.AssertionFailed;
+}
+
+fn expect_truncated_decode(data: &[byte]) !bool {
+    var read_offset: usize = 0;
+    const decoded: DecodedObject = codec_decode_object(data, &read_offset) catch |err| {
+        try expect(@error_id(err) == @error_id(error.CodecUnexpectedEof));
+        return true;
+    };
+    _ = decoded;
+    return false;
+}
+
+fn test_truncated_payload_errors() !void {
+    var payload: [byte: 7] = [];
+    fill_payload(payload[0: 7]);
+    const payload_slice: &[byte] = payload[0: 7];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+    try codec_encode_object(buf[0: 128], &offset, 3 as u16, 0 as u16, payload_slice);
+    try expect(offset > CODEC_ENVELOPE_BYTES);
+
+    var i: usize = 0;
+    while i < offset {
+        const rejected: bool = try expect_truncated_decode(buf[0: i]);
+        if !rejected {
+            return error.AssertionFailed;
+        }
+        i = i + 1;
+    }
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Codec Tests");
+    run_test("fixed integer roundtrip", test_fixed_integer_roundtrip);
+    run_test("varuint roundtrip", test_varuint_roundtrip);
+    run_test("bytes enum list roundtrip", test_bytes_enum_and_list_roundtrip);
+    run_test("map order and stable object encoding", test_map_order_and_stable_object_encoding);
+    run_test("magic invalid error", test_magic_version_and_hash_errors);
+    run_test("version error", test_version_error);
+    run_test("hash error", test_hash_error);
+    run_test("truncated payload errors", test_truncated_payload_errors);
+    return test_suite_end();
+}

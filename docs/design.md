@@ -348,6 +348,22 @@ old ref version + expected commit + new commit + new published_view_id -> compar
 src/backend/auth/login.uya -> ["src", "backend", "auth", "login.uya"]
 ```
 
+### 8.1 Path normalization 跨平台规则
+
+所有写入 manifest、stage、pathspec matcher 和索引的路径，都先归一化为“仓库相对 UTF-8 byte path”。规范化结果永远使用 `/` 作为 separator，不依赖宿主平台的本地路径表示。
+
+| 场景 | Canonical 规则 | Windows / macOS / Linux 备注 |
+| --- | --- | --- |
+| 分隔符 | 输入中的 `\`、`/` 和重复分隔符都先按 segment separator 处理，输出统一为 `/` | Windows 工作区路径先转成 `/`；POSIX 平台保持 `/` |
+| 相对路径约束 | 只接受仓库相对路径；`/foo`、`C:\foo`、`\\server\share`、`~/foo` 一律拒绝 | 三平台统一报绝对路径错误，不做“帮你截成相对路径”的隐式修复 |
+| `.` segment | 头部 `./` 和中间 `.` segment 在归一化时移除 | `./src/./main.uya` 归一化为 `src/main.uya` |
+| `..` segment | 任意位置出现 `..` 都直接拒绝，不做折叠 | 防止 path traversal，供 `add`、`checkout`、`hydrate` 和远端输入共用 |
+| 空 segment / 尾部分隔符 | 空 segment 折叠；尾部分隔符移除；仓库根保持空路径而不是 `.` | `foo//bar/` 归一化为 `foo/bar` |
+| 编码 | 路径必须是有效 UTF-8；归一化后保留原始 code point 序列，不做 NFC/NFD 重写 | macOS 额外做 NFD/NFC 冲突检测，但不会静默改写对象路径 |
+| 大小写 | canonical bytes 保留原大小写，不做 case folding | 在大小写不敏感工作区上，`status` / `merge` / `checkout` 必须显式报 `PathCaseConflict` |
+| 非法字符 | 拒绝 NUL、ASCII 控制字符和 Windows 无法 materialize 的 `:\"*?<>|` | 避免对象能入库但无法在受支持平台落盘 |
+| 保留名 | 拒绝 `.`、`..`、Windows device names（`CON`、`PRN`、`AUX`、`NUL`、`COM1`-`COM9`、`LPT1`-`LPT9`）以及尾随空格 / 点 | 保证仓库在 Windows / macOS / Linux 间可 roundtrip |
+
 Manifest node：
 
 ```uya
@@ -384,6 +400,24 @@ Manifest 约束：
 - 一个 node 的目标大小控制在 32KB 到 256KB，便于缓存和并行 diff。
 - child range 不重叠，查询 pathspec 时可直接跳过无关分片。
 - `ManifestId = hash("hypergit.manifest.v1" || canonical_manifest_payload)`，Merkle 身份由 payload 派生，而不是写回 payload。
+
+### 8.2 Manifest shard split / merge 阈值
+
+第一版先使用固定阈值，把“单 shard 可缓存、可顺序读、可并行 diff”优先级放在最前面：
+
+| 指标 | soft target | hard split | merge underflow | merge upper bound |
+| --- | --- | --- | --- | --- |
+| encoded payload size | 128 KiB | `> 256 KiB` | `< 32 KiB` | sibling 合并后 `<= 192 KiB` |
+| leaf `entry_count` | 1024 | `> 2048` | `< 128` | 合并后 `<= 1536` |
+| internal `child_count` | 64 | `> 256` | `< 16` | 合并后 `<= 192` |
+
+执行规则：
+
+1. leaf 或 internal node 命中任一 `hard split` 条件后，就在当前 level 上按 canonical path byte order 选择最接近 `128 KiB` / `1024 entries` 的边界拆分。
+2. split 后每个 sibling 的目标范围是 `64 KiB - 160 KiB`；若数据分布极端不均，允许留下一个较小尾 shard，但绝不允许另一个 sibling 超过 `256 KiB`。
+3. 节点写回后若落入任一 `merge underflow` 条件，先尝试与左 sibling 合并，再尝试右 sibling；只有当合并结果不超过 `merge upper bound` 时才真正合并。
+4. root node 允许暂时小于 underflow 阈值；当 root 只剩一个 child 且自身没有 direct entry 时，直接向下折叠一级，而不是保留空壳 root。
+5. 读路径（query / diff / checkout planner）只消费现有 shard 结构；split / merge 只发生在写路径，避免查询期间偷偷改树。
 
 路径查询复杂度应接近：
 
@@ -466,6 +500,38 @@ Codec 规则：
 - 不编码不确定字段，例如本地 mtime、指针地址、arena offset。
 - payload hash 基于 canonical payload，而不是内存布局。
 
+### 10.1 object codec v1 二进制字段编码表
+
+v1 codec 一律按“字段顺序即字节顺序”序列化，不依赖 Uya struct 内存布局，也不写任何隐式 padding。
+
+| 逻辑类型 / 字段 | 编码 | 字节布局 | Canonical 约束 |
+| --- | --- | --- | --- |
+| `u8` | fixed integer | 1 byte | 不允许额外填充 |
+| `u16` | fixed integer | 2 bytes, little-endian | 仅按声明宽度编码 |
+| `u32` | fixed integer | 4 bytes, little-endian | magic、flags、mode 等固定宽度字段使用 |
+| `u64` | fixed integer | 8 bytes, little-endian | length、generation、logical size 使用 |
+| `i64` | fixed integer | 8 bytes, little-endian two's complement | 时间戳和带符号偏移使用 |
+| `bool` | fixed integer | 1 byte | 只允许 `0x00` / `0x01`；其他值视为 `CodecNonCanonical` |
+| `varuint` | unsigned LEB128 | 1-10 bytes | 必须最短编码；`0` 只能编码成单字节 `0x00` |
+| `Hash32` | raw bytes | 32 bytes | 不加长度前缀，不做额外包装 |
+| `ObjectId` / `CommitId` / `ManifestId` / `BlobId` | raw wrapped hash | 32 bytes | 只编码内部 `Hash32` 字节，不编码 wrapper 名称 |
+| `enum` | fixed integer | 默认 `u16`；超出 `65535` 成员时升级为 `u32` | 数值必须映射到已声明成员；未知值报 `CodecNonCanonical` |
+| `byte slice` | `varuint len + raw bytes` | `len` 前缀后紧跟数据 | 不写 NUL terminator，不做隐式压缩 |
+| `UTF-8 string` / path | `varuint len + raw bytes` | 与 `byte slice` 相同 | 对用户可见文本和路径要求有效 UTF-8 |
+| `list<T>` | `varuint count + repeated item` | 逐项顺序编码 | item 顺序属于语义的一部分，编码前不得重排 |
+| `map<K, V>` | `varuint count + repeated key/value` | 逐对顺序编码 | key 必须先按 key byte order 排序；重复 key 直接报错 |
+
+`ObjectEnvelope` 的序列化顺序固定如下：
+
+| 顺序 | 字段 | 编码 | 说明 |
+| --- | --- | --- | --- |
+| 1 | `magic` | `u32` little-endian | magic 常量值在 codec 实现冻结阶段统一确定 |
+| 2 | `version` | `u16` little-endian | v1 固定写入 `1` |
+| 3 | `kind` | `u16` enum | `ObjectKind` 的判别值空间预留给对象模型 |
+| 4 | `flags` | `u16` little-endian | v1 未定义位必须写 `0` |
+| 5 | `payload_len` | `u64` little-endian | 只统计 canonical payload 字节数，不包含 envelope |
+| 6 | `payload_hash` | `Hash32` raw bytes | hash 输入只覆盖 canonical payload，不覆盖 envelope |
+
 错误处理：
 
 ```uya
@@ -475,6 +541,32 @@ error CodecUnsupportedVersion;
 error CodecHashMismatch;
 error CodecNonCanonical;
 ```
+
+### 10.2 错误码命名规范
+
+HyperGit 统一把“模块内 Uya 错误符号”和“对外稳定错误码”分成两层命名：
+
+| 层级 | 格式 | 示例 | 用途 |
+| --- | --- | --- | --- |
+| Uya 错误符号 | `error <Domain><Reason>;` | `error CodecInvalidMagic;` | 模块内返回、测试断言、模式匹配 |
+| 稳定错误码 | `HGX_<DOMAIN>_<REASON>` | `HGX_CODEC_INVALID_MAGIC` | CLI、JSON、protocol frame、日志聚合 |
+
+命名规则：
+
+1. `Domain` 必须来自稳定模块边界，例如 `Cli`、`Repo`、`Config`、`Codec`、`Object`、`Manifest`、`Store`、`Pack`、`Stage`、`Workspace`、`Remote`、`Merge`、`Policy`、`Http`。
+2. `Reason` 使用稳定语义词，不把临时实现细节塞进错误名；优先复用 `NotFound`、`AlreadyExists`、`Invalid*`、`Unsupported*`、`HashMismatch`、`UnexpectedEof`、`PermissionDenied`、`CaseConflict`、`DirtyConflict`、`WouldOverwrite`、`Corrupt*` 等后缀。
+3. 一个错误只表达一个可恢复判断点；避免 `And` / `Or` / `Misc` / `UnknownFailure` 这类模糊拼接名。
+4. 若多个模块共享同一失败语义，Uya 名称仍保留模块前缀，但稳定错误码的 `REASON` 应尽量一致，例如 `CodecUnexpectedEof` -> `HGX_CODEC_UNEXPECTED_EOF`，`RemoteUnexpectedEof` -> `HGX_REMOTE_UNEXPECTED_EOF`。
+5. 面向用户的命令输出可以附带解释文本，但机器可消费接口必须保留稳定错误码，不直接暴露本地化句子当“错误码”。
+
+推荐示例：
+
+| 场景 | Uya 错误符号 | 稳定错误码 |
+| --- | --- | --- |
+| 仓库不存在 | `error RepoNotFound;` | `HGX_REPO_NOT_FOUND` |
+| codec magic 错误 | `error CodecInvalidMagic;` | `HGX_CODEC_INVALID_MAGIC` |
+| manifest 中出现大小写冲突 | `error ManifestCaseConflict;` | `HGX_MANIFEST_CASE_CONFLICT` |
+| checkout 会覆盖 dirty 文件 | `error WorkspaceWouldOverwriteDirty;` | `HGX_WORKSPACE_WOULD_OVERWRITE_DIRTY` |
 
 Codec 的第一批测试必须覆盖：
 
