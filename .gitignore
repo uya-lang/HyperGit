@@ -1,4 +1,6 @@
 .uyacache/
+__pycache__/
+*.pyc
 bin/*
 !bin/.gitkeep
 build/*
