@@ -1,525 +1,797 @@
-# HyperGit 设计草案
+# HyperGit / 极仓系统设计
 
-假设我要从根本上重新设计一个面向超大规模仓库的 Git-like 系统，目标不是“让 Git 勉强能跑”，而是让它天然支持：
+状态：设计版 v0.1  
+目标实现语言：纯 Uya  
+本机工具链：`~/uya/uya/bin/uya`，当前 `uya --help` 显示版本 `v0.9.7`  
+命令行入口：`hgx`
 
-- 亿级文件
-- TB/PB 级对象存储
-- 百万级提交历史
-- 超大 monorepo
-- 分布式协作
-- 高并发读写
-- 并行 checkout / diff / merge / blame / fetch / GC
-- 云端索引与本地按需 materialize
+## 1. 项目定位
 
-我会把它设计成一个内容寻址 + 分层索引 + 懒加载工作区 + 并行执行引擎的系统。
+HyperGit / 极仓是一个面向超大规模仓库的 Git-like 版本控制系统。它保留 Git 最重要的精神：内容寻址、不可变对象、分布式协作和本地优先；但数据模型、索引、工作区和协议从一开始就按亿级文件、TB/PB 级对象、百万级提交历史和高并发读写来设计。
 
-## 1. 现有 Git 的核心问题
+一句话目标：
 
-Git 的优秀之处是：
+> 把仓库从“巨大目录树”重构为“可查询、可分片、可并行执行的版本化内容数据库”。
 
-> commit / tree / blob 全部内容寻址，天然不可变，适合分布式协作。
+核心用户场景：
 
-但 Git 的历史包袱在超大仓库下非常明显：
+- 超大 monorepo 的日常开发。
+- CI / 构建系统只拉取受影响工作集。
+- IDE 浏览和搜索巨大仓库时按需 materialize。
+- 大文件、数据集、模型、设计资产作为一等对象管理。
+- 服务端提供 manifest query、path history query、server-side diff 和按需对象传输。
 
-1. **tree 是递归结构**  
-   大目录 diff、checkout、merge 时需要大量遍历。
-2. **工作区是完整物化模型**  
-   默认 checkout 出完整文件树，超大 monorepo 会拖垮磁盘和文件系统。
-3. **索引 index 是单机文件级结构**  
-   `.git/index` 在超大规模下会变成瓶颈。
-4. **packfile 更偏批量压缩，不适合细粒度并发访问**  
-   对象查找、解压、delta chain 追踪在并发场景下不够理想。
-5. **GC / repack 是重量级全局操作**  
-   超大仓库下，全局 repack 成本很高。
-6. **协议以对象传输为中心，而不是以“用户当前需要的视图”为中心**  
-   现代 Git 已经有 `partial clone`、`sparse-checkout`、`commit-graph`、`multi-pack-index`、`Scalar` 等优化，但它们更像增强层，而不是最初的数据模型设计。Git 官方 `sparse-checkout` 允许只检出部分目录；Scalar 通过 `partial clone`、`background maintenance`、`sparse-checkout` 等特性优化大仓库；`multi-pack-index` 用于跨多个 `packfile` 加速对象查找。([Git][1])
+非目标：
 
-## 2. 新系统总体架构：HyperGit
+- 不做 Git 的小修小补包装层。
+- 不以“完整 checkout 全仓库”为默认模型。
+- 不把大文件完全外包给 Git LFS 式旁路系统。
+- 不依赖外部 GC 语言运行时、JVM、Node、Python 服务作为核心实现。
 
-我会设计一个类似下面的架构：
+## 2. 纯 Uya 实现约束
+
+HyperGit 的核心实现必须使用 `~/uya/uya` 的 Uya 语言完成。C99 后端只是 Uya 编译产物，不是业务实现语言。
+
+允许的边界：
+
+- Uya 标准库：`std.crypto`、`std.collections`、`std.io`、`std.json`、`std.protobuf`、`std.http`、`std.async`、`std.thread`、`std.mem`。
+- OS / libc FFI：文件、目录、mmap、socket、poll/epoll、时间、进程退出码等系统边界。
+- C99 后端：用于可移植编译、调试生成代码和性能剖析。
+
+不允许的核心依赖：
+
+- 不用 Rust/C++/Go/Python 实现对象库、索引、协议、diff、merge 或工作区核心。
+- 不把 SQLite/RocksDB/LevelDB 作为第一版必要存储核心；可以在未来做可选后端。
+- 不用外部 Git 命令作为 native 功能的真实执行路径；Git 兼容层只能是导入/导出或网关。
+
+Uya 语言特性在本项目中的使用原则：
+
+- `!T` 显式错误联合：所有 IO、解析、校验、网络、存储操作返回显式错误。
+- `defer` / `errdefer`：文件句柄、segment writer、arena、lease token 必须显式释放。
+- `atomic T`：worker 计数、队列状态、引用发布版本、后台任务状态使用原子字段。
+- `interface`：对象存储、索引、传输、工作区后端通过接口解耦。
+- 泛型 `<T>`：arena vector、hash map、result collector、bounded queue 使用通用容器。
+- 无 GC：热路径以 arena、固定缓冲区、对象池和显式 drop 为基础。
+
+## 3. 总体架构
 
 ```text
-┌──────────────────────────────────────────────┐
-│ CLI / IDE / CI / Build System                │
-└──────────────────────────────────────────────┘
-                    │
-┌──────────────────────────────────────────────┐
-│ Workspace Engine                             │
-│ - sparse materialization                     │
-│ - virtual filesystem                         │
-│ - local change tracking                      │
-└──────────────────────────────────────────────┘
-                    │
-┌──────────────────────────────────────────────┐
-│ Query & Parallel Execution Engine            │
-│ - parallel diff                              │
-│ - parallel checkout                          │
-│ - parallel merge                             │
-│ - parallel blame                             │
-│ - parallel object prefetch                   │
-└──────────────────────────────────────────────┘
-                    │
-┌──────────────────────────────────────────────┐
-│ Metadata Index Layer                         │
-│ - commit graph index                         │
-│ - path index                                 │
-│ - tree segment index                         │
-│ - bloom filter index                         │
-│ - ownership / module index                   │
-└──────────────────────────────────────────────┘
-                    │
-┌──────────────────────────────────────────────┐
-│ Object Storage Layer                         │
-│ - content-addressed blobs                    │
-│ - chunked files                              │
-│ - immutable tree shards                      │
-│ - append-only packs                          │
-│ - local + remote cache                       │
-└──────────────────────────────────────────────┘
-                    │
-┌──────────────────────────────────────────────┐
-│ Remote Object Service / Metadata Service     │
-│ - object API                                 │
-│ - graph API                                  │
-│ - path query API                             │
-│ - delta negotiation API                      │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ CLI / IDE Adapter / CI Adapter                           │
+│ hgx clone/status/diff/commit/push/hydrate/affected        │
+└─────────────────────────────┬────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────┐
+│ Workspace Engine                                          │
+│ sparse profile / local change db / lazy materialization   │
+└─────────────────────────────┬────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────┐
+│ Query + Parallel Execution Engine                         │
+│ diff / checkout / merge / blame / fetch / prefetch         │
+└─────────────────────────────┬────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────┐
+│ Index Layer                                               │
+│ commit graph / manifest shard / path history / bloom       │
+└─────────────────────────────┬────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────┐
+│ Object Storage                                            │
+│ content objects / chunked blobs / segment packs / cache    │
+└─────────────────────────────┬────────────────────────────┘
+                              │
+┌─────────────────────────────▼────────────────────────────┐
+│ Remote Service                                            │
+│ object API / graph API / manifest API / pack protocol      │
+└──────────────────────────────────────────────────────────┘
 ```
 
-核心思想：
+架构原则：
 
-> 不再把仓库看成一个巨大目录树，而是看成一个可查询、可分片、可并行遍历的不可变版本化数据库。
+- 对象不可变，引用可变。
+- 对象内容寻址，引用更新 CAS。
+- manifest 可分片，路径查询不全树扫描。
+- 工作区默认懒加载，文件内容按需 hydrate。
+- 索引是一等数据结构，但任何索引都可从权威对象重建。
+- 大操作拆成任务图，默认并行执行。
+- 本地与远端共享同一对象模型，协议传输“视图和查询结果”，不只是裸对象。
 
-## 3. 数据模型重构
+## 4. 推荐源码布局
 
-### 3.1 Commit 不只指向 tree，而是指向 Manifest Root
-
-传统 Git：
+第一版实现建议采用清晰的 Uya 模块边界：
 
 ```text
-commit -> root tree -> subtree -> blob
+src/
+  hgx/
+    main.uya                 # CLI 入口和命令分派
+    commands/
+      init.uya
+      status.uya
+      add.uya
+      commit.uya
+      diff.uya
+      checkout.uya
+      hydrate.uya
+      fetch.uya
+      push.uya
+  hypergit/
+    core/
+      ids.uya                # Hash / ObjectId / CommitId / ManifestId
+      error.uya              # 项目级错误定义
+      codec.uya              # canonical binary codec
+      arena.uya              # 项目级 arena 包装
+    object/
+      types.uya              # Commit / Manifest / Blob / Chunk
+      hash.uya               # domain separated hash
+      validate.uya           # 对象结构校验
+    store/
+      object_store.uya       # ObjectStore interface
+      loose_store.uya        # 开发期 loose object
+      segment_pack.uya       # segment pack 读写
+      pack_index.uya
+      cache.uya
+    manifest/
+      trie.uya
+      shard.uya
+      query.uya
+      diff.uya
+    index/
+      commit_graph.uya
+      path_history.uya
+      bloom.uya
+      ref_store.uya
+      published_view.uya
+    workspace/
+      layout.uya
+      local_change_db.uya
+      materialize.uya
+      watcher.uya
+      sparse.uya
+    exec/
+      task.uya
+      worker_pool.uya
+      planner.uya
+    protocol/
+      frame.uya
+      fetch.uya
+      push.uya
+      manifest_query.uya
+    large/
+      chunker.uya
+      chunk_manifest.uya
+      hydrate.uya
+      diff.uya
+    merge/
+      planner.uya
+      text_merge.uya
+      conflict.uya
+tests/
+  test_object_codec.uya
+  test_manifest_diff.uya
+  test_loose_store.uya
+  test_segment_pack.uya
+  test_workspace_status.uya
+bench/
+  bench_manifest_query.uya
+  bench_segment_read.uya
 ```
 
-新模型：
+包命名以稳定语义为准，避免把实现细节暴露到公共模块名里。例如 `store.segment_pack` 可以替换实现，但 `object.ObjectId`、`manifest.query`、`workspace.status` 应保持稳定。
+
+## 5. 本地仓库布局
+
+HyperGit 本地元数据目录使用 `.hgit/`，避免与 `.git/` 混淆：
 
 ```text
-commit -> manifest root
-        -> tree shard index
-        -> path segment table
-        -> blob/chunk refs
+.hgit/
+  config.json
+  refs/
+    heads/main
+    remotes/origin/main
+  objects/
+    loose/
+      ab/cdef...
+    packs/
+      seg-000001.hgp
+      seg-000001.hgi
+  indexes/
+    commit-graph.hgi
+    manifest-locator.hgi
+    path-history-l0.hgi
+  workspace/
+    state.json
+    sparse.json
+    stage.hgi
+    local-change.hgi
+    leases.json
+  cache/
+    chunks/
+    manifests/
 ```
 
-Commit 结构：
+本地文件分三类：
+
+- 权威对象：`objects/` 下的不可变对象和 pack segment。
+- 可重建索引：`indexes/` 下的 commit graph、manifest locator、path history。
+- 工作区状态：`workspace/` 下的 sparse profile、stage、materialized path、dirty path、lease。
+
+## 6. 核心标识和对象模型
+
+对象 ID 使用 domain-separated hash。第一版推荐使用 32 字节 BLAKE3 或 SHA-256；Uya 标准库已提供 `std.crypto.blake3` 和 `std.crypto.sha256`，具体实现可先抽象为 `HashAlgorithm`。
+
+下面的 Uya 片段默认可引入：
+
+```uya
+use std.collections.vec.Vec;
+```
+
+```uya
+export struct Hash32 {
+    bytes: [byte: 32]
+}
+
+export struct ObjectId {
+    hash: Hash32
+}
+
+export struct CommitId {
+    id: ObjectId
+}
+
+export struct ManifestId {
+    id: ObjectId
+}
+
+export struct BlobId {
+    id: ObjectId
+}
+
+export struct PublishedViewId {
+    hash: Hash32
+}
+```
+
+以下 Uya 片段以“对象 payload”视角表达数据模型，接近实现结构，但不是完整可编译模块。内容寻址对象的 `ObjectId`、manifest Merkle hash 和其他自派生标识不写入它自己的 canonical payload，而是放在对象文件名、索引、ref、内存 wrapper 或查询上下文里，避免 hash 自引用。
+
+存储边界可以抽象为：
+
+```uya
+export struct StoredObject<T> {
+    object_id: ObjectId,
+    payload: T
+}
+```
+
+对象外壳统一包含版本、类型、长度和校验：
+
+```uya
+export enum ObjectKind {
+    Commit,
+    ManifestNode,
+    BlobMeta,
+    Chunk,
+    RefSnapshot,
+    IndexBlock
+}
+
+export struct ObjectEnvelope {
+    magic: u32,
+    version: u16,
+    kind: ObjectKind,
+    flags: u16,
+    payload_len: u64,
+    payload_hash: Hash32
+}
+```
+
+Hash 输入必须包含 domain，避免不同对象类型在相同 payload 下混淆：
 
 ```text
-Commit {
-    id: Hash
-    parents: [CommitId]
-    author
-    committer
-    message
-    timestamp
-    manifest_root: ManifestId
-    changed_path_summary: BloomFilter
-    module_summary: ModuleBitmap
+hash("hypergit.commit.v1" || canonical_commit_payload)
+hash("hypergit.manifest.v1" || canonical_manifest_payload)
+hash("hypergit.chunk.v1" || plaintext_or_ciphertext_policy_payload)
+```
+
+## 7. Commit 与 Published View
+
+Commit 不直接指向递归 tree，而是指向 manifest root。
+
+```uya
+export struct CommitPayload {
+    parents: Vec<CommitId>,
+    author: Identity,
+    committer: Identity,
+    message: Vec<byte>,
+    timestamp_ms: i64,
+    manifest_root: ManifestId,
+    changed_path_bloom: BloomFilter,
+    module_bitmap: ModuleBitmap,
     generation: u64
 }
 ```
 
-新增字段：
+`generation` 用于祖先查询和 merge-base；`changed_path_bloom` 用于快速判断某个 pathspec 是否可能受提交影响；`module_bitmap` 用于 CI affected target。
 
-- `changed_path_summary`：快速判断某个路径是否可能被该提交影响。
-- `module_summary`：快速判断某个模块是否受影响。
-- `generation`：加速祖先查询、`merge-base` 查询。
-- `manifest_root`：指向分片化文件树。
+远端和本地引用不只发布 commit，还发布一致性视图：
 
-Git 的 `commit-graph` 本质上已经在做类似“提交历史索引”的事情，新系统会把它变成一等公民，而不是可选优化。
-
-### 3.2 Tree 改成 B+Tree / Merkle Trie
-
-传统 Git tree 是目录递归结构。新模型使用：
-
-```text
-Merkle Path Trie / B+Tree
-```
-
-路径按段存储：
-
-```text
-/src/backend/auth/login.go
-=> ["src", "backend", "auth", "login.go"]
-```
-
-Manifest 结构：
-
-```text
-ManifestNode {
-    prefix: PathPrefix
-    entries: [Entry]
-    children: [ManifestNodeId]
-    hash: Hash
+```uya
+export struct PublishedView {
+    head_commit: CommitId,
+    manifest_root: ManifestId,
+    serving_index_snapshot: ObjectId,
+    lineage_watermark: u64,
+    dependency_watermark: u64,
+    created_at_ms: i64
 }
 ```
 
-Entry：
+引用更新模型：
 
 ```text
-Entry {
-    name
-    type: file | dir | symlink | submodule
-    mode
-    object_id
-    size
-    mtime_hint
-    content_type
+refs/heads/main -> (target_commit, published_view_id, version)
+```
+
+更新必须走 CAS：
+
+```text
+old ref version + expected commit + new commit + new published_view_id -> compare-and-swap
+```
+
+这样一次 checkout、diff、blame、IDE 浏览会话可以绑定同一个 `PublishedViewId`，不会在中途读到两个索引快照。
+
+## 8. Manifest：分片化 Merkle Path Trie
+
+传统 Git tree 是递归目录对象。HyperGit 使用按路径排序的 Merkle Path Trie / B+Tree 风格 manifest。路径按 segment 处理，例如：
+
+```text
+src/backend/auth/login.uya -> ["src", "backend", "auth", "login.uya"]
+```
+
+Manifest node：
+
+```uya
+export struct ManifestNodePayload {
+    prefix: PathPrefix,
+    level: u16,
+    entry_count: u32,
+    child_count: u32,
+    entries: Vec<ManifestEntry>,
+    children: Vec<ManifestChild>
+}
+
+export struct ManifestEntry {
+    name: Vec<byte>,
+    kind: EntryKind,
+    mode: u32,
+    object_id: ObjectId,
+    logical_size: u64,
+    content_type: ContentType,
+    policy_id: PolicyId
+}
+
+export struct ManifestChild {
+    min_name: Vec<byte>,
+    max_name: Vec<byte>,
+    child_id: ManifestId,
+    child_hash: Hash32
 }
 ```
 
-这样有几个好处：
+Manifest 约束：
 
-1. **路径范围查询快**  
-   查询 `src/payment/**` 不需要遍历整个仓库。
-2. **天然可分片**  
-   `src/a-m` 和 `src/n-z` 可以在不同 shard。
-3. **diff 可并行**  
-   两个 commit 的 manifest root 可以分段比较。
-4. **checkout 可并行**  
-   不同路径段独立 materialize。
-5. **merge 可并行**  
-   不同 tree shard 可以独立做三方合并。
+- entries 按 canonical path byte order 排序。
+- 一个 node 的目标大小控制在 32KB 到 256KB，便于缓存和并行 diff。
+- child range 不重叠，查询 pathspec 时可直接跳过无关分片。
+- `ManifestId = hash("hypergit.manifest.v1" || canonical_manifest_payload)`，Merkle 身份由 payload 派生，而不是写回 payload。
 
-### 3.3 大文件是原生 Chunked Blob，而不是外接 LFS
-
-在 HyperGit / 极仓里，大文件不应该像传统 Git 那样作为一个完整 `blob` 直接塞进对象库，也不应该只是外接一个类似 Git LFS 的系统。
-
-核心原则是：
-
-> 大文件 = Blob 元数据 + 内容分块 Chunk + 去重索引 + 按需加载 + 并行传输。
-
-传统 Git 里，一个文件大致是：
+路径查询复杂度应接近：
 
 ```text
-file -> blob(hash(content))
+O(log(shards) + matched_entries)
 ```
 
-如果一个 2GB 文件只改了 1MB，Git 仍然会把新版本当成一个新 blob 处理。即使 `pack delta` 能缓解一部分，这个模型对超大文件、二进制文件、局部访问和并发传输都不理想。
-
-HyperGit 中，大文件会变成原生对象链：
+而不是：
 
 ```text
-LargeFileBlob
-    ├── BlobMeta
-    ├── ChunkManifest
-    ├── Chunk_001
-    ├── Chunk_002
-    ├── Chunk_003
-    └── ...
+O(total_files)
 ```
 
-结构类似：
+## 9. Blob 与大文件模型
 
-```text
-BlobMeta {
-    blob_id: Hash
-    logical_size: u64
-    file_type: binary | text | media | archive | model | dataset
-    chunking_strategy: fixed | content_defined
-    chunks: [ChunkRef]
-    content_fingerprint
-    encryption_profile
-    dedupe_scope
+小文件使用普通 blob：
+
+```uya
+export struct SmallBlobPayload {
+    logical_size: u64,
+    content_hash: Hash32,
+    payload: Vec<byte>
 }
 ```
 
-每个 chunk：
+大文件是原生 chunked blob，不是外接 LFS pointer：
 
-```text
-ChunkRef {
-    chunk_id: Hash
-    storage_id: Hash
-    offset: u64
-    logical_size: u32
-    stored_size: u32
-    ciphertext_checksum
-    storage_tier
+```uya
+export struct ChunkedBlobPayload {
+    logical_size: u64,
+    file_type: FileType,
+    chunking_strategy: ChunkingStrategy,
+    chunk_count: u32,
+    chunks: Vec<ChunkRef>,
+    content_fingerprint: Hash32,
+    encryption_profile: PolicyId,
+    dedupe_scope: DedupeScope
+}
+
+export struct ChunkRef {
+    logical_chunk_id: Hash32,
+    storage_id: Hash32,
+    offset: u64,
+    logical_size: u32,
+    stored_size: u32,
+    checksum: Hash32,
+    storage_tier: StorageTier
 }
 ```
 
-底层真实对象仍然是不可变内容寻址对象：
+默认阈值建议：
 
-```text
-Chunk {
-    storage_id: Hash
-    encrypted_payload
+| 文件大小 | 对象策略 | 默认工作区行为 |
+| --- | --- | --- |
+| `< 8MB` | small blob | 可直接 materialize |
+| `8MB - 128MB` | chunked blob | 按 sparse profile hydrate |
+| `> 128MB` | large chunked blob | 默认 virtual |
+| `> 1GB` | large chunked blob | 需要显式 hydrate |
+
+Chunk 策略：
+
+- 默认 Content-Defined Chunking，平均 4MB，最小 512KB，最大 16MB。
+- 高随机内容或已压缩文件可回退固定分块。
+- 上传只传缺失 chunk。
+- 下载支持 range read 和并行 hydrate。
+- 二进制 merge 默认保守，不懂格式时不假装智能合并。
+
+## 10. Canonical Codec
+
+对象持久化使用项目自定义 canonical binary codec。第一版不要直接用 JSON/YAML 存权威对象；JSON 只用于 config、debug dump 和测试 golden 文件。
+
+Codec 规则：
+
+- 整数使用明确端序，推荐 little-endian。
+- 变长列表使用 `varuint length + repeated item`。
+- enum 使用固定宽度 `u16` 或 `u32`。
+- 字符串和路径存 UTF-8 byte slice，不做平台本地编码。
+- 所有 map 在编码前按 key 的 byte order 排序。
+- 不把对象自己的 `ObjectId`、`ManifestId`、`PublishedViewId` 或其他自派生 hash 编进自己的 canonical payload。
+- 不编码不确定字段，例如本地 mtime、指针地址、arena offset。
+- payload hash 基于 canonical payload，而不是内存布局。
+
+错误处理：
+
+```uya
+error CodecUnexpectedEof;
+error CodecInvalidMagic;
+error CodecUnsupportedVersion;
+error CodecHashMismatch;
+error CodecNonCanonical;
+```
+
+Codec 的第一批测试必须覆盖：
+
+- 同一对象重复编码字节完全一致。
+- 字段顺序、map 顺序、路径排序稳定。
+- 损坏 magic/version/hash 时返回明确错误。
+- 随机截断 payload 不越界，不 panic，不读未初始化内存。
+
+## 11. Object Store
+
+对象存储接口：
+
+```uya
+export interface ObjectStore {
+    fn has(self: &Self, id: ObjectId) !bool;
+    fn get(self: &Self, id: ObjectId, arena: &Arena) !ObjectBytes;
+    fn put(self: &Self, kind: ObjectKind, payload: &[const byte]) !ObjectId;
+    fn open_reader(self: &Self, id: ObjectId) !ObjectReader;
 }
 ```
 
-这样，大文件的版本对象本身很小，真正的大内容被拆成很多不可变 chunk。直接收益是：
+第一版实现顺序：
 
-- 大文件小修改不需要重传整个 blob。
-- diff 大文件只比较 chunk 或逻辑范围，而不是全量字节。
-- 大文件不再外包给 LFS，而是仓库对象模型的一部分。
-- 支持并行下载、并行校验、并行解压和范围读取。
+1. `LooseObjectStore`：每个对象一个文件，便于调试。
+2. `SegmentPackWriter`：append-only segment pack。
+3. `SegmentPackIndex`：object id -> segment offset。
+4. `CompositeObjectStore`：loose + pack + cache 组合读。
 
-#### 3.3.1 内容定义分块优先，固定分块作为回退
-
-对于大文件，我不会只用固定 `4MB` / `8MB` 分块，因为固定分块有一个根本问题：
-
-> 文件头部插入一点内容，后面所有 chunk offset 都变了，去重效果会急剧下降。
-
-因此大文件默认采用 **Content-Defined Chunking, CDC**，也就是根据滚动哈希决定切分点，而不是按固定 offset 切分。
-
-例如：
+Segment pack 结构：
 
 ```text
-平均 chunk size: 4MB
-最小 chunk size: 512KB
-最大 chunk size: 16MB
+Header
+ObjectRecord...
+IndexFooter
+ChecksumFooter
 ```
 
-这样如果文件中间插入少量内容，大部分原有 chunk 仍然可以复用。它特别适合：
+分组维度：
 
-- 大型二进制文件
-- 数据集
-- 模型文件
-- 视频
-- VM 镜像
-- 设计资产
-- 游戏资源包
+- 对象类型：commit / manifest / blobmeta / chunk。
+- locality：路径前缀、时间窗口、模块、热度。
+- generation：recent、daily、weekly、cold。
 
-固定分块不是被淘汰，而是作为少数格式的回退策略，例如高度随机、不可切分、或内容定义分块收益很低的对象。
+GC / compaction 原则：
 
-#### 3.3.2 小修改只上传变化的 Chunk
+- 前台写 append-only。
+- 后台 copy-forward 生成新 segment。
+- 旧 segment 只有在 active lease watermark 之后才能删除。
+- 索引损坏只影响性能；对象校验失败必须返回硬错误。
 
-假设有一个 `10GB` 文件：
+## 12. Index Layer
+
+索引是性能路径，但不是事实来源。
+
+Commit graph index：
+
+```uya
+export struct CommitGraphEntry {
+    commit_id: CommitId,
+    generation: u64,
+    parents: Vec<CommitId>,
+    timestamp_ms: i64,
+    changed_path_bloom: BloomFilter,
+    module_bitmap: ModuleBitmap
+}
+```
+
+用途：
+
+- `merge-base`
+- `log -- path`
+- `branch contains`
+- `bisect`
+- `affected tests`
+
+Path history 分两层：
+
+- L0 强一致索引：提交发布时同步写入 changed path、delete event、rename hint。
+- L1 异步 lineage 索引：后台构建 content fingerprint、chunk-line map、深度 rename graph。
+
+Manifest locator：
+
+- `path prefix -> manifest shard id`
+- `manifest id -> pack segment`
+- `published_view_id -> root manifest + shard map snapshot`
+
+Bloom filter：
+
+- commit changed-path bloom。
+- segment object bloom。
+- manifest shard path bloom。
+
+任意查询都必须能在索引缺失或落后时回退到权威对象路径，并在结果中暴露 watermark。
+
+## 13. Workspace Engine
+
+工作区不是完整目录树，而是一个有 sparse profile 的虚拟视图。
+
+```uya
+export struct WorkspaceState {
+    repo_root: Vec<byte>,
+    base_commit: CommitId,
+    view_id: PublishedViewId,
+    sparse_profile_id: Hash32,
+    materialized_count: u64,
+    dirty_count: u64,
+    watcher_seq: u64
+}
+```
+
+### 13.1 Stage / Index 模型
+
+`hgx add` 和 `hgx commit` 不能直接建立在 `LocalChangeDB` 上。`LocalChangeDB` 只负责发现工作区变化；真正的提交输入必须是显式 stage snapshot。
+
+第一版 stage 持久化文件：
 
 ```text
-model.bin
+.hgit/workspace/stage.hgi
 ```
 
-第一次提交：
+建议的数据模型：
+
+```uya
+export enum StageEntryKind {
+    Add,
+    Modify,
+    Delete,
+    ModeOnly
+}
+
+export struct StageEntry {
+    path: Vec<byte>,
+    kind: StageEntryKind,
+    base_object: ObjectId,
+    has_staged_object: bool,
+    staged_object: ObjectId,
+    file_mode: u32
+}
+
+export struct StageState {
+    base_commit: CommitId,
+    entry_count: u64,
+    last_update_ms: i64
+}
+```
+
+约束：
+
+- `hgx add <pathspec>` 从 working tree 或 manifest snapshot 生成 `StageEntry`，写入 `stage.hgi`。
+- `hgx commit` 只消费 stage snapshot，不重新全量扫描 working tree。
+- `hgx status` 同时展示 base -> stage 的 staged 变化，以及 stage -> worktree 的 unstaged 变化。
+- 删除、mode change、稀疏路径部分提交都通过 stage 表达，不能依赖“当前目录上恰好扫到了什么”。
+- 对尚未 hydrate 的未修改文件，stage 可以直接复用 manifest 中已有 `ObjectId`，不需要强制 materialize。
+
+### 13.2 本地变更数据库
+
+本地变更数据库：
+
+```uya
+export struct LocalChange {
+    path: Vec<byte>,
+    base_object: ObjectId,
+    working_hash: Hash32,
+    status: ChangeStatus,
+    last_seen_inode: u64,
+    last_seen_mtime_ns: i64,
+    watcher_seq: u64,
+    reconcile_epoch: u64
+}
+```
+
+状态来源优先级：
+
+1. stage snapshot。
+2. 显式记录的 local change。
+3. 文件系统 watcher 事件。
+4. 分片 reconcile 扫描。
+5. manifest 权威视图。
+
+命令语义：
+
+- `hgx status` 不全仓库扫描，默认读 stage、local change db 和 watcher journal。
+- `hgx add pathspec` 更新 stage，而不是直接写 commit 草稿。
+- `hgx commit -m` 以 stage 为唯一提交输入；空 stage 时拒绝生成新 commit。
+- `hgx hydrate pathspec` 下载并落盘内容。
+- `hgx dehydrate pathspec` 删除本地内容但保留 manifest 元数据。
+- `hgx sparse add/remove` 更新工作区可见/默认物化范围。
+
+第一版可以先不实现内核级 VFS，采用“真实文件 + placeholder + manifest-aware command”的用户态模型；后续再扩展 FUSE/平台 VFS。
+
+## 14. 并行执行模型
+
+HyperGit 的重操作都通过 planner 生成任务图，再交给 worker pool 执行。
+
+```uya
+export enum TaskKind {
+    ReadObject,
+    WriteObject,
+    DiffShard,
+    MaterializePath,
+    FetchSegment,
+    HashFileRange,
+    MergeShard
+}
+
+export struct Task {
+    id: u64,
+    kind: TaskKind,
+    priority: u16,
+    input_offset: u64,
+    input_len: u64
+}
+```
+
+执行原则：
+
+- 每个 worker 持有自己的 arena，减少跨线程分配。
+- 共享统计使用 `atomic u64`。
+- object cache 只存不可变对象。
+- 任务结果通过 bounded queue 汇总。
+- 失败任务携带明确错误；planner 决定是否重试、降级或整体失败。
+
+需要并行化的路径：
+
+- manifest diff：按 shard 并行。
+- checkout/materialize：按路径和 pack locality 并行。
+- fetch/push：按 segment 并行。
+- 大文件 hash/chunk/upload：按 range 或 chunk 并行。
+- merge：全局 namespace preflight 后按独立 shard 并行。
+
+## 15. Diff 与 Merge
+
+Manifest diff：
 
 ```text
-model.bin -> 2560 个 chunk，每个约 4MB
+if left_manifest_id == right_manifest_id:
+    skip whole shard
+else:
+    align child ranges
+    spawn diff task per changed range
 ```
 
-第二次只改了其中 `20MB` 内容：
+文本 diff 第一版可以实现 Myers 或 patience diff 的简化版本，优先保证正确性和可测试性。大文件 diff 使用类型感知摘要：
 
-```text
-新版本 model.bin:
-    2555 个 chunk 复用旧版本
-    5 个 chunk 新增
-```
+- 大文本：chunk + line range diff。
+- 二进制：chunk-level changed summary。
+- 图片/视频/模型/数据集：先输出 metadata diff，后续插件化。
 
-提交时只需要：
+Merge 分三阶段：
 
-1. 重新计算 chunk manifest。
-2. 上传新增 chunk。
-3. 新建一个 `BlobMeta`。
-4. commit 指向新的 `BlobMeta`。
-
-不会重新上传 `10GB`。
-
-#### 3.3.3 默认懒加载，按需 Hydrate 与 Range Read
-
-默认 checkout 不应该把所有大文件都下载下来。工作区里可以先放一个 lightweight placeholder：
-
-```text
-path: assets/model/v3/model.bin
-size: 10GB
-blob_id: abc123
-state: virtual
-chunks: not downloaded
-```
-
-当用户真的打开文件、构建系统需要文件、或者用户显式执行命令时，才下载内容：
-
-```bash
-hgx hydrate assets/model/v3/model.bin
-hgx hydrate assets/models/**
-hgx dehydrate assets/models/**
-```
-
-这点看起来像 Git LFS 的 pointer + pull，但本质区别是：
-
-> HyperGit 的大文件不是外接 LFS，而是原生对象类型。
-
-很多大文件也不需要完整下载。例如视频只预览前几秒、模型只读 header、Parquet 只读 footer、归档文件只读 central directory。
-
-因此对象服务需要支持：
-
-```text
-ReadBlobRange(view, blob_id, offset, length)
-```
-
-底层根据 offset 映射到 chunk：
-
-```text
-offset -> chunk range -> fetch needed chunks only
-```
-
-这样 IDE、构建系统、分析工具可以只读必要范围，而不是被迫拉完整对象。
-
-#### 3.3.4 并行上传和下载是默认路径
-
-大文件天然适合并行传输。
-
-上传流程：
-
-```text
-1. 扫描文件
-2. 并行切 chunk
-3. 并行计算 logical_chunk_id / storage_id
-4. 并行压缩并加密
-5. 查询远端已有 chunk
-6. 只上传缺失 chunk
-7. 写入 BlobMeta
-```
-
-下载流程：
-
-```text
-1. 读取 BlobMeta
-2. 选择需要的 chunk
-3. 按 storage locality 分组
-4. 并行下载
-5. 并行校验密文完整性
-6. 并行解密与解压
-7. 顺序组装或按需映射
-```
-
-伪代码：
-
-```python
-def upload_large_file(path):
-    chunks = content_defined_chunk(path)
-
-    missing = remote.find_missing_chunks_in_scope(
-        scope_token=current_repo.dedupe_scope_token,
-        chunk_storage_ids=[chunk.storage_id for chunk in chunks]
-    )
-
-    parallel_upload(missing)
-
-    blob_meta = BlobMeta(
-        size=file_size(path),
-        chunks=[chunk.ref for chunk in chunks]
-    )
-
-    return remote.put_blob_meta(blob_meta)
-```
-
-#### 3.3.5 大文件 Diff 要类型感知，Merge 要保守
-
-大文件 diff 不应该默认做全文 diff。系统需要按类型选择策略：
-
-| 文件类型 | Diff 策略 |
-| --- | --- |
-| 大文本 | 分块行 diff |
-| 二进制 | chunk-level diff |
-| 图片 | perceptual diff / metadata diff |
-| 视频 | metadata + keyframe diff |
-| 模型 | tensor metadata diff |
-| 数据集 | schema / partition diff |
-| 压缩包 | archive index diff |
-| 未知二进制 | chunk changed summary |
-
-例如：
-
-```bash
-hgx diff model.bin
-```
-
-输出不应该是传统文本 diff，而更接近：
-
-```text
-model.bin changed
-size: 10.2GB -> 10.3GB
-chunks: 2560 -> 2581
-reused chunks: 2549
-new chunks: 32
-removed chunks: 11
-changed logical ranges:
-  1.2GB - 1.3GB
-  7.8GB - 7.9GB
-```
-
-Merge 则必须更保守：
-
-- **文本大文件**：允许按 chunk + line range 合并；若修改落在不同逻辑范围，可以自动合并。
-- **二进制大文件**：默认不做内容级 merge，只做策略判断。
-- **可理解格式**：通过插件化 merge driver 处理，例如 `JSON`、`Parquet manifest`、`ONNX`、`Unity asset`、`CAD`、`SQLite`。
+1. 全局 preflight：rename graph、file/dir 冲突、大小写折叠冲突、symlink/submodule 边界。
+2. shard 内并行三方合并。
+3. 全局收敛：目录 rename、mode、平台约束、最终 manifest。
 
 默认二进制 merge 规则：
 
 ```text
 ours changed, theirs unchanged -> take ours
 ours unchanged, theirs changed -> take theirs
-both changed same blob -> ok
-both changed different blob -> conflict
+both unchanged -> keep base
+both changed to same blob -> ok
+both changed to different blob -> conflict
 ```
 
-核心原则：
+## 16. 远端协议
 
-> 不懂格式时，不假装智能合并。
+协议目标不是“传所有可达对象”，而是“传这个工作视图需要的对象和索引增量”。
 
-#### 3.3.6 去重、冷热分层与安全策略
-
-大文件系统最重要的能力之一是去重，但去重边界必须先于“全局共享”来定义。HyperGit 里，去重不直接建立在“全组织裸 hash 可见”上，而是建立在**授权后的 dedupe scope** 上：
+能力协商：
 
 ```text
-Repo scope    -> 默认，只在单仓库内 dedupe
-Tenant scope  -> 同一业务租户内 dedupe
-Org scope     -> 明确授权的组织级共享对象池
+partial_materialization
+manifest_query
+path_history_query
+chunked_blob
+parallel_pack_segments
+server_side_diff
+server_side_merge_base
+prefetch_hints
 ```
 
-对象标识也分成两层：
+核心请求：
 
 ```text
-logical_chunk_id   = SHA256(plaintext_chunk)
-physical_storage_id = HMAC-SHA256(scope_secret, plaintext_chunk)
+GetCommitGraph(frontier, want_refs)
+GetManifest(published_view_id, pathspec)
+GetBlobRange(published_view_id, blob_id, offset, length)
+GetPackSegments(published_view_id, object_ids)
+GetPathHistory(published_view_id, path, since)
+FetchView(have_frontier, want_ref, sparse_profile, blob_filter)
+PushObjects(objects, expected_ref, new_commit)
 ```
 
-- `logical_chunk_id` 用于内容完整性校验、manifest 引用和跨版本比较。
-- `physical_storage_id` 只在服务端存储层和被授权的 dedupe scope 内可见，用于物理去重。
-- 客户端不会对“全局对象库”发起裸存在性探测；缺块查询必须携带 scope token，服务端也只能在该授权 scope 内回答是否缺失。
+第一版传输建议：
 
-在这个前提下，去重至少分三层：
+- 本地测试先使用 file remote：`file:///path/to/repo`。
+- 第二阶段使用 Uya `std.http` 实现 HTTP/1.1 服务端。
+- payload 使用 canonical binary frame，debug 模式可导出 JSON。
+- 每个 frame 包含 magic、version、request id、kind、payload length、checksum。
 
-1. **Chunk 级去重**  
-   相同 chunk 只存一次，但物理去重键是 `physical_storage_id`，不是裸内容 hash。
-2. **跨文件去重**  
-   两个文件共享部分内容时，也能复用 chunk。
-3. **跨仓库去重**  
-   企业内部多个仓库共用 SDK、数据集、基础模型时，可以在显式授权的 tenant/org scope 内使用共享 chunk store，而不是默认全组织互相探测。
+## 17. 安全、策略与权限
 
-Chunk 还应该支持冷热分层：
+对象完整性：
+
+- 所有对象读取后校验 hash。
+- pack segment 有整体 checksum。
+- chunk 同时有 logical chunk id 和 stored checksum。
+
+去重边界：
 
 ```text
-Hot: 本地 SSD / 团队缓存
-Warm: 区域对象存储
-Cold: 归档存储
+Repo scope   -> 默认，只在单仓库去重
+Tenant scope -> 同租户授权去重
+Org scope    -> 明确授权的组织级共享对象池
 ```
 
-`ChunkRef` 中的 `storage_tier` 用于表达对象当前所在层。典型策略：
-
-- 最近 30 天访问过的 chunk 放热层。
-- 主干分支最新版本放热层。
-- 老 tag / 旧 release 放冷层。
-- CI 常用资源提前预热。
-
-大文件层往往还要承载敏感数据，因此对象层需要支持：
-
-```text
-per-path policy
-per-blob policy
-per-chunk encryption
-access audit
-quota
-retention
-```
-
-例如：
+权限策略以 path policy 表达：
 
 ```text
 /data/customer/**
@@ -529,863 +801,158 @@ retention
     local-cache-ttl: 24h
 ```
 
-chunk 内容可以独立压缩和加密，但顺序必须固定为“先压缩，再加密，再存储”：
+本地安全：
 
-```text
-plaintext_chunk
-    -> compress
-    -> encrypt(chunk_key)
-    -> store(ciphertext)
-```
+- 不信任 `.hgit` 中可被手工篡改的索引。
+- 读取 object 必须重新校验 hash。
+- checkout 必须拒绝 path traversal、绝对路径、非法 symlink escape。
+- Windows/macOS/Linux 的大小写、执行位、symlink 差异要在 manifest entry 中建模。
 
-校验链也要分层：
+## 18. CLI 设计
 
-```text
-logical_chunk_id    -> 约束明文内容身份
-ciphertext_checksum -> 约束传输与落盘完整性
-```
-
-`BlobMeta` 只记录加密 key reference，而不是直接存 key；真正的数据面校验先验证密文完整性，再解密并验证 `logical_chunk_id`。
-
-#### 3.3.7 与 Git LFS 的区别和默认阈值
-
-Git LFS 的模型大致是：
-
-```text
-Git blob = pointer file
-LFS server = real large object
-```
-
-HyperGit 的模型是：
-
-```text
-Commit -> Manifest -> BlobMeta -> Chunks
-```
-
-区别：
-
-| 能力 | Git LFS | HyperGit 大文件模型 |
-| --- | --- | --- |
-| 是否原生对象 | 否 | 是 |
-| Chunk 级去重 | 通常不是核心模型 | 是 |
-| Range read | 不一定 | 原生支持 |
-| 并行下载 | 有限 | 原生支持 |
-| 大文件 diff | 弱 | 类型感知 |
-| 大文件 merge | 弱 | 插件化 |
-| 存储分层 | 外部实现 | 原生 |
-| 权限审计 | 依赖 LFS 服务 | 原生 |
-| 与 manifest 集成 | 弱 | 强 |
-| 部分 checkout | 依赖额外机制 | 默认模型 |
-
-推荐默认策略：
-
-```text
-小于 8MB：普通 blob
-8MB - 128MB：chunked blob，可直接 hydrate
-大于 128MB：large blob，默认 lazy
-大于 1GB：large blob + explicit hydrate
-```
-
-示例：
-
-```text
-README.md              -> normal blob
-src/app/main.go        -> normal blob
-assets/logo.psd        -> chunked blob
-dataset/train.parquet  -> large chunked blob
-model/checkpoint.bin   -> large chunked blob, lazy by default
-```
-
-也可以通过配置覆盖：
-
-```toml
-[large_file]
-threshold = "8MB"
-chunk_avg_size = "4MB"
-
-[[large_file.rule]]
-pattern = "*.parquet"
-strategy = "chunked"
-diff = "parquet-aware"
-
-[[large_file.rule]]
-pattern = "*.onnx"
-strategy = "chunked"
-diff = "model-metadata"
-
-[[large_file.rule]]
-pattern = "*.zip"
-strategy = "whole-object"
-diff = "archive-index"
-```
-
-一句话总结：
-
-> HyperGit 不把大文件当成 Git blob，也不把它外包给 LFS，而是把它建模成原生的 chunked blob：支持内容定义分块、跨版本去重、按需加载、范围读取、并行传输、冷热存储、类型感知 diff 和插件化 merge。
-
-### 3.4 发布视图与一致性模型
-
-如果索引成为核心读路径，就必须先定义一致性边界。系统需要明确区分四类数据：
-
-- **权威对象**：`Commit`、`Manifest`、`Blob Metadata`、`Chunk`，是最终事实来源。
-- **最小同步发布索引**：`commit graph delta`、`manifest shard locator`、`changed path bloom`、changed-path 的 L0 posting list；它们必须和 ref 发布保持同一快照。
-- **延迟构建的服务加速索引**：完整 `tree segment map`、大范围 path fanout cache、模块聚合 posting，可在 ref 发布后补齐，但查询必须能回退到权威对象路径。
-- **异步分析索引**：`DependencyIndex`、深度 `LineageIndex`、热度统计、预取提示，可以落后于最新提交，但必须显式带版本。
-
-查询不直接对“最新对象集合”执行，而是对一个已发布视图执行：
-
-```text
-PublishedView {
-    view_id: Hash
-    head_commit: CommitId
-    manifest_root: ManifestId
-    serving_index_snapshot: IndexSnapshotId
-    optional_index_watermarks: {
-        lineage: u64
-        dependency: u64
-    }
-    created_at
-}
-```
-
-约束如下：
-
-1. `push` 先上传权威对象，再构建**最小同步发布索引**并生成 `PublishedView`，最后原子发布 ref；只有这一小组索引会阻塞 ref 可见性。
-2. 多步操作必须绑定同一个 `view_id`；一次 `checkout`、`diff`、`merge`、`blame`、IDE 浏览会话不能在中途漂到另一个索引快照上。
-3. 延迟构建的服务加速索引和异步分析索引都允许滞后，但查询结果必须返回自己的 watermark；若所需索引未追平，则退化到较慢但正确的权威对象路径。
-4. 同步发布阶段必须有明确预算，例如“单次 push 只同步触达 changed shards”；超过预算的二级索引自动转入后台任务，不能无限期阻塞提交发布。
-5. 任意索引都必须可从权威对象重建；索引损坏只能影响性能，不能改变仓库事实。
-
-## 4. 存储层设计
-
-### 4.1 对象分层
-
-对象分四类：
-
-```text
-Commit Object
-Manifest Object
-Blob Metadata Object
-Chunk Object
-```
-
-每类对象有不同存储策略：
-
-| 类型 | 特点 | 存储策略 |
-| --- | --- | --- |
-| Commit | 小、频繁查询 | 热索引 + KV |
-| Manifest | 中等、结构化 | 分片 + Merkle |
-| Blob Metadata | 中等 | KV + cache |
-| Chunk | 大、不可变 | 对象存储 / pack / CDN |
-
-### 4.2 Packfile 改为 Segment Pack
-
-传统 `packfile` 是大包。新设计：
-
-```text
-PackSegment {
-    segment_id
-    object_type
-    locality_key
-    objects[]
-    index
-    bloom
-}
-```
-
-按 locality 分组：
-
-- 按路径模块：`src/payment`
-- 按时间窗口：`2026-W20`
-- 按对象类型：`commit` / `manifest` / `blob` / `chunk`
-- 按热度：`hot` / `warm` / `cold`
-
-这样可以做到：
-
-- 查询某个模块只打开相关 pack segment。
-- 后台 compaction 可以局部执行。
-- GC 不需要全仓库 stop-the-world。
-- 多线程可以独立读取不同 segment。
-
-### 4.3 多级缓存
-
-```text
-L1: 进程内对象 cache
-L2: 本地磁盘 object cache
-L3: 局域网 / 团队共享 cache
-L4: 远程对象服务
-L5: 冷对象归档存储
-```
-
-开发者 `clone` 时不再下载完整仓库，而是：
-
-```text
-clone = 下载 commit graph + manifest root + 当前 sparse profile
-```
-
-这与 Git `partial clone` 的方向一致：`partial clone` 的目标就是不在初始 `clone` 时下载所有对象，而是在需要时再取对象；Scalar 也通过 `partial clone` 和 background prefetch 降低大仓库操作成本。([GitHub][2])
-
-### 4.4 对象生命周期、Lease 与回收边界
-
-只看 refs 做可达性分析是不够的，因为工作区、后台任务和进行中的查询都会临时依赖尚未物化的对象。
-
-因此系统需要显式 lease：
-
-```text
-ObjectLease {
-    lease_id
-    holder_type: workspace | fetch | merge | blame | prefetch | gc_reader
-    root_view: ViewId
-    pinned_commits: [CommitId]
-    pinned_manifest_shards: [ManifestNodeId]
-    pinned_segments: [SegmentId]
-    expires_at
-    renew_token
-}
-```
-
-规则：
-
-1. `clone` / `checkout` 会为当前 `base_commit` 和对应 `PublishedView` 建立长租约，哪怕文件尚未 materialize。
-2. `fetch`、`merge`、`blame`、后台 prefetch 只拿短租约，但在任务执行期间自动续租。
-3. `dehydrate` 可以删除本地副本，但不能立即释放逻辑 pin；只有当工作区基线前移或工作区关闭后，租约才能真正释放。
-4. Compaction 采用 copy-forward：先写新 segment，再发布新索引映射；旧 segment 只有在其小于全局 lease watermark 后才能回收。
-5. 冷归档和删除都基于“refs 可达性 + 活跃 lease + 正在运行的后台任务”三者的并集，而不是只看 head refs。
-
-## 5. 工作区设计：虚拟化，而不是完整 checkout
-
-### 5.1 Workspace Manifest
-
-本地工作区不再默认拥有所有文件，而是有一个 workspace manifest：
-
-```text
-Workspace {
-    base_commit
-    sparse_profile
-    materialized_paths
-    dirty_paths
-    virtual_paths
-}
-```
-
-用户看到的是完整目录树，但真正落盘的只有：
-
-- 用户打开过的文件
-- build 需要的文件
-- sparse profile 指定的文件
-- 最近修改过的文件
-
-这类似 `sparse-checkout` 的思想，但设计成默认模型。Git `sparse-checkout` 的官方描述是：只让工作树包含被选择的路径子集，通常可按目录 cone 模式选择。([Git][1])
-
-### 5.2 VFS / Lazy Materialization
-
-访问文件时：
-
-```text
-open("src/payment/foo.go")
-    -> workspace engine 检查本地是否有
-    -> 没有则查询 manifest
-    -> 下载 blob chunks
-    -> materialize 到本地
-    -> 返回文件句柄
-```
-
-对 IDE 和构建系统暴露：
-
-```text
-完整路径空间 + 按需文件内容
-```
-
-对磁盘暴露：
-
-```text
-部分真实文件 + 虚拟占位
-```
-
-仅拦截 `open()` 还不够，workspace engine 还必须原生回答目录与元数据查询：
-
-- `stat` / `lstat`：直接由 manifest 返回，不强制下载文件内容。
-- `readdir` / 递归 walk：直接遍历 manifest shard；必要时只 hydrate 目录元数据，不 hydrate 文件 payload。
-- `glob` / include 扫描：优先在 manifest 上执行，避免构建系统先全盘遍历再触发海量 materialize。
-- synthetic inode：对虚拟路径生成稳定 inode 映射，避免 IDE、watcher、增量编译器把同一路径误判成新文件。
-
-### 5.3 目录枚举、Glob 与 Watcher 语义
-
-如果目标是“用户看到完整目录树”，那就必须把下面这些语义定义完整：
-
-1. **目录枚举是虚拟化的一等能力**  
-   不允许因为工具做了 `readdir()` 就被迫批量下载文件内容；目录项和基础元数据应该来自 manifest。
-2. **watch 不能只依赖底层文件系统事件**  
-   对尚未 materialize 的路径，workspace engine 要能发出 synthetic create/modify/delete 事件；本地 watcher 丢事件时要能回放日志并做 reconcile。
-3. **大规模扫描要区分“元数据 hydrate”和“内容 hydrate”**  
-   构建系统可以先拿完整目录和属性视图，再按需 materialize 真正要读取的文件。
-4. **跨平台文件系统差异必须前置建模**  
-   例如大小写敏感/不敏感、inode 语义、符号链接能力、执行位语义，不能等到 merge 或 checkout 时才暴露。
-
-### 5.4 本地变更单独存储
-
-不要直接依赖全量 working tree 扫描。
-
-维护一个本地变更数据库：
-
-```text
-LocalChangeDB {
-    path
-    base_object
-    working_hash
-    status
-    last_seen_inode
-    last_seen_mtime
-    watcher_seq
-    reconcile_epoch
-}
-```
-
-配合文件系统 watcher：
-
-- 新增文件直接记录
-- 修改文件增量 hash
-- 删除文件记录 tombstone
-- watcher 是 fast path，不是唯一事实来源
-- status 不需要扫全仓库，但要支持后台分片 reconcile 来纠正漏事件、系统崩溃和跨平台 watcher 差异
-
-## 6. 并行处理核心设计
-
-### 6.1 并行 diff
-
-传统：
-
-```text
-递归比较 tree
-```
-
-新模型：
-
-```text
-diff(commitA, commitB, pathspec):
-    rootA = manifest(A)
-    rootB = manifest(B)
-    tasks = split_by_manifest_shard(rootA, rootB, pathspec)
-    parallel_map(diff_shard, tasks)
-    merge_results()
-```
-
-伪代码：
-
-```rust
-fn diff_commits(a: CommitId, b: CommitId, pathspec: PathSpec) -> DiffResult {
-    let shards = planner.plan_manifest_diff(a.manifest_root, b.manifest_root, pathspec);
-
-    parallel(shards, |shard| {
-        diff_manifest_shard(shard.left, shard.right)
-    }).reduce(DiffResult::merge)
-}
-```
-
-优化点：
-
-- manifest node hash 相同，整段跳过。
-- bloom filter 显示路径不可能变化，跳过。
-- path index 直接定位相关 shard。
-- 大文件 diff 按 chunk 并行。
-
-### 6.2 并行 checkout
-
-```text
-checkout(commit, sparse_profile):
-    target_manifest = get_manifest(commit)
-    plan = compare(workspace_manifest, target_manifest)
-    tasks = partition_by_directory_or_pack_locality(plan)
-    parallel_execute(tasks)
-```
-
-每个任务：
-
-```text
-Task {
-    paths: [Path]
-    required_objects: [ObjectId]
-    pack_segments: [SegmentId]
-}
-```
-
-执行：
-
-1. 批量下载对象。
-2. 并行解压。
-3. 并行写文件。
-4. 原子更新 workspace manifest。
-
-避免每个文件单独 round-trip。
-
-### 6.3 并行 merge
-
-三方合并：
-
-```text
-base, ours, theirs
-```
-
-先按 manifest shard 分区：
-
-```text
-merge(base, ours, theirs):
-    namespace_conflicts = preflight_namespace_scan(base, ours, theirs)
-    shards = align(base.manifest, ours.manifest, theirs.manifest)
-    parallel_map(merge_shard, shards)
-    combine_manifest()
-    reconcile_global_renames_and_modes()
-```
-
-不同路径之间只有在通过全局 namespace preflight 后，才可以安全并行。
-
-冲突分四类：
-
-1. **同路径内容冲突**
-2. **rename / delete 冲突**
-3. **命名空间冲突**：`file <-> dir`、目录级 rename、大小写折叠冲突、symlink / submodule 边界冲突、mode 冲突
-4. **跨路径语义冲突**
-
-因此 merge planner 至少要分三阶段：
-
-1. **全局预处理**：扫描改动路径集，建立 rename graph，检测 namespace 冲突。
-2. **shard 内并行合并**：对已证明相互独立的 shard 做内容级三方合并。
-3. **全局收敛**：统一处理目录 rename、mode 变化、平台相关约束，再生成最终 manifest。
-
-前 3 类冲突由版本系统保证语义一致；第 4 类再交给语言服务 / build graph / test selection。
-
-### 6.4 并行 blame
-
-Blame 最大的问题是历史路径追踪昂贵。
-
-新模型维护：
-
-```text
-LineageIndex {
-    path
-    commit_range
-    content_fingerprint
-    previous_path
-    chunk_line_map
-}
-```
-
-执行：
-
-```text
-blame(file):
-    chunks = split_file_into_line_chunks(file)
-    parallel_map(blame_chunk, chunks)
-```
-
-每个 chunk 优先通过 `LineageIndex` 做内容 fingerprint 回溯；若对应索引尚未追平当前 `view_id`，则回退到较慢的 manifest diff / path history 组合路径，而不是返回不一致结果。
-
-### 6.5 并行 fetch / push
-
-Fetch 不再是“给我这些 commit 及其可达对象”，而是：
-
-```text
-client:
-    have commit graph frontier
-    want refs
-    want path profile
-    want blob policy
-```
-
-协议：
-
-```text
-FetchRequest {
-    have_commits
-    want_refs
-    base_view
-    sparse_profile
-    blob_filter
-    max_pack_segment_size
-    client_cache_summary
-}
-```
-
-服务端返回：
-
-```text
-FetchResponse {
-    published_view
-    commit_graph_delta
-    manifest_delta
-    object_segments
-    prefetch_hints
-}
-```
-
-这样服务端可以只返回：
-
-- 新 commit
-- 相关 manifest shard
-- 用户 sparse profile 需要的 blob/chunk
-- 未来可能需要的预取提示
-
-## 7. 索引系统是一等公民
-
-### 7.1 Commit Graph Index
-
-```text
-CommitGraphIndex {
-    commit_id
-    generation
-    parents
-    changed_paths_bloom
-    module_bitmap
-    timestamp
-}
-```
-
-用途：
-
-- `merge-base`
-- `log -- path`
-- `branch contains`
-- blame
-- `bisect`
-- CI affected target selection
-
-Git 的 Scalar 已经通过开启高级配置、后台维护等方式让大仓库更可用；在新设计里，这些索引和维护任务应该是核心机制，而不是额外工具。([Git][3])
-
-### 7.2 Path History Index
-
-`log -- path` 和 `blame` 想要在超大规模下可用，必须承认它们对索引的要求并不相同。因此 path history 不能只有一层：
-
-- **L0 强一致路径索引**：提交时同步写入，只记录“哪些 path 在哪些 commit 里被显式修改/删除”，以及廉价的 rename hint。
-- **L1 异步 lineage 索引**：后台构建内容 fingerprint、chunk-line map、重命名图和跨路径 lineage，用于快速 blame 和高质量 rename 追踪。
-
-```text
-PathHistoryIndex {
-    path_hash
-    commits_that_changed_path
-    delete_events
-    rename_hints
-    lineage_shards
-}
-```
-
-维护策略：
-
-1. 写入路径只要求 L0 就绪，这样不会把 `push` 成本放大到不可接受。
-2. L1 由后台 worker 按 changed shard 增量构建，并带独立 watermark。
-3. `log -- path` 默认可只依赖 L0；`blame`、深度 rename 跟踪优先用 L1，若 L1 落后则显式回退到慢路径。
-4. 显式 rename 操作、目录级移动、批量格式化等高噪声场景要记录额外 hint，否则纯查询时推断会非常昂贵。
-
-让下面操作变成索引查询：
+第一版命令：
 
 ```bash
-hgx log -- src/payment/foo.go
-hgx blame src/payment/foo.go
-hgx diff main...feature -- src/payment
-```
-
-### 7.3 Build / Ownership Index
-
-超大仓库最重要的问题不是“所有文件是什么”，而是：
-
-> 我的改动影响什么？
-
-维护：
-
-```text
-DependencyIndex {
-    source_path
-    build_targets
-    reverse_dependencies
-    owners
-    test_targets
-}
-```
-
-这让系统能支持：
-
-```bash
-hgx affected tests
-hgx affected owners
-hgx affected builds
-```
-
-## 8. 并发写入与引用模型
-
-Git refs 本质是指针：
-
-```text
-refs/heads/main -> commit
-```
-
-新系统中 ref update 必须支持高并发，但 native serving 层不能只存“`ref -> commit`”，还要存“这个 ref 当前暴露的是哪个已发布视图”。
-
-设计：
-
-```text
-RefStore {
-    ref_name
-    target_commit
-    published_view
-    version
-    lease_token
-}
-```
-
-更新使用 CAS：
-
-```text
-update_ref(ref, old_commit, new_commit):
-    compare_and_swap(
-        ref.target_commit,
-        ref.published_view,
-        old_commit,
-        new_commit,
-        new_view
-    )
-```
-
-Push 流程：
-
-1. 客户端上传新对象。
-2. 服务端校验对象完整性。
-3. 服务端只构建最小同步发布索引，并生成 `PublishedView`。
-4. 服务端校验权限、策略、CI gate。
-5. CAS 更新 `ref -> (target_commit, published_view)`。
-6. 延迟服务索引和分析索引在后台继续追平，并把 watermark 绑定到同一个 `view_id`。
-7. 若第 5 步失败，则返回最新 ref，让客户端 rebase/merge；后台索引任务也必须按 `view_id` 幂等收敛，避免对失败发布做无用放大。
-
-## 9. GC / Compaction 设计
-
-传统全局 GC 在超大仓库里非常危险。新设计使用分代 compaction：
-
-```text
-Generation 0: recent loose segments
-Generation 1: daily compacted segments
-Generation 2: weekly compacted segments
-Generation 3: cold archival segments
-```
-
-GC 原则：
-
-- append-only 写入
-- 后台局部 compaction
-- 对象引用计数或可达性 bitmap
-- 以 active lease watermark 作为真正回收下界
-- pack segment 级别回收
-- 冷对象迁移到低成本存储
-- 永不阻塞前台读写
-
-## 10. 网络协议重新设计
-
-不要只传 Git object，要传“查询结果”。
-
-协议能力：
-
-```text
-Capability {
-    partial_materialization
-    manifest_query
-    path_history_query
-    chunked_blob
-    parallel_pack_segments
-    server_side_diff
-    server_side_merge_base
-    prefetch_hints
-}
-```
-
-典型请求：
-
-```text
-GetManifest(view, pathspec)
-GetBlob(view, blob_id, range/chunks)
-GetDiff(viewA, viewB, pathspec)
-GetCommitGraph(frontier, view)
-GetPathHistory(path, since, view)
-GetPackSegments(object_ids, view)
-```
-
-这会把远端从“文件服务器”升级为“版本数据库服务”。
-
-## 11. 命令层体验
-
-用户命令保持类似 Git。本文统一假设 CLI 名称为 `hgx`：
-
-```bash
-hgx clone repo
-hgx checkout main
+hgx init
 hgx status
-hgx diff
-hgx commit
-hgx push
+hgx add <pathspec>
+hgx commit -m <message>
+hgx log
+hgx diff [pathspec]
+hgx checkout <commit-or-ref>
+hgx hydrate <pathspec>
+hgx dehydrate <pathspec>
+hgx sparse add <pathspec>
+hgx sparse remove <pathspec>
+hgx fetch <remote>
+hgx push <remote> <ref>
+hgx doctor
 ```
 
-但默认行为不同：
+体验原则：
+
+- 常用命令与 Git 心智接近。
+- 输出明确区分 virtual、materialized、dirty、missing、conflict。
+- 慢操作显示对象数、segment 数、下载字节、并行度。
+- `doctor` 能检查对象损坏、索引落后、lease 泄漏、工作区状态不一致。
+
+## 19. 测试与验证策略
+
+测试分层：
+
+- 单元测试：codec、hash、path normalize、manifest query、bloom filter。
+- 存储测试：loose store、segment pack、pack index、corruption detection。
+- 工作区测试：status、add、commit、hydrate/dehydrate、sparse profile。
+- 算法测试：manifest diff、merge conflict、large file chunking。
+- 协议测试：frame encode/decode、file remote fetch/push、HTTP remote smoke。
+- 属性测试：随机 manifest roundtrip、随机对象 codec roundtrip、随机 pathspec query。
+- 性能基准：百万路径 manifest query、segment lookup、parallel materialize。
+
+Uya 命令建议：
 
 ```bash
-hgx clone repo
+~/uya/uya/bin/uya check src/hgx/main.uya
+~/uya/uya/bin/uya test tests/test_object_codec.uya
+~/uya/uya/bin/uya build src/hgx/main.uya -o bin/hgx
+~/uya/uya/bin/uya build src/hgx/main.uya -o build/hgx.c --c99
 ```
 
-只下载：
+CI 第一阶段至少跑：
 
+- 所有 `tests/test_*.uya`。
+- C99 生成 smoke。
+- 空仓库到首个 commit 的端到端脚本。
+- 损坏对象检测脚本。
+
+## 20. 里程碑
+
+M0 文档和工程骨架：
+
+- 明确纯 Uya 实现边界。
+- 建立源码目录、测试目录、构建脚本。
+- 完成 `hgx --help`。
+
+M1 最小本地仓库：
+
+- `hgx init`
+- canonical codec
+- object id / hash
+- loose object store
 - refs
-- commit graph head slice
-- root manifest
-- 默认 sparse profile
 
-新增命令：
+M2 最小提交链：
 
-```bash
-hgx sparse add src/payment
-hgx sparse remove legacy/
-hgx prefetch //team/payment
-hgx hydrate src/payment/**
-hgx dehydrate third_party/**
-hgx affected tests
-hgx doctor performance
-```
+- path normalize
+- small blob
+- manifest node
+- commit object
+- `hgx add/status/commit/log`
 
-## 12. 关键算法示例
-
-### 12.1 Manifest Diff
-
-```python
-def diff_manifest(a, b):
-    if a.hash == b.hash:
-        return []
-
-    if a.is_leaf() and b.is_leaf():
-        return diff_entries(a.entries, b.entries)
-
-    tasks = align_children(a.children, b.children)
-
-    return parallel_reduce(
-        tasks,
-        lambda pair: diff_manifest(pair.left, pair.right),
-        merge_diff_results
-    )
-```
-
-复杂度从：
-
-```text
-O(total files)
-```
-
-变成接近：
-
-```text
-O(changed shards + touched path range)
-```
-
-### 12.2 Sparse Checkout Planner
-
-```python
-def checkout_plan(current, target, sparse_profile):
-    target_paths = target.query(sparse_profile)
-    current_paths = current.materialized_paths
-
-    to_add = target_paths - current_paths
-    to_remove = current_paths - target_paths
-    to_update = changed_between(current, target, target_paths)
-
-    return partition_by_pack_locality(to_add + to_update + to_remove)
-```
-
-### 12.3 Parallel Object Fetch
-
-```python
-def fetch_objects(object_ids):
-    groups = group_by_pack_segment(object_ids)
-
-    return parallel_map(groups, lambda group: {
-        segment = download_segment(group.segment_id)
-        return extract_objects(segment, group.object_ids)
-    })
-```
-
-## 13. 与现有 Git 的兼容策略
-
-完全推翻 Git 生态不现实，所以我会设计三层兼容：
-
-### 第一层：Git Compatible Mode
-
-这是一个兼容网关，不是把 native 对象模型原样暴露给 Git 客户端。它支持：
-
-```bash
-git clone
-git fetch
-git push
-```
-
-约束与语义如下：
-
-- `git clone` / `git fetch` 读取的是某个 `PublishedView` 的确定性 Git 导出结果，导出对象 id 在该兼容视图内稳定，但不要求与 native object id 相同。
-- `git push` 只允许进入开启兼容模式的 refs；服务端先把 Git tree/blob/commit 导入 native manifest/object 模型，再走同一套 ref CAS 发布流程。
-- native chunked blob 在兼容导出时按策略降级：小对象导出为普通 Git blob，大对象导出为普通 blob 或 Git LFS pointer，取决于仓库策略。
-- virtual workspace、server-side diff、范围读取、路径级查询等 native 能力不会透传给 Git 客户端；兼容层的目标是互操作，不是保留全部语义。
-
-### 第二层：Enhanced Git Mode
-
-基于现有 Git 功能：
-
-- `partial clone`
-- `sparse-checkout`
-- `commit-graph`
-- `multi-pack-index`
-- `background maintenance`
-- `FSMonitor`
-- `bitmap index`
-
-这和 Scalar 的方向一致：Scalar 是通过配置高级 Git 特性、后台维护、减少网络传输来优化大仓库使用体验。([Git][3])
-
-### 第三层：Native HyperGit Mode
-
-启用新协议：
+M3 查询和 diff：
 
 - manifest query
-- chunked blob
-- path history index
-- server-side diff
-- virtual workspace
-- parallel checkout / merge / blame
+- manifest diff
+- commit graph index
+- `hgx diff`
 
-## 14. 我会特别避免的设计
+M4 工作区物化：
 
-不建议只做这些：
+- sparse profile
+- hydrate/dehydrate
+- local change db
+- checkout planner
 
-1. **只把仓库拆成多个 repo**  
-   会破坏原子提交、跨模块重构和统一版本视图。
-2. **只上 Git LFS**  
-   LFS 解决大文件，不解决亿级小文件、历史查询、checkout、diff、merge。
-3. **只做 shallow clone**  
-   shallow clone 影响历史操作，不适合长期开发工作区。
-4. **只做 CI 缓存**  
-   只能优化构建，不解决开发者本地体验。
-5. **只靠更强机器**  
-   这是把架构问题变成硬件问题。
+M5 Segment pack：
 
-## 15. 最终架构原则
+- pack writer/reader
+- pack index
+- local compaction
+- corruption tests
 
-我会把系统原则定为：
+M6 大文件：
 
-```text
-1. 所有大对象不可变
-2. 所有树结构可分片
-3. 所有路径查询走索引
-4. 所有文件内容按需加载
-5. 所有耗时操作可切分为任务图
-6. 所有后台维护增量化
-7. 所有网络传输基于用户实际工作集
-8. 所有 ref 更新使用 CAS
-9. 所有本地状态显式记录，不靠全量扫描
-10. 所有大型操作默认并行
-```
+- chunker
+- chunked blob meta
+- range read
+- large file diff summary
 
-一句话总结：
+M7 远端：
 
-> 新系统不是“更快的 Git”，而是把 Git 的内容寻址思想保留下来，把目录树、对象存储、工作区、协议、索引和执行引擎全部改造成面向超大规模仓库的并行版本数据库。
+- file remote
+- fetch/push
+- published view
+- CAS refs
 
-[1]: https://git-scm.com/docs/git-sparse-checkout?utm_source=chatgpt.com "Git - git-sparse-checkout Documentation"
-[2]: https://github.com/microsoft/scalar?utm_source=chatgpt.com "microsoft/scalar: Scalar: A set of tools and ..."
-[3]: https://git-scm.com/docs/scalar?utm_source=chatgpt.com "Git - scalar Documentation"
+M8 并行化：
+
+- worker pool
+- parallel manifest diff
+- parallel checkout
+- parallel fetch
+
+M9 Git 互操作：
+
+- Git import/export proof of concept。
+- Native object 和 Git object 的映射文档。
+
+## 21. 关键风险
+
+- Uya 标准库中某些 IO / async / thread 能力仍可能需要项目内补足；第一版应控制并发模型复杂度。
+- canonical codec 一旦发布就影响对象 ID，需要早期冻结 v1 规则。
+- manifest shard 大小和 path ordering 会影响所有查询性能，需要基准驱动调整。
+- 工作区 watcher 不能作为唯一事实来源，必须设计 reconcile。
+- 大文件 CDC 算法需要大量测试，避免边界错误导致去重率和性能双输。
+- Git 兼容层容易吞掉资源，应先做 native MVP，再做兼容网关。
+
+## 22. 最终设计原则
+
+1. 权威对象不可变。
+2. 可变引用必须 CAS。
+3. 路径空间必须可索引、可分片。
+4. 工作区默认按需物化。
+5. 大文件是原生 chunked blob。
+6. 索引可重建，不能改变事实。
+7. 每个长操作绑定 `PublishedView`。
+8. 每个后台任务有 lease 和 watermark。
+9. 每个 IO 失败返回显式 Uya 错误。
+10. 每个核心模块都必须能用纯 Uya 测试验证。
