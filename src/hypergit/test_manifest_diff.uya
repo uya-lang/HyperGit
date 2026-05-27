@@ -1,0 +1,69 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.ManifestId;
+use core.ids.object_id_from_hash;
+use core.ids.manifest_id_from_object;
+use object.types.ByteList;
+use object.types.ManifestChild;
+use manifest.diff.manifest_diff_skip_by_id;
+use manifest.diff.manifest_diff_skip_child;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn make_manifest_id(seed: byte) ManifestId {
+    const object_id: ObjectId = object_id_from_hash(make_hash(seed));
+    return manifest_id_from_object(object_id);
+}
+
+fn make_child(min_name: &[byte], max_name: &[byte], seed: byte) ManifestChild {
+    return ManifestChild{
+        min_name: ByteList{ ptr: min_name.ptr, len: min_name.len },
+        max_name: ByteList{ ptr: max_name.ptr, len: max_name.len },
+        child_id: make_manifest_id(seed),
+        child_hash: make_hash(seed + 40 as byte),
+    };
+}
+
+fn test_manifest_diff_skip_by_id() !void {
+    const left: ManifestId = make_manifest_id(1 as byte);
+    const right_same: ManifestId = make_manifest_id(1 as byte);
+    const right_other: ManifestId = make_manifest_id(2 as byte);
+    try expect(manifest_diff_skip_by_id(&left, &right_same));
+    try expect(!manifest_diff_skip_by_id(&left, &right_other));
+}
+
+fn test_manifest_diff_skip_child_requires_same_range_and_hash() !void {
+    var min_name: [byte: 9] = ['s' as byte, 'r' as byte, 'c' as byte, '/' as byte, 'a' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte];
+    var max_name: [byte: 9] = ['s' as byte, 'r' as byte, 'c' as byte, '/' as byte, 'z' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte];
+    var other_max: [byte: 11] = ['s' as byte, 'r' as byte, 'c' as byte, '2' as byte, '/' as byte, 'z' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte, 'x' as byte];
+
+    const left: ManifestChild = make_child(min_name[0: 9], max_name[0: 9], 5 as byte);
+    const same: ManifestChild = make_child(min_name[0: 9], max_name[0: 9], 5 as byte);
+    const changed_hash: ManifestChild = make_child(min_name[0: 9], max_name[0: 9], 6 as byte);
+    const changed_range: ManifestChild = make_child(min_name[0: 9], other_max[0: 11], 5 as byte);
+
+    try expect(manifest_diff_skip_child(&left, &same));
+    try expect(!manifest_diff_skip_child(&left, &changed_hash));
+    try expect(!manifest_diff_skip_child(&left, &changed_range));
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Manifest Diff Tests");
+    run_test("manifest diff skip by id", test_manifest_diff_skip_by_id);
+    run_test("manifest diff skip child requires same range and hash", test_manifest_diff_skip_child_requires_same_range_and_hash);
+    return test_suite_end();
+}

@@ -1,0 +1,349 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use manifest.path.manifest_path_compare;
+use object.codec.manifest_node_payload_encoded_len;
+use object.types.ByteList;
+use object.types.ManifestChild;
+use object.types.ManifestChildList;
+use object.types.ManifestEntry;
+use object.types.ManifestEntryList;
+use object.types.ManifestNodePayload;
+use object.types.PathPrefix;
+use object.types.manifest_child_list_from_slice;
+use object.types.manifest_entry_list_from_slice;
+
+export const MANIFEST_SOFT_TARGET_BYTES: usize = 131072 as usize;
+export const MANIFEST_HARD_SPLIT_BYTES: usize = 262144 as usize;
+export const MANIFEST_SIBLING_MIN_TARGET_BYTES: usize = 65536 as usize;
+export const MANIFEST_SIBLING_MAX_TARGET_BYTES: usize = 163840 as usize;
+export const MANIFEST_LEAF_TARGET_ENTRIES: usize = 1024 as usize;
+export const MANIFEST_LEAF_HARD_ENTRIES: usize = 2048 as usize;
+export const MANIFEST_INTERNAL_TARGET_CHILDREN: usize = 64 as usize;
+export const MANIFEST_INTERNAL_HARD_CHILDREN: usize = 256 as usize;
+
+error ManifestSplitImpossible;
+
+export struct ManifestNodePayloadList {
+    ptr: &ManifestNodePayload,
+    len: usize
+}
+
+struct ManifestShardOrder {
+    kinds: &byte,
+    indexes: &usize,
+    len: usize
+}
+
+struct ManifestShardChunk {
+    entry_start: usize,
+    entry_count: usize,
+    child_start: usize,
+    child_count: usize
+}
+
+fn manifest_shard_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.ManifestAlloc;
+    }
+    return raw[0: len];
+}
+
+fn manifest_shard_copy_byte_list(arena: &Arena, value: &ByteList) !ByteList {
+    const out: &[byte] = try manifest_shard_arena_bytes(arena, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn manifest_shard_is_internal(payload: &ManifestNodePayload) bool {
+    return payload.children.len > 0;
+}
+
+fn manifest_shard_target_count(payload: &ManifestNodePayload) usize {
+    if manifest_shard_is_internal(payload) {
+        return MANIFEST_INTERNAL_TARGET_CHILDREN;
+    }
+    return MANIFEST_LEAF_TARGET_ENTRIES;
+}
+
+fn manifest_shard_hard_count(payload: &ManifestNodePayload) usize {
+    if manifest_shard_is_internal(payload) {
+        return MANIFEST_INTERNAL_HARD_CHILDREN;
+    }
+    return MANIFEST_LEAF_HARD_ENTRIES;
+}
+
+fn manifest_shard_count_metric(payload: &ManifestNodePayload, chunk: &ManifestShardChunk) usize {
+    if manifest_shard_is_internal(payload) {
+        return chunk.child_count;
+    }
+    return chunk.entry_count;
+}
+
+fn manifest_shard_abs_diff(left: usize, right: usize) usize {
+    if left > right {
+        return left - right;
+    }
+    return right - left;
+}
+
+fn manifest_shard_entry_slice(payload: &ManifestNodePayload, start: usize, count: usize) ManifestEntryList {
+    if count == 0 {
+        return ManifestEntryList{ ptr: null, len: 0 };
+    }
+    return manifest_entry_list_from_slice(payload.entries.ptr[start: count]);
+}
+
+fn manifest_shard_child_slice(payload: &ManifestNodePayload, start: usize, count: usize) ManifestChildList {
+    if count == 0 {
+        return ManifestChildList{ ptr: null, len: 0 };
+    }
+    return manifest_child_list_from_slice(payload.children.ptr[start: count]);
+}
+
+fn manifest_shard_build_order(arena: &Arena, payload: &ManifestNodePayload) !ManifestShardOrder {
+    const total_items: usize = payload.entries.len + payload.children.len;
+    const kinds: &byte = arena_alloc(arena, total_items);
+    if kinds == null {
+        return error.ManifestAlloc;
+    }
+    const indexes: &usize = arena_alloc(arena, @size_of(usize) as usize * total_items) as &usize;
+    if indexes == null {
+        return error.ManifestAlloc;
+    }
+
+    var entry_index: usize = 0;
+    var child_index: usize = 0;
+    var out_index: usize = 0;
+    while entry_index < payload.entries.len && child_index < payload.children.len {
+        const cmp: i32 = manifest_path_compare(&payload.entries.ptr[entry_index].name, &payload.children.ptr[child_index].min_name);
+        if cmp <= 0 {
+            kinds[out_index] = 0 as byte;
+            indexes[out_index] = entry_index;
+            entry_index = entry_index + 1;
+        } else {
+            kinds[out_index] = 1 as byte;
+            indexes[out_index] = child_index;
+            child_index = child_index + 1;
+        }
+        out_index = out_index + 1;
+    }
+    while entry_index < payload.entries.len {
+        kinds[out_index] = 0 as byte;
+        indexes[out_index] = entry_index;
+        entry_index = entry_index + 1;
+        out_index = out_index + 1;
+    }
+    while child_index < payload.children.len {
+        kinds[out_index] = 1 as byte;
+        indexes[out_index] = child_index;
+        child_index = child_index + 1;
+        out_index = out_index + 1;
+    }
+
+    return ManifestShardOrder{
+        kinds: kinds,
+        indexes: indexes,
+        len: total_items,
+    };
+}
+
+fn manifest_shard_chunk_for_range(order: &ManifestShardOrder, start: usize, end: usize) ManifestShardChunk {
+    var chunk: ManifestShardChunk = ManifestShardChunk{
+        entry_start: 0 as usize,
+        entry_count: 0 as usize,
+        child_start: 0 as usize,
+        child_count: 0 as usize,
+    };
+    var i: usize = start;
+    while i < end {
+        if order.kinds[i] == 0 as byte {
+            if chunk.entry_count == 0 {
+                chunk.entry_start = order.indexes[i];
+            }
+            chunk.entry_count = chunk.entry_count + 1;
+        } else {
+            if chunk.child_count == 0 {
+                chunk.child_start = order.indexes[i];
+            }
+            chunk.child_count = chunk.child_count + 1;
+        }
+        i = i + 1;
+    }
+    return chunk;
+}
+
+fn manifest_shard_chunk_payload_size(payload: &ManifestNodePayload, order: &ManifestShardOrder, start: usize, end: usize) usize {
+    const chunk: ManifestShardChunk = manifest_shard_chunk_for_range(order, start, end);
+    const temp: ManifestNodePayload = ManifestNodePayload{
+        prefix: PathPrefix{ bytes: ByteList{ ptr: payload.prefix.bytes.ptr, len: payload.prefix.bytes.len } },
+        level: payload.level,
+        entry_count: chunk.entry_count as u32,
+        child_count: chunk.child_count as u32,
+        entries: manifest_shard_entry_slice(payload, chunk.entry_start, chunk.entry_count),
+        children: manifest_shard_child_slice(payload, chunk.child_start, chunk.child_count),
+    };
+    return manifest_node_payload_encoded_len(&temp);
+}
+
+fn manifest_shard_chunk_metric(payload: &ManifestNodePayload, order: &ManifestShardOrder, start: usize, end: usize) usize {
+    const chunk: ManifestShardChunk = manifest_shard_chunk_for_range(order, start, end);
+    return manifest_shard_count_metric(payload, &chunk);
+}
+
+fn manifest_shard_choose_boundary(payload: &ManifestNodePayload, order: &ManifestShardOrder, start: usize) !usize {
+    if start + 1 as usize >= order.len {
+        return error.ManifestSplitImpossible;
+    }
+
+    const target_count: usize = manifest_shard_target_count(payload);
+    const hard_count: usize = manifest_shard_hard_count(payload);
+    const count_weight: usize = MANIFEST_SOFT_TARGET_BYTES / target_count;
+    var best_end: usize = 0;
+    var best_score: usize = 0;
+    var found: bool = false;
+    var end: usize = start + 1 as usize;
+    while end <= order.len {
+        const size: usize = manifest_shard_chunk_payload_size(payload, order, start, end);
+        const metric: usize = manifest_shard_chunk_metric(payload, order, start, end);
+        if size > MANIFEST_HARD_SPLIT_BYTES || metric > hard_count {
+            if found {
+                break;
+            }
+            return end;
+        }
+
+        var score: usize = manifest_shard_abs_diff(size, MANIFEST_SOFT_TARGET_BYTES) + manifest_shard_abs_diff(metric, target_count) * count_weight;
+        if size < MANIFEST_SIBLING_MIN_TARGET_BYTES && end < order.len {
+            score = score + (MANIFEST_SIBLING_MIN_TARGET_BYTES - size);
+        }
+        if size > MANIFEST_SIBLING_MAX_TARGET_BYTES {
+            score = score + (size - MANIFEST_SIBLING_MAX_TARGET_BYTES) * 2 as usize;
+        }
+
+        if !found || score < best_score {
+            best_end = end;
+            best_score = score;
+            found = true;
+        }
+        end = end + 1;
+    }
+
+    if !found {
+        return error.ManifestSplitImpossible;
+    }
+    return best_end;
+}
+
+fn manifest_shard_clone_chunk(arena: &Arena, payload: &ManifestNodePayload, chunk: &ManifestShardChunk) !ManifestNodePayload {
+    const copied_prefix: ByteList = try manifest_shard_copy_byte_list(arena, &payload.prefix.bytes);
+
+    var raw_entries: &ManifestEntry = null;
+    if chunk.entry_count > 0 {
+        raw_entries = arena_alloc(arena, @size_of(ManifestEntry) as usize * chunk.entry_count) as &ManifestEntry;
+        if raw_entries == null {
+            return error.ManifestAlloc;
+        }
+        var i: usize = 0;
+        while i < chunk.entry_count {
+            const src: &ManifestEntry = &payload.entries.ptr[chunk.entry_start + i];
+            raw_entries[i] = ManifestEntry{
+                name: try manifest_shard_copy_byte_list(arena, &src.name),
+                kind: src.kind,
+                mode: src.mode,
+                object_id: src.object_id,
+                logical_size: src.logical_size,
+                content_type: src.content_type,
+                policy_id: src.policy_id,
+            };
+            i = i + 1;
+        }
+    }
+
+    var raw_children: &ManifestChild = null;
+    if chunk.child_count > 0 {
+        raw_children = arena_alloc(arena, @size_of(ManifestChild) as usize * chunk.child_count) as &ManifestChild;
+        if raw_children == null {
+            return error.ManifestAlloc;
+        }
+        var i: usize = 0;
+        while i < chunk.child_count {
+            const src: &ManifestChild = &payload.children.ptr[chunk.child_start + i];
+            raw_children[i] = ManifestChild{
+                min_name: try manifest_shard_copy_byte_list(arena, &src.min_name),
+                max_name: try manifest_shard_copy_byte_list(arena, &src.max_name),
+                child_id: src.child_id,
+                child_hash: src.child_hash,
+            };
+            i = i + 1;
+        }
+    }
+
+    var entry_list: ManifestEntryList = ManifestEntryList{ ptr: null, len: 0 };
+    if chunk.entry_count > 0 {
+        entry_list = manifest_entry_list_from_slice(raw_entries[0: chunk.entry_count]);
+    }
+    var child_list: ManifestChildList = ManifestChildList{ ptr: null, len: 0 };
+    if chunk.child_count > 0 {
+        child_list = manifest_child_list_from_slice(raw_children[0: chunk.child_count]);
+    }
+
+    return ManifestNodePayload{
+        prefix: PathPrefix{ bytes: copied_prefix },
+        level: payload.level,
+        entry_count: chunk.entry_count as u32,
+        child_count: chunk.child_count as u32,
+        entries: entry_list,
+        children: child_list,
+    };
+}
+
+export fn manifest_shard_needs_split(payload: &ManifestNodePayload) bool {
+    if manifest_node_payload_encoded_len(payload) > MANIFEST_HARD_SPLIT_BYTES {
+        return true;
+    }
+    if manifest_shard_is_internal(payload) {
+        return payload.children.len > MANIFEST_INTERNAL_HARD_CHILDREN;
+    }
+    return payload.entries.len > MANIFEST_LEAF_HARD_ENTRIES;
+}
+
+export fn manifest_shard_split(arena: &Arena, payload: &ManifestNodePayload) !ManifestNodePayloadList {
+    const total_items: usize = payload.entries.len + payload.children.len;
+    if total_items == 0 {
+        return error.ManifestSplitImpossible;
+    }
+
+    const out_payloads: &ManifestNodePayload = arena_alloc(arena, @size_of(ManifestNodePayload) as usize * total_items) as &ManifestNodePayload;
+    if out_payloads == null {
+        return error.ManifestAlloc;
+    }
+
+    const order: ManifestShardOrder = try manifest_shard_build_order(arena, payload);
+    var cursor: usize = 0;
+    var out_len: usize = 0;
+    while cursor < order.len {
+        var end: usize = order.len;
+        if manifest_shard_chunk_payload_size(payload, &order, cursor, order.len) > MANIFEST_HARD_SPLIT_BYTES || manifest_shard_chunk_metric(payload, &order, cursor, order.len) > manifest_shard_hard_count(payload) {
+            end = try manifest_shard_choose_boundary(payload, &order, cursor);
+        }
+        if end <= cursor {
+            return error.ManifestSplitImpossible;
+        }
+        const chunk: ManifestShardChunk = manifest_shard_chunk_for_range(&order, cursor, end);
+        out_payloads[out_len] = try manifest_shard_clone_chunk(arena, payload, &chunk);
+        out_len = out_len + 1;
+        cursor = end;
+    }
+
+    return ManifestNodePayloadList{ ptr: out_payloads, len: out_len };
+}

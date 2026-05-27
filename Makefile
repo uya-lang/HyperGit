@@ -21,6 +21,11 @@ c99:
 test:
 	$(UYA) test src/hypergit/test_object_model.uya
 	$(UYA) test src/hypergit/test_object_codec.uya
+	$(UYA) test src/hypergit/test_manifest_path.uya
+	$(UYA) test src/hypergit/test_manifest_trie.uya
+	$(UYA) test src/hypergit/test_manifest_shard.uya
+	$(UYA) test src/hypergit/test_manifest_query.uya
+	$(UYA) test src/hypergit/test_manifest_diff.uya
 	$(UYA) test src/hypergit/test_loose_store.uya
 	$(UYA) test src/hgx/test_repo_layout.uya
 	$(UYA) test src/hgx/test_cli_args.uya

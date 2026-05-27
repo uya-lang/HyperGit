@@ -1,0 +1,289 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.manifest_id_from_object;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.path.manifest_path_normalize;
+use manifest.query.ManifestLookupKind;
+use manifest.query.ManifestLookupResult;
+use manifest.query.ManifestRangeQueryResult;
+use manifest.query.manifest_lookup_path;
+use manifest.query.manifest_pathspec_list_from_slice;
+use manifest.query.manifest_pathspec_matches_any;
+use manifest.query.manifest_pathspec_matches_path;
+use manifest.query.manifest_range_query;
+use manifest.trie.ManifestChildInput;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.manifest_child_input_list_from_slice;
+use manifest.trie.manifest_internal_build;
+use manifest.trie.manifest_leaf_build;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ManifestNodePayload;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn make_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(make_hash(seed));
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(make_object_id(seed));
+}
+
+fn make_manifest_id(seed: byte) ManifestId {
+    return manifest_id_from_object(make_object_id(seed));
+}
+
+fn normalize_literal(arena: &Arena, text: &const byte) !ByteList {
+    return try manifest_path_normalize(arena, literal_bytes(text));
+}
+
+fn make_leaf_input(arena: &Arena, text: &const byte, seed: byte) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try normalize_literal(arena, text),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id(seed),
+        logical_size: seed as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id(seed + 32 as byte),
+    };
+}
+
+fn make_child_input(arena: &Arena, min_text: &const byte, max_text: &const byte, seed: byte) !ManifestChildInput {
+    return ManifestChildInput{
+        min_path: try normalize_literal(arena, min_text),
+        max_path: try normalize_literal(arena, max_text),
+        child_id: make_manifest_id(seed),
+        child_hash: make_hash(seed + 50 as byte),
+    };
+}
+
+fn test_manifest_lookup_leaf_exact_hit_and_miss() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const input0: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "a.b", 1 as byte);
+    const input1: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "a/c", 2 as byte);
+    const input2: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "a/b", 3 as byte);
+    var inputs: [ManifestLeafInputEntry: 3] = [input0, input1, input2];
+    const prefix: ByteList = try normalize_literal(&build_arena, "");
+    const payload: ManifestNodePayload = try manifest_leaf_build(&build_arena, &prefix, manifest_leaf_input_list_from_slice(inputs[0: 3]));
+
+    const hit_path: ByteList = try normalize_literal(&input_arena, "a/c");
+    const hit: ManifestLookupResult = try manifest_lookup_path(&payload, &hit_path);
+    try expect(hit.kind == ManifestLookupKind.Entry);
+    try expect(hit.index == 1 as usize);
+
+    const miss_path: ByteList = try normalize_literal(&input_arena, "z");
+    const miss: ManifestLookupResult = try manifest_lookup_path(&payload, &miss_path);
+    try expect(miss.kind == ManifestLookupKind.Missing);
+}
+
+fn test_manifest_lookup_internal_direct_entry_and_child_hit() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "");
+    const direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "README.md", 10 as byte);
+    var directs: [ManifestLeafInputEntry: 1] = [direct];
+    const child0: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/z.uya", 11 as byte);
+    const child1: ManifestChildInput = try make_child_input(&input_arena, "tests/a.uya", "tests/z.uya", 12 as byte);
+    var children: [ManifestChildInput: 2] = [child0, child1];
+
+    const payload: ManifestNodePayload = try manifest_internal_build(
+        &build_arena,
+        &prefix,
+        manifest_leaf_input_list_from_slice(directs[0: 1]),
+        manifest_child_input_list_from_slice(children[0: 2]),
+    );
+
+    const direct_path: ByteList = try normalize_literal(&input_arena, "README.md");
+    const direct_hit: ManifestLookupResult = try manifest_lookup_path(&payload, &direct_path);
+    try expect(direct_hit.kind == ManifestLookupKind.Entry);
+    try expect(direct_hit.index == 0 as usize);
+
+    const child_path: ByteList = try normalize_literal(&input_arena, "tests/m.uya");
+    const child_hit: ManifestLookupResult = try manifest_lookup_path(&payload, &child_path);
+    try expect(child_hit.kind == ManifestLookupKind.Child);
+    try expect(child_hit.index == 1 as usize);
+}
+
+fn test_manifest_lookup_prefix_mismatch() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "src");
+    const direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/main.uya", 20 as byte);
+    var directs: [ManifestLeafInputEntry: 1] = [direct];
+    const child: ManifestChildInput = try make_child_input(&input_arena, "src/lib/a.uya", "src/lib/z.uya", 21 as byte);
+    var children: [ManifestChildInput: 1] = [child];
+    const payload: ManifestNodePayload = try manifest_internal_build(
+        &build_arena,
+        &prefix,
+        manifest_leaf_input_list_from_slice(directs[0: 1]),
+        manifest_child_input_list_from_slice(children[0: 1]),
+    );
+
+    const outside_path: ByteList = try normalize_literal(&input_arena, "tests/main.uya");
+    const lookup: ManifestLookupResult = manifest_lookup_path(&payload, &outside_path) catch |err| {
+        try expect(@error_id(err) == @error_id(error.ManifestLookupPrefixMismatch));
+        return;
+    };
+    _ = lookup;
+    return error.AssertionFailed;
+}
+
+fn test_manifest_pathspec_matches_exact_and_descendant_paths() !void {
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const spec: ByteList = try normalize_literal(&arena, "src");
+    const exact: ByteList = try normalize_literal(&arena, "src");
+    const descendant: ByteList = try normalize_literal(&arena, "src/main.uya");
+    const sibling: ByteList = try normalize_literal(&arena, "src2/main.uya");
+    const prefix_like: ByteList = try normalize_literal(&arena, "src-gen/file.uya");
+
+    try expect(manifest_pathspec_matches_path(&spec, &exact));
+    try expect(manifest_pathspec_matches_path(&spec, &descendant));
+    try expect(!manifest_pathspec_matches_path(&spec, &sibling));
+    try expect(!manifest_pathspec_matches_path(&spec, &prefix_like));
+}
+
+fn test_manifest_pathspec_empty_and_multi_match() !void {
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const empty: ByteList = try normalize_literal(&arena, "");
+    const src_spec: ByteList = try normalize_literal(&arena, "src");
+    const tests_spec: ByteList = try normalize_literal(&arena, "tests");
+    const src_path: ByteList = try normalize_literal(&arena, "src/main.uya");
+    const tests_path: ByteList = try normalize_literal(&arena, "tests/main.uya");
+    const docs_path: ByteList = try normalize_literal(&arena, "docs/readme.md");
+    var specs: [ByteList: 2] = [src_spec, tests_spec];
+
+    try expect(manifest_pathspec_matches_path(&empty, &docs_path));
+    try expect(manifest_pathspec_matches_any(manifest_pathspec_list_from_slice(specs[0: 2]), &src_path));
+    try expect(manifest_pathspec_matches_any(manifest_pathspec_list_from_slice(specs[0: 2]), &tests_path));
+    try expect(!manifest_pathspec_matches_any(manifest_pathspec_list_from_slice(specs[0: 2]), &docs_path));
+    try expect(manifest_pathspec_matches_any(manifest_pathspec_list_from_slice(specs[0: 0]), &docs_path));
+}
+
+fn test_manifest_range_query_filters_leaf_entries() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const input0: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "a.b", 30 as byte);
+    const input1: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "a/c", 31 as byte);
+    const input2: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "a/b", 32 as byte);
+    var inputs: [ManifestLeafInputEntry: 3] = [input0, input1, input2];
+    const prefix: ByteList = try normalize_literal(&build_arena, "");
+    const payload: ManifestNodePayload = try manifest_leaf_build(&build_arena, &prefix, manifest_leaf_input_list_from_slice(inputs[0: 3]));
+
+    const spec: ByteList = try normalize_literal(&input_arena, "a");
+    var specs: [ByteList: 1] = [spec];
+    var query_arena_buf: [byte: 4096] = [];
+    var query_arena: Arena = Arena{ buffer: &query_arena_buf[0], size: 0, used: 0 };
+    arena_init(&query_arena, &query_arena_buf[0], 4096 as usize);
+    const result: ManifestRangeQueryResult = try manifest_range_query(&query_arena, &payload, manifest_pathspec_list_from_slice(specs[0: 1]));
+    try expect(result.entry_indexes.len == 2 as usize);
+    try expect(result.entry_indexes.ptr[0] == 0 as usize);
+    try expect(result.entry_indexes.ptr[1] == 1 as usize);
+    try expect(result.child_indexes.len == 0 as usize);
+}
+
+fn test_manifest_range_query_filters_child_ranges() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "");
+    const direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "README.md", 40 as byte);
+    var directs: [ManifestLeafInputEntry: 1] = [direct];
+    const child0: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/z.uya", 41 as byte);
+    const child1: ManifestChildInput = try make_child_input(&input_arena, "tests/a.uya", "tests/z.uya", 42 as byte);
+    var children: [ManifestChildInput: 2] = [child0, child1];
+    const payload: ManifestNodePayload = try manifest_internal_build(
+        &build_arena,
+        &prefix,
+        manifest_leaf_input_list_from_slice(directs[0: 1]),
+        manifest_child_input_list_from_slice(children[0: 2]),
+    );
+
+    const spec0: ByteList = try normalize_literal(&input_arena, "README.md");
+    const spec1: ByteList = try normalize_literal(&input_arena, "tests");
+    var specs: [ByteList: 2] = [spec0, spec1];
+    var query_arena_buf: [byte: 4096] = [];
+    var query_arena: Arena = Arena{ buffer: &query_arena_buf[0], size: 0, used: 0 };
+    arena_init(&query_arena, &query_arena_buf[0], 4096 as usize);
+    const result: ManifestRangeQueryResult = try manifest_range_query(&query_arena, &payload, manifest_pathspec_list_from_slice(specs[0: 2]));
+    try expect(result.entry_indexes.len == 1 as usize);
+    try expect(result.entry_indexes.ptr[0] == 0 as usize);
+    try expect(result.child_indexes.len == 1 as usize);
+    try expect(result.child_indexes.ptr[0] == 1 as usize);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Manifest Query Tests");
+    run_test("manifest lookup leaf exact hit and miss", test_manifest_lookup_leaf_exact_hit_and_miss);
+    run_test("manifest lookup internal direct entry and child hit", test_manifest_lookup_internal_direct_entry_and_child_hit);
+    run_test("manifest lookup prefix mismatch", test_manifest_lookup_prefix_mismatch);
+    run_test("manifest pathspec matches exact and descendant paths", test_manifest_pathspec_matches_exact_and_descendant_paths);
+    run_test("manifest pathspec empty and multi match", test_manifest_pathspec_empty_and_multi_match);
+    run_test("manifest range query filters leaf entries", test_manifest_range_query_filters_leaf_entries);
+    run_test("manifest range query filters child ranges", test_manifest_range_query_filters_child_ranges);
+    return test_suite_end();
+}

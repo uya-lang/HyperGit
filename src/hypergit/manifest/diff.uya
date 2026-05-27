@@ -1,0 +1,22 @@
+use core.ids.ManifestId;
+use core.ids.manifest_id_compare;
+use core.ids.hash32_compare;
+use manifest.path.manifest_path_compare;
+use object.types.ManifestChild;
+
+export fn manifest_diff_skip_by_id(left: &ManifestId, right: &ManifestId) bool {
+    return manifest_id_compare(left, right) == 0;
+}
+
+export fn manifest_diff_skip_child(left: &ManifestChild, right: &ManifestChild) bool {
+    if manifest_path_compare(&left.min_name, &right.min_name) != 0 {
+        return false;
+    }
+    if manifest_path_compare(&left.max_name, &right.max_name) != 0 {
+        return false;
+    }
+    if manifest_id_compare(&left.child_id, &right.child_id) != 0 {
+        return false;
+    }
+    return hash32_compare(&left.child_hash, &right.child_hash) == 0;
+}

@@ -1,0 +1,261 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use object.types.ByteList;
+use manifest.path.ManifestPathIterator;
+use manifest.path.ManifestPathSegment;
+use manifest.path.manifest_path_normalize;
+use manifest.path.manifest_path_iterator;
+use manifest.path.manifest_path_iterator_next;
+use manifest.path.manifest_path_compare;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn expect_normalized_literal(input: &const byte, expected: &const byte) !void {
+    var arena_buf: [byte: 2048] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 2048 as usize);
+    const normalized: ByteList = try manifest_path_normalize(&arena, literal_bytes(input));
+    try expect_byte_list_eq(normalized, literal_bytes(expected));
+}
+
+fn expect_normalized_bytes(input: &[byte], expected: &[byte]) !void {
+    var arena_buf: [byte: 2048] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 2048 as usize);
+    const normalized: ByteList = try manifest_path_normalize(&arena, input);
+    try expect_byte_list_eq(normalized, expected);
+}
+
+fn expect_normalize_error(input: &[byte], expected_error_id: u32) !void {
+    var arena_buf: [byte: 2048] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 2048 as usize);
+    const normalized: ByteList = manifest_path_normalize(&arena, input) catch |err| {
+        try expect(@error_id(err) == expected_error_id);
+        return;
+    };
+    _ = normalized;
+    return error.AssertionFailed;
+}
+
+fn expect_normalize_literal_error(input: &const byte, expected_error_id: u32) !void {
+    try expect_normalize_error(literal_bytes(input), expected_error_id);
+}
+
+fn compare_normalized_literals(left: &const byte, right: &const byte) !i32 {
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+    const left_path: ByteList = try manifest_path_normalize(&arena, literal_bytes(left));
+    const right_path: ByteList = try manifest_path_normalize(&arena, literal_bytes(right));
+    return manifest_path_compare(&left_path, &right_path);
+}
+
+fn test_normalize_separators_and_dot_segments() !void {
+    try expect_normalized_literal("./src\\\\backend//auth/./login.uya/", "src/backend/auth/login.uya");
+    try expect_normalized_literal("foo//bar/", "foo/bar");
+}
+
+fn test_root_and_dot_paths_collapse_to_empty() !void {
+    try expect_normalized_literal("", "");
+    try expect_normalized_literal(".", "");
+    try expect_normalized_literal("././", "");
+}
+
+fn test_hidden_and_utf8_paths_are_preserved() !void {
+    try expect_normalized_literal(".gitignore", ".gitignore");
+
+    var input: [byte: 5] = [228 as byte, 184 as byte, 173 as byte, '/' as byte, 'a' as byte];
+    var expected: [byte: 5] = [228 as byte, 184 as byte, 173 as byte, '/' as byte, 'a' as byte];
+    try expect_normalized_bytes(input[0: 5], expected[0: 5]);
+}
+
+fn test_segment_iterator_handles_root_path() !void {
+    var arena_buf: [byte: 2048] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 2048 as usize);
+
+    const normalized: ByteList = try manifest_path_normalize(&arena, literal_bytes("././"));
+    var iter: ManifestPathIterator = manifest_path_iterator(&normalized);
+    var segment: ManifestPathSegment = ManifestPathSegment{
+        bytes: ByteList{ ptr: null, len: 0 },
+        index: 0 as usize,
+        start: 0 as usize,
+        end: 0 as usize,
+        is_last: false,
+    };
+    try expect(!manifest_path_iterator_next(&iter, &segment));
+}
+
+fn test_segment_iterator_returns_ordered_segments() !void {
+    var arena_buf: [byte: 2048] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 2048 as usize);
+
+    const normalized: ByteList = try manifest_path_normalize(&arena, literal_bytes("./src//backend/auth/login.uya"));
+    var iter: ManifestPathIterator = manifest_path_iterator(&normalized);
+    var segment: ManifestPathSegment = ManifestPathSegment{
+        bytes: ByteList{ ptr: null, len: 0 },
+        index: 0 as usize,
+        start: 0 as usize,
+        end: 0 as usize,
+        is_last: false,
+    };
+
+    try expect(manifest_path_iterator_next(&iter, &segment));
+    try expect_byte_list_eq(segment.bytes, literal_bytes("src"));
+    try expect(segment.index == 0 as usize);
+    try expect(segment.start == 0 as usize);
+    try expect(segment.end == 3 as usize);
+    try expect(segment.is_last == false);
+
+    try expect(manifest_path_iterator_next(&iter, &segment));
+    try expect_byte_list_eq(segment.bytes, literal_bytes("backend"));
+    try expect(segment.index == 1 as usize);
+    try expect(segment.start == 4 as usize);
+    try expect(segment.end == 11 as usize);
+    try expect(segment.is_last == false);
+
+    try expect(manifest_path_iterator_next(&iter, &segment));
+    try expect_byte_list_eq(segment.bytes, literal_bytes("auth"));
+    try expect(segment.index == 2 as usize);
+    try expect(segment.start == 12 as usize);
+    try expect(segment.end == 16 as usize);
+    try expect(segment.is_last == false);
+
+    try expect(manifest_path_iterator_next(&iter, &segment));
+    try expect_byte_list_eq(segment.bytes, literal_bytes("login.uya"));
+    try expect(segment.index == 3 as usize);
+    try expect(segment.start == 17 as usize);
+    try expect(segment.end == 26 as usize);
+    try expect(segment.is_last == true);
+
+    try expect(!manifest_path_iterator_next(&iter, &segment));
+}
+
+fn test_segment_iterator_preserves_utf8_segment_bytes() !void {
+    var arena_buf: [byte: 2048] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 2048 as usize);
+
+    var input: [byte: 5] = [228 as byte, 184 as byte, 173 as byte, '/' as byte, 'a' as byte];
+    var utf8_segment: [byte: 3] = [228 as byte, 184 as byte, 173 as byte];
+    var ascii_segment: [byte: 1] = ['a' as byte];
+    const normalized: ByteList = try manifest_path_normalize(&arena, input[0: 5]);
+    var iter: ManifestPathIterator = manifest_path_iterator(&normalized);
+    var segment: ManifestPathSegment = ManifestPathSegment{
+        bytes: ByteList{ ptr: null, len: 0 },
+        index: 0 as usize,
+        start: 0 as usize,
+        end: 0 as usize,
+        is_last: false,
+    };
+
+    try expect(manifest_path_iterator_next(&iter, &segment));
+    try expect_byte_list_eq(segment.bytes, utf8_segment[0: 3]);
+    try expect(segment.index == 0 as usize);
+    try expect(segment.is_last == false);
+
+    try expect(manifest_path_iterator_next(&iter, &segment));
+    try expect_byte_list_eq(segment.bytes, ascii_segment[0: 1]);
+    try expect(segment.index == 1 as usize);
+    try expect(segment.is_last == true);
+
+    try expect(!manifest_path_iterator_next(&iter, &segment));
+}
+
+fn test_path_compare_prefix_order() !void {
+    try expect((try compare_normalized_literals("", "src")) < 0);
+    try expect((try compare_normalized_literals("src", "src/backend")) < 0);
+    try expect((try compare_normalized_literals("src/backend", "src")) > 0);
+}
+
+fn test_path_compare_is_segment_aware() !void {
+    try expect((try compare_normalized_literals("a/b", "a.b")) < 0);
+    try expect((try compare_normalized_literals("a/c", "a.b")) < 0);
+    try expect((try compare_normalized_literals("src", "src-gen")) < 0);
+}
+
+fn test_path_compare_equality_and_sibling_order() !void {
+    try expect((try compare_normalized_literals("foo//bar/", "./foo/bar")) == 0);
+    try expect((try compare_normalized_literals("src/backend", "src/frontend")) < 0);
+    try expect((try compare_normalized_literals("src/frontend", "src/backend")) > 0);
+}
+
+fn test_reject_absolute_paths() !void {
+    try expect_normalize_literal_error("/foo", @error_id(error.ManifestAbsolutePath));
+    try expect_normalize_literal_error("\\foo", @error_id(error.ManifestAbsolutePath));
+    try expect_normalize_literal_error("C:\\foo", @error_id(error.ManifestAbsolutePath));
+    try expect_normalize_literal_error("C:/foo", @error_id(error.ManifestAbsolutePath));
+    try expect_normalize_literal_error("\\\\server\\share", @error_id(error.ManifestAbsolutePath));
+    try expect_normalize_literal_error("~/foo", @error_id(error.ManifestAbsolutePath));
+}
+
+fn test_reject_parent_traversal_segments() !void {
+    try expect_normalize_literal_error("..", @error_id(error.ManifestPathTraversal));
+    try expect_normalize_literal_error("../src/main.uya", @error_id(error.ManifestPathTraversal));
+    try expect_normalize_literal_error("./../src/main.uya", @error_id(error.ManifestPathTraversal));
+    try expect_normalize_literal_error("src/../main.uya", @error_id(error.ManifestPathTraversal));
+}
+
+fn test_reject_invalid_characters() !void {
+    try expect_normalize_literal_error("a:b", @error_id(error.ManifestInvalidCharacter));
+    try expect_normalize_literal_error("bad*name", @error_id(error.ManifestInvalidCharacter));
+    try expect_normalize_literal_error("line\nbreak", @error_id(error.ManifestInvalidCharacter));
+
+    var nul_path: [byte: 7] = ['f' as byte, 'o' as byte, 'o' as byte, 0 as byte, 'b' as byte, 'a' as byte, 'r' as byte];
+    try expect_normalize_error(nul_path[0: 7], @error_id(error.ManifestInvalidCharacter));
+}
+
+fn test_reject_invalid_utf8() !void {
+    var bad_two_byte: [byte: 2] = [195 as byte, 40 as byte];
+    try expect_normalize_error(bad_two_byte[0: 2], @error_id(error.ManifestInvalidUtf8));
+
+    var truncated_three_byte: [byte: 2] = [228 as byte, 184 as byte];
+    try expect_normalize_error(truncated_three_byte[0: 2], @error_id(error.ManifestInvalidUtf8));
+}
+
+fn test_reject_reserved_names_and_trailing_space_dot() !void {
+    try expect_normalize_literal_error("CON", @error_id(error.ManifestReservedName));
+    try expect_normalize_literal_error("aux.txt", @error_id(error.ManifestReservedName));
+    try expect_normalize_literal_error("dir/Lpt9.log", @error_id(error.ManifestReservedName));
+    try expect_normalize_literal_error("name.", @error_id(error.ManifestReservedName));
+    try expect_normalize_literal_error("dir/file /tail", @error_id(error.ManifestReservedName));
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Manifest Path Tests");
+    run_test("normalize separators and dot segments", test_normalize_separators_and_dot_segments);
+    run_test("root and dot paths collapse to empty", test_root_and_dot_paths_collapse_to_empty);
+    run_test("hidden and utf8 paths are preserved", test_hidden_and_utf8_paths_are_preserved);
+    run_test("segment iterator handles root path", test_segment_iterator_handles_root_path);
+    run_test("segment iterator returns ordered segments", test_segment_iterator_returns_ordered_segments);
+    run_test("segment iterator preserves utf8 segment bytes", test_segment_iterator_preserves_utf8_segment_bytes);
+    run_test("path compare prefix order", test_path_compare_prefix_order);
+    run_test("path compare is segment aware", test_path_compare_is_segment_aware);
+    run_test("path compare equality and sibling order", test_path_compare_equality_and_sibling_order);
+    run_test("reject absolute paths", test_reject_absolute_paths);
+    run_test("reject parent traversal segments", test_reject_parent_traversal_segments);
+    run_test("reject invalid characters", test_reject_invalid_characters);
+    run_test("reject invalid utf8", test_reject_invalid_utf8);
+    run_test("reject reserved names and trailing space dot", test_reject_reserved_names_and_trailing_space_dot);
+    return test_suite_end();
+}

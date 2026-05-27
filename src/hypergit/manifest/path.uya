@@ -1,0 +1,422 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use object.types.ByteList;
+
+error ManifestAlloc;
+error ManifestAbsolutePath;
+error ManifestPathTraversal;
+error ManifestInvalidUtf8;
+error ManifestInvalidCharacter;
+error ManifestReservedName;
+
+export struct ManifestPathSegment {
+    bytes: ByteList,
+    index: usize,
+    start: usize,
+    end: usize,
+    is_last: bool
+}
+
+export struct ManifestPathIterator {
+    path: ByteList,
+    offset: usize,
+    segment_index: usize
+}
+
+fn manifest_path_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.ManifestAlloc;
+    }
+    return raw[0: len];
+}
+
+fn is_separator(value: byte) bool {
+    return value == '/' as byte || value == '\\' as byte;
+}
+
+fn is_ascii_letter(value: byte) bool {
+    return (value >= 'a' as byte && value <= 'z' as byte) || (value >= 'A' as byte && value <= 'Z' as byte);
+}
+
+fn ascii_fold(value: byte) byte {
+    if value >= 'A' as byte && value <= 'Z' as byte {
+        return value + 32 as byte;
+    }
+    return value;
+}
+
+fn is_utf8_continuation(value: byte) bool {
+    return value >= 128 as byte && value <= 191 as byte;
+}
+
+fn validate_utf8(input: &[byte]) !void {
+    var i: usize = 0;
+    while i < input.len {
+        const first: byte = input.ptr[i];
+        if first < 128 as byte {
+            i = i + 1;
+            continue;
+        }
+
+        if first < 194 as byte {
+            return error.ManifestInvalidUtf8;
+        }
+
+        if first <= 223 as byte {
+            if i + 1 as usize >= input.len || !is_utf8_continuation(input.ptr[i + 1 as usize]) {
+                return error.ManifestInvalidUtf8;
+            }
+            i = i + 2 as usize;
+            continue;
+        }
+
+        if first == 224 as byte {
+            if i + 2 as usize >= input.len {
+                return error.ManifestInvalidUtf8;
+            }
+            const second: byte = input.ptr[i + 1 as usize];
+            const third: byte = input.ptr[i + 2 as usize];
+            if second < 160 as byte || second > 191 as byte || !is_utf8_continuation(third) {
+                return error.ManifestInvalidUtf8;
+            }
+            i = i + 3 as usize;
+            continue;
+        }
+
+        if first >= 225 as byte && first <= 236 as byte {
+            if i + 2 as usize >= input.len {
+                return error.ManifestInvalidUtf8;
+            }
+            if !is_utf8_continuation(input.ptr[i + 1 as usize]) || !is_utf8_continuation(input.ptr[i + 2 as usize]) {
+                return error.ManifestInvalidUtf8;
+            }
+            i = i + 3 as usize;
+            continue;
+        }
+
+        if first == 237 as byte {
+            if i + 2 as usize >= input.len {
+                return error.ManifestInvalidUtf8;
+            }
+            const second: byte = input.ptr[i + 1 as usize];
+            const third: byte = input.ptr[i + 2 as usize];
+            if second < 128 as byte || second > 159 as byte || !is_utf8_continuation(third) {
+                return error.ManifestInvalidUtf8;
+            }
+            i = i + 3 as usize;
+            continue;
+        }
+
+        if first >= 238 as byte && first <= 239 as byte {
+            if i + 2 as usize >= input.len {
+                return error.ManifestInvalidUtf8;
+            }
+            if !is_utf8_continuation(input.ptr[i + 1 as usize]) || !is_utf8_continuation(input.ptr[i + 2 as usize]) {
+                return error.ManifestInvalidUtf8;
+            }
+            i = i + 3 as usize;
+            continue;
+        }
+
+        if first == 240 as byte {
+            if i + 3 as usize >= input.len {
+                return error.ManifestInvalidUtf8;
+            }
+            const second: byte = input.ptr[i + 1 as usize];
+            const third: byte = input.ptr[i + 2 as usize];
+            const fourth: byte = input.ptr[i + 3 as usize];
+            if second < 144 as byte || second > 191 as byte || !is_utf8_continuation(third) || !is_utf8_continuation(fourth) {
+                return error.ManifestInvalidUtf8;
+            }
+            i = i + 4 as usize;
+            continue;
+        }
+
+        if first >= 241 as byte && first <= 243 as byte {
+            if i + 3 as usize >= input.len {
+                return error.ManifestInvalidUtf8;
+            }
+            if !is_utf8_continuation(input.ptr[i + 1 as usize]) || !is_utf8_continuation(input.ptr[i + 2 as usize]) || !is_utf8_continuation(input.ptr[i + 3 as usize]) {
+                return error.ManifestInvalidUtf8;
+            }
+            i = i + 4 as usize;
+            continue;
+        }
+
+        if first == 244 as byte {
+            if i + 3 as usize >= input.len {
+                return error.ManifestInvalidUtf8;
+            }
+            const second: byte = input.ptr[i + 1 as usize];
+            const third: byte = input.ptr[i + 2 as usize];
+            const fourth: byte = input.ptr[i + 3 as usize];
+            if second < 128 as byte || second > 143 as byte || !is_utf8_continuation(third) || !is_utf8_continuation(fourth) {
+                return error.ManifestInvalidUtf8;
+            }
+            i = i + 4 as usize;
+            continue;
+        }
+
+        return error.ManifestInvalidUtf8;
+    }
+}
+
+fn is_absolute_prefix(input: &[byte]) bool {
+    if input.len == 0 {
+        return false;
+    }
+    if is_separator(input.ptr[0]) {
+        return true;
+    }
+    if input.ptr[0] == '~' as byte && input.len > 1 as usize && is_separator(input.ptr[1]) {
+        return true;
+    }
+    if input.len >= 2 as usize && is_ascii_letter(input.ptr[0]) && input.ptr[1] == ':' as byte {
+        if input.len == 2 as usize {
+            return true;
+        }
+        if is_separator(input.ptr[2]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn is_invalid_materialize_char(value: byte) bool {
+    if value < 32 as byte || value == 127 as byte {
+        return true;
+    }
+    return value == 0 as byte ||
+        value == ':' as byte ||
+        value == '"' as byte ||
+        value == '*' as byte ||
+        value == '?' as byte ||
+        value == '<' as byte ||
+        value == '>' as byte ||
+        value == '|' as byte;
+}
+
+fn segment_is_reserved_name(segment: &[byte]) bool {
+    if segment.len == 0 {
+        return false;
+    }
+
+    const last: byte = segment.ptr[segment.len - 1 as usize];
+    if last == ' ' as byte || last == '.' as byte {
+        return true;
+    }
+
+    var base_len: usize = 0;
+    while base_len < segment.len {
+        if segment.ptr[base_len] == '.' as byte {
+            break;
+        }
+        base_len = base_len + 1;
+    }
+    if base_len == 0 {
+        return false;
+    }
+
+    if base_len == 3 as usize {
+        const c0: byte = ascii_fold(segment.ptr[0]);
+        const c1: byte = ascii_fold(segment.ptr[1]);
+        const c2: byte = ascii_fold(segment.ptr[2]);
+        if c0 == 'c' as byte && c1 == 'o' as byte && c2 == 'n' as byte {
+            return true;
+        }
+        if c0 == 'p' as byte && c1 == 'r' as byte && c2 == 'n' as byte {
+            return true;
+        }
+        if c0 == 'a' as byte && c1 == 'u' as byte && c2 == 'x' as byte {
+            return true;
+        }
+        if c0 == 'n' as byte && c1 == 'u' as byte && c2 == 'l' as byte {
+            return true;
+        }
+    }
+
+    if base_len == 4 as usize {
+        const c0: byte = ascii_fold(segment.ptr[0]);
+        const c1: byte = ascii_fold(segment.ptr[1]);
+        const c2: byte = ascii_fold(segment.ptr[2]);
+        const c3: byte = ascii_fold(segment.ptr[3]);
+        if c3 >= '1' as byte && c3 <= '9' as byte {
+            if c0 == 'c' as byte && c1 == 'o' as byte && c2 == 'm' as byte {
+                return true;
+            }
+            if c0 == 'l' as byte && c1 == 'p' as byte && c2 == 't' as byte {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+export fn manifest_path_iterator(path: &ByteList) ManifestPathIterator {
+    return ManifestPathIterator{
+        path: *path,
+        offset: 0 as usize,
+        segment_index: 0 as usize,
+    };
+}
+
+export fn manifest_path_iterator_next(iter: &ManifestPathIterator, out: &ManifestPathSegment) bool {
+    var cursor: usize = iter.offset;
+    while cursor < iter.path.len && is_separator(iter.path.ptr[cursor]) {
+        cursor = cursor + 1;
+    }
+    if cursor >= iter.path.len {
+        iter.offset = cursor;
+        return false;
+    }
+
+    const start: usize = cursor;
+    while cursor < iter.path.len && !is_separator(iter.path.ptr[cursor]) {
+        cursor = cursor + 1;
+    }
+
+    const segment_slice: &[byte] = iter.path.ptr[start: cursor - start];
+    out.bytes = ByteList{ ptr: segment_slice.ptr, len: segment_slice.len };
+    out.index = iter.segment_index;
+    out.start = start;
+    out.end = cursor;
+    out.is_last = cursor == iter.path.len;
+
+    iter.segment_index = iter.segment_index + 1;
+    if cursor < iter.path.len {
+        iter.offset = cursor + 1;
+    } else {
+        iter.offset = cursor;
+    }
+    return true;
+}
+
+fn manifest_path_byte_list_compare(left: ByteList, right: ByteList) i32 {
+    var i: usize = 0;
+    var limit: usize = left.len;
+    if right.len < limit {
+        limit = right.len;
+    }
+
+    while i < limit {
+        if left.ptr[i] < right.ptr[i] {
+            return -1;
+        }
+        if left.ptr[i] > right.ptr[i] {
+            return 1;
+        }
+        i = i + 1;
+    }
+
+    if left.len < right.len {
+        return -1;
+    }
+    if left.len > right.len {
+        return 1;
+    }
+    return 0;
+}
+
+export fn manifest_path_compare(left: &ByteList, right: &ByteList) i32 {
+    var left_iter: ManifestPathIterator = manifest_path_iterator(left);
+    var right_iter: ManifestPathIterator = manifest_path_iterator(right);
+    var left_segment: ManifestPathSegment = ManifestPathSegment{
+        bytes: ByteList{ ptr: null, len: 0 },
+        index: 0 as usize,
+        start: 0 as usize,
+        end: 0 as usize,
+        is_last: false,
+    };
+    var right_segment: ManifestPathSegment = ManifestPathSegment{
+        bytes: ByteList{ ptr: null, len: 0 },
+        index: 0 as usize,
+        start: 0 as usize,
+        end: 0 as usize,
+        is_last: false,
+    };
+
+    while true {
+        const left_ok: bool = manifest_path_iterator_next(&left_iter, &left_segment);
+        const right_ok: bool = manifest_path_iterator_next(&right_iter, &right_segment);
+        if !left_ok && !right_ok {
+            return 0;
+        }
+        if !left_ok {
+            return -1;
+        }
+        if !right_ok {
+            return 1;
+        }
+
+        const cmp: i32 = manifest_path_byte_list_compare(left_segment.bytes, right_segment.bytes);
+        if cmp != 0 {
+            return cmp;
+        }
+    }
+    return 0;
+}
+
+export fn manifest_path_normalize(arena: &Arena, input: &[byte]) !ByteList {
+    try validate_utf8(input);
+    if is_absolute_prefix(input) {
+        return error.ManifestAbsolutePath;
+    }
+
+    const output: &[byte] = try manifest_path_arena_bytes(arena, input.len);
+    const segment_buf: &[byte] = try manifest_path_arena_bytes(arena, input.len);
+    var output_len: usize = 0;
+    var i: usize = 0;
+
+    while i < input.len {
+        while i < input.len && is_separator(input.ptr[i]) {
+            i = i + 1;
+        }
+        if i >= input.len {
+            break;
+        }
+
+        var segment_len: usize = 0;
+        while i < input.len && !is_separator(input.ptr[i]) {
+            const value: byte = input.ptr[i];
+            if is_invalid_materialize_char(value) {
+                return error.ManifestInvalidCharacter;
+            }
+            segment_buf.ptr[segment_len] = value;
+            segment_len = segment_len + 1;
+            i = i + 1;
+        }
+
+        if segment_len == 1 as usize && segment_buf.ptr[0] == '.' as byte {
+            continue;
+        }
+        if segment_len == 2 as usize && segment_buf.ptr[0] == '.' as byte && segment_buf.ptr[1] == '.' as byte {
+            return error.ManifestPathTraversal;
+        }
+
+        const segment: &[byte] = segment_buf.ptr[0: segment_len];
+        if segment_is_reserved_name(segment) {
+            return error.ManifestReservedName;
+        }
+
+        if output_len > 0 {
+            output.ptr[output_len] = '/' as byte;
+            output_len = output_len + 1;
+        }
+
+        var j: usize = 0;
+        while j < segment_len {
+            output.ptr[output_len + j] = segment.ptr[j];
+            j = j + 1;
+        }
+        output_len = output_len + segment_len;
+    }
+
+    return ByteList{ ptr: output.ptr, len: output_len };
+}

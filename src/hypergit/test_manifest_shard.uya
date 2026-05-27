@@ -1,0 +1,230 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.manifest_id_from_object;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.path.manifest_path_compare;
+use manifest.path.manifest_path_normalize;
+use manifest.shard.manifest_shard_needs_split;
+use manifest.shard.manifest_shard_split;
+use manifest.shard.ManifestNodePayloadList;
+use manifest.trie.ManifestChildInput;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.manifest_child_input_list_from_slice;
+use manifest.trie.manifest_internal_build;
+use manifest.trie.manifest_leaf_build;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ManifestNodePayload;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn make_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(make_hash(seed));
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(make_object_id(seed));
+}
+
+fn make_manifest_id(seed: byte) ManifestId {
+    return manifest_id_from_object(make_object_id(seed));
+}
+
+fn normalize_literal(arena: &Arena, text: &const byte) !ByteList {
+    return try manifest_path_normalize(arena, literal_bytes(text));
+}
+
+fn make_zero_padded_bytes(arena: &Arena, prefix: &const byte, value: usize, suffix: &const byte) !ByteList {
+    const prefix_len: usize = strlen(prefix);
+    const suffix_len: usize = strlen(suffix);
+    const raw: &byte = arena_alloc(arena, prefix_len + 4 as usize + suffix_len);
+    if raw == null {
+        return error.ManifestAlloc;
+    }
+    const out: &[byte] = raw[0: prefix_len + 4 as usize + suffix_len];
+    var i: usize = 0;
+    while i < prefix_len {
+        out.ptr[i] = prefix[i];
+        i = i + 1;
+    }
+    out.ptr[prefix_len + 0] = ('0' as byte) + ((value / 1000 as usize) % 10 as usize) as byte;
+    out.ptr[prefix_len + 1] = ('0' as byte) + ((value / 100 as usize) % 10 as usize) as byte;
+    out.ptr[prefix_len + 2] = ('0' as byte) + ((value / 10 as usize) % 10 as usize) as byte;
+    out.ptr[prefix_len + 3] = ('0' as byte) + (value % 10 as usize) as byte;
+    i = 0;
+    while i < suffix_len {
+        out.ptr[prefix_len + 4 as usize + i] = suffix[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: out.ptr, len: prefix_len + 4 as usize + suffix_len };
+}
+
+fn make_generated_leaf_input(arena: &Arena, index: usize) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try make_zero_padded_bytes(arena, "f", index, ".uya"),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id((index % 200 as usize) as byte),
+        logical_size: index as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id((index % 200 as usize) as byte + 20 as byte),
+    };
+}
+
+fn make_generated_child_input(arena: &Arena, index: usize) !ManifestChildInput {
+    return ManifestChildInput{
+        min_path: try make_zero_padded_bytes(arena, "pkg", index, "/a.uya"),
+        max_path: try make_zero_padded_bytes(arena, "pkg", index, "/z.uya"),
+        child_id: make_manifest_id((index % 200 as usize) as byte + 40 as byte),
+        child_hash: make_hash((index % 200 as usize) as byte + 60 as byte),
+    };
+}
+
+fn test_manifest_shard_split_leaf_by_entry_threshold() !void {
+    const total_entries: usize = 2050 as usize;
+    var input_arena_buf: [byte: 524288] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 524288 as usize);
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(&input_arena, @size_of(ManifestLeafInputEntry) as usize * total_entries) as &ManifestLeafInputEntry;
+    try expect(raw_inputs != null);
+    var i: usize = 0;
+    while i < total_entries {
+        raw_inputs[i] = try make_generated_leaf_input(&input_arena, i);
+        i = i + 1;
+    }
+
+    var build_arena_buf: [byte: 786432] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 786432 as usize);
+    const prefix: ByteList = try normalize_literal(&build_arena, "");
+    const payload: ManifestNodePayload = try manifest_leaf_build(&build_arena, &prefix, manifest_leaf_input_list_from_slice(raw_inputs[0: total_entries]));
+    try expect(manifest_shard_needs_split(&payload));
+
+    var split_arena_buf: [byte: 1048576] = [];
+    var split_arena: Arena = Arena{ buffer: &split_arena_buf[0], size: 0, used: 0 };
+    arena_init(&split_arena, &split_arena_buf[0], 1048576 as usize);
+    const siblings: ManifestNodePayloadList = try manifest_shard_split(&split_arena, &payload);
+    try expect(siblings.len >= 2 as usize);
+
+    var total_seen: usize = 0;
+    var previous_last: ByteList = ByteList{ ptr: null, len: 0 };
+    i = 0;
+    while i < siblings.len {
+        const sibling: &ManifestNodePayload = &siblings.ptr[i];
+        try expect(sibling.children.len == 0 as usize);
+        try expect(sibling.entries.len <= 2048 as usize);
+        if i == 0 {
+            try expect_byte_list_eq(sibling.entries.ptr[0].name, literal_bytes("f0000.uya"));
+        } else {
+            try expect(manifest_path_compare(&previous_last, &sibling.entries.ptr[0].name) < 0);
+        }
+        previous_last = ByteList{ ptr: sibling.entries.ptr[sibling.entries.len - 1 as usize].name.ptr, len: sibling.entries.ptr[sibling.entries.len - 1 as usize].name.len };
+        total_seen = total_seen + sibling.entries.len;
+        i = i + 1;
+    }
+    try expect_byte_list_eq(previous_last, literal_bytes("f2049.uya"));
+    try expect(total_seen == total_entries);
+}
+
+fn test_manifest_shard_split_internal_by_child_threshold() !void {
+    const total_children: usize = 257 as usize;
+    var input_arena_buf: [byte: 262144] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 262144 as usize);
+    const raw_children: &ManifestChildInput = arena_alloc(&input_arena, @size_of(ManifestChildInput) as usize * total_children) as &ManifestChildInput;
+    try expect(raw_children != null);
+    var i: usize = 0;
+    while i < total_children {
+        raw_children[i] = try make_generated_child_input(&input_arena, i);
+        i = i + 1;
+    }
+
+    var build_arena_buf: [byte: 393216] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 393216 as usize);
+    const prefix: ByteList = try normalize_literal(&build_arena, "");
+    var no_entries: [ManifestLeafInputEntry: 1] = [ManifestLeafInputEntry{
+        path: prefix,
+        kind: EntryKind.File,
+        mode: 0u32,
+        object_id: make_object_id(0 as byte),
+        logical_size: 0u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id(0 as byte),
+    }];
+    const payload: ManifestNodePayload = try manifest_internal_build(
+        &build_arena,
+        &prefix,
+        manifest_leaf_input_list_from_slice(no_entries[0: 0]),
+        manifest_child_input_list_from_slice(raw_children[0: total_children]),
+    );
+    try expect(manifest_shard_needs_split(&payload));
+
+    var split_arena_buf: [byte: 524288] = [];
+    var split_arena: Arena = Arena{ buffer: &split_arena_buf[0], size: 0, used: 0 };
+    arena_init(&split_arena, &split_arena_buf[0], 524288 as usize);
+    const siblings: ManifestNodePayloadList = try manifest_shard_split(&split_arena, &payload);
+    try expect(siblings.len >= 2 as usize);
+
+    var total_seen: usize = 0;
+    var previous_max: ByteList = ByteList{ ptr: null, len: 0 };
+    i = 0;
+    while i < siblings.len {
+        const sibling: &ManifestNodePayload = &siblings.ptr[i];
+        try expect(sibling.entries.len == 0 as usize);
+        try expect(sibling.children.len <= 256 as usize);
+        if i == 0 {
+            try expect_byte_list_eq(sibling.children.ptr[0].min_name, literal_bytes("pkg0000/a.uya"));
+        } else {
+            try expect(manifest_path_compare(&previous_max, &sibling.children.ptr[0].min_name) < 0);
+        }
+        previous_max = ByteList{ ptr: sibling.children.ptr[sibling.children.len - 1 as usize].max_name.ptr, len: sibling.children.ptr[sibling.children.len - 1 as usize].max_name.len };
+        total_seen = total_seen + sibling.children.len;
+        i = i + 1;
+    }
+    try expect_byte_list_eq(previous_max, literal_bytes("pkg0256/z.uya"));
+    try expect(total_seen == total_children);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Manifest Shard Tests");
+    run_test("manifest shard split leaf by entry threshold", test_manifest_shard_split_leaf_by_entry_threshold);
+    run_test("manifest shard split internal by child threshold", test_manifest_shard_split_internal_by_child_threshold);
+    return test_suite_end();
+}

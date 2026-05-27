@@ -1,0 +1,297 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use manifest.path.manifest_path_compare;
+use object.types.ByteList;
+use object.types.ManifestChild;
+use object.types.ManifestNodePayload;
+
+error ManifestLookupPrefixMismatch;
+
+export enum ManifestLookupKind {
+    Missing,
+    Entry,
+    Child
+}
+
+export struct ManifestLookupResult {
+    kind: ManifestLookupKind,
+    index: usize
+}
+
+export struct ManifestPathspecList {
+    ptr: &ByteList,
+    len: usize
+}
+
+export struct ManifestIndexList {
+    ptr: &usize,
+    len: usize
+}
+
+export struct ManifestRangeQueryResult {
+    entry_indexes: ManifestIndexList,
+    child_indexes: ManifestIndexList
+}
+
+export fn manifest_pathspec_list_from_slice(slice: &[ByteList]) ManifestPathspecList {
+    return ManifestPathspecList{ ptr: slice.ptr, len: slice.len };
+}
+
+enum ManifestReducedPathspecKind {
+    None,
+    All,
+    Relative
+}
+
+struct ManifestReducedPathspec {
+    kind: ManifestReducedPathspecKind,
+    relative: ByteList
+}
+
+fn manifest_query_path_has_prefix(path: &ByteList, prefix: &ByteList) bool {
+    if prefix.len == 0 {
+        return true;
+    }
+    if prefix.len > path.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < prefix.len {
+        if path.ptr[i] != prefix.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    if prefix.len == path.len {
+        return true;
+    }
+    return path.ptr[prefix.len] == '/' as byte;
+}
+
+fn manifest_query_suffix_after_prefix(path: &ByteList, prefix: &ByteList) !ByteList {
+    if !manifest_query_path_has_prefix(path, prefix) {
+        return error.ManifestLookupPrefixMismatch;
+    }
+    if prefix.len == 0 {
+        return ByteList{ ptr: path.ptr, len: path.len };
+    }
+    if path.len <= prefix.len {
+        return ByteList{ ptr: null, len: 0 };
+    }
+    const start: usize = prefix.len + 1 as usize;
+    if start > path.len {
+        return ByteList{ ptr: null, len: 0 };
+    }
+    const suffix: &[byte] = path.ptr[start: path.len - start];
+    return ByteList{ ptr: suffix.ptr, len: suffix.len };
+}
+
+fn manifest_query_find_entry(payload: &ManifestNodePayload, suffix: &ByteList) ManifestLookupResult {
+    var low: usize = 0;
+    var high: usize = payload.entries.len;
+    while low < high {
+        const mid: usize = low + ((high - low) / 2 as usize);
+        const cmp: i32 = manifest_path_compare(&payload.entries.ptr[mid].name, suffix);
+        if cmp < 0 {
+            low = mid + 1 as usize;
+        } else {
+            high = mid;
+        }
+    }
+    if low < payload.entries.len && manifest_path_compare(&payload.entries.ptr[low].name, suffix) == 0 {
+        return ManifestLookupResult{ kind: ManifestLookupKind.Entry, index: low };
+    }
+    return ManifestLookupResult{ kind: ManifestLookupKind.Missing, index: 0 as usize };
+}
+
+fn manifest_query_find_child(payload: &ManifestNodePayload, suffix: &ByteList) ManifestLookupResult {
+    var low: usize = 0;
+    var high: usize = payload.children.len;
+    while low < high {
+        const mid: usize = low + ((high - low) / 2 as usize);
+        const child: &ManifestChild = &payload.children.ptr[mid];
+        if manifest_path_compare(suffix, &child.min_name) < 0 {
+            high = mid;
+            continue;
+        }
+        if manifest_path_compare(suffix, &child.max_name) > 0 {
+            low = mid + 1 as usize;
+            continue;
+        }
+        return ManifestLookupResult{ kind: ManifestLookupKind.Child, index: mid };
+    }
+    return ManifestLookupResult{ kind: ManifestLookupKind.Missing, index: 0 as usize };
+}
+
+export fn manifest_pathspec_matches_path(pathspec: &ByteList, path: &ByteList) bool {
+    if pathspec.len == 0 {
+        return true;
+    }
+    if !manifest_query_path_has_prefix(path, pathspec) {
+        return false;
+    }
+    if path.len == pathspec.len {
+        return true;
+    }
+    return path.ptr[pathspec.len] == '/' as byte;
+}
+
+export fn manifest_pathspec_matches_any(pathspecs: ManifestPathspecList, path: &ByteList) bool {
+    if pathspecs.len == 0 {
+        return true;
+    }
+    var i: usize = 0;
+    while i < pathspecs.len {
+        if manifest_pathspec_matches_path(&pathspecs.ptr[i], path) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn manifest_query_reduce_pathspec(prefix: &ByteList, pathspec: &ByteList) ManifestReducedPathspec {
+    if pathspec.len == 0 {
+        return ManifestReducedPathspec{
+            kind: ManifestReducedPathspecKind.All,
+            relative: ByteList{ ptr: null, len: 0 },
+        };
+    }
+    if prefix.len == 0 {
+        return ManifestReducedPathspec{
+            kind: ManifestReducedPathspecKind.Relative,
+            relative: ByteList{ ptr: pathspec.ptr, len: pathspec.len },
+        };
+    }
+    if manifest_query_path_has_prefix(prefix, pathspec) {
+        return ManifestReducedPathspec{
+            kind: ManifestReducedPathspecKind.All,
+            relative: ByteList{ ptr: null, len: 0 },
+        };
+    }
+    if !manifest_query_path_has_prefix(pathspec, prefix) {
+        return ManifestReducedPathspec{
+            kind: ManifestReducedPathspecKind.None,
+            relative: ByteList{ ptr: null, len: 0 },
+        };
+    }
+    if pathspec.len == prefix.len {
+        return ManifestReducedPathspec{
+            kind: ManifestReducedPathspecKind.All,
+            relative: ByteList{ ptr: null, len: 0 },
+        };
+    }
+
+    const start: usize = prefix.len + 1 as usize;
+    const relative: &[byte] = pathspec.ptr[start: pathspec.len - start];
+    if relative.len == 0 {
+        return ManifestReducedPathspec{
+            kind: ManifestReducedPathspecKind.All,
+            relative: ByteList{ ptr: null, len: 0 },
+        };
+    }
+    return ManifestReducedPathspec{
+        kind: ManifestReducedPathspecKind.Relative,
+        relative: ByteList{ ptr: relative.ptr, len: relative.len },
+    };
+}
+
+fn manifest_query_relative_range_may_match(pathspec: &ByteList, min_name: &ByteList, max_name: &ByteList) bool {
+    if manifest_pathspec_matches_path(pathspec, min_name) {
+        return true;
+    }
+    if manifest_pathspec_matches_path(pathspec, max_name) {
+        return true;
+    }
+    return manifest_path_compare(min_name, pathspec) <= 0 && manifest_path_compare(pathspec, max_name) <= 0;
+}
+
+export fn manifest_range_query(arena: &Arena, payload: &ManifestNodePayload, pathspecs: ManifestPathspecList) !ManifestRangeQueryResult {
+    const entry_raw: &usize = arena_alloc(arena, @size_of(usize) as usize * payload.entries.len) as &usize;
+    if payload.entries.len > 0 && entry_raw == null {
+        return error.ManifestAlloc;
+    }
+    const child_raw: &usize = arena_alloc(arena, @size_of(usize) as usize * payload.children.len) as &usize;
+    if payload.children.len > 0 && child_raw == null {
+        return error.ManifestAlloc;
+    }
+
+    var entry_len: usize = 0;
+    var i: usize = 0;
+    while i < payload.entries.len {
+        var matched: bool = false;
+        if pathspecs.len == 0 {
+            matched = true;
+        } else {
+            var spec_index: usize = 0;
+            while spec_index < pathspecs.len {
+                const reduced: ManifestReducedPathspec = manifest_query_reduce_pathspec(&payload.prefix.bytes, &pathspecs.ptr[spec_index]);
+                if reduced.kind == ManifestReducedPathspecKind.All {
+                    matched = true;
+                    break;
+                }
+                if reduced.kind == ManifestReducedPathspecKind.Relative && manifest_pathspec_matches_path(&reduced.relative, &payload.entries.ptr[i].name) {
+                    matched = true;
+                    break;
+                }
+                spec_index = spec_index + 1;
+            }
+        }
+        if matched {
+            entry_raw[entry_len] = i;
+            entry_len = entry_len + 1;
+        }
+        i = i + 1;
+    }
+
+    var child_len: usize = 0;
+    i = 0;
+    while i < payload.children.len {
+        var matched: bool = false;
+        if pathspecs.len == 0 {
+            matched = true;
+        } else {
+            var spec_index: usize = 0;
+            while spec_index < pathspecs.len {
+                const reduced: ManifestReducedPathspec = manifest_query_reduce_pathspec(&payload.prefix.bytes, &pathspecs.ptr[spec_index]);
+                if reduced.kind == ManifestReducedPathspecKind.All {
+                    matched = true;
+                    break;
+                }
+                if reduced.kind == ManifestReducedPathspecKind.Relative && manifest_query_relative_range_may_match(&reduced.relative, &payload.children.ptr[i].min_name, &payload.children.ptr[i].max_name) {
+                    matched = true;
+                    break;
+                }
+                spec_index = spec_index + 1;
+            }
+        }
+        if matched {
+            child_raw[child_len] = i;
+            child_len = child_len + 1;
+        }
+        i = i + 1;
+    }
+
+    return ManifestRangeQueryResult{
+        entry_indexes: ManifestIndexList{ ptr: entry_raw, len: entry_len },
+        child_indexes: ManifestIndexList{ ptr: child_raw, len: child_len },
+    };
+}
+
+export fn manifest_lookup_path(payload: &ManifestNodePayload, full_path: &ByteList) !ManifestLookupResult {
+    const suffix: ByteList = try manifest_query_suffix_after_prefix(full_path, &payload.prefix.bytes);
+    if suffix.len == 0 {
+        return ManifestLookupResult{ kind: ManifestLookupKind.Missing, index: 0 as usize };
+    }
+
+    const entry_hit: ManifestLookupResult = manifest_query_find_entry(payload, &suffix);
+    if entry_hit.kind == ManifestLookupKind.Entry {
+        return entry_hit;
+    }
+
+    if payload.children.len == 0 {
+        return entry_hit;
+    }
+    return manifest_query_find_child(payload, &suffix);
+}

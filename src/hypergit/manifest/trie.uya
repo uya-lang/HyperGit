@@ -1,0 +1,481 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.ids.ObjectId;
+use core.ids.ManifestId;
+use core.ids.Hash32;
+use core.ids.PolicyId;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ManifestChildList;
+use object.types.ManifestChild;
+use object.types.ManifestEntry;
+use object.types.ManifestEntryList;
+use object.types.ManifestNodePayload;
+use object.types.PathPrefix;
+use object.types.manifest_child_list_from_slice;
+use object.types.manifest_entry_list_from_slice;
+use manifest.path.ManifestPathIterator;
+use manifest.path.ManifestPathSegment;
+use manifest.path.manifest_path_compare;
+use manifest.path.manifest_path_iterator;
+use manifest.path.manifest_path_iterator_next;
+use object.validate.validate_manifest_node_payload;
+
+error ManifestEmptyLeaf;
+error ManifestPrefixTooDeep;
+error ManifestLeafPrefixMismatch;
+error ManifestLeafDuplicatePath;
+error ManifestFileDirectoryConflict;
+error ManifestEmptyInternal;
+error ManifestInternalPrefixMismatch;
+error ManifestInternalEntryNotDirect;
+error ManifestInternalDuplicateEntry;
+error ManifestChildRangeInvalid;
+error ManifestChildRangeOverlap;
+
+export struct ManifestLeafInputEntry {
+    path: ByteList,
+    kind: EntryKind,
+    mode: u32,
+    object_id: ObjectId,
+    logical_size: u64,
+    content_type: ContentType,
+    policy_id: PolicyId
+}
+
+export struct ManifestLeafInputList {
+    ptr: &ManifestLeafInputEntry,
+    len: usize
+}
+
+export fn manifest_leaf_input_list_from_slice(slice: &[ManifestLeafInputEntry]) ManifestLeafInputList {
+    return ManifestLeafInputList{ ptr: slice.ptr, len: slice.len };
+}
+
+export struct ManifestChildInput {
+    min_path: ByteList,
+    max_path: ByteList,
+    child_id: ManifestId,
+    child_hash: Hash32
+}
+
+export struct ManifestChildInputList {
+    ptr: &ManifestChildInput,
+    len: usize
+}
+
+export fn manifest_child_input_list_from_slice(slice: &[ManifestChildInput]) ManifestChildInputList {
+    return ManifestChildInputList{ ptr: slice.ptr, len: slice.len };
+}
+
+fn manifest_trie_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.ManifestAlloc;
+    }
+    return raw[0: len];
+}
+
+fn arena_copy_byte_list(arena: &Arena, value: &ByteList) !ByteList {
+    const out: &[byte] = try manifest_trie_arena_bytes(arena, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn path_segment_count(path: &ByteList) !u16 {
+    var iter: ManifestPathIterator = manifest_path_iterator(path);
+    var segment: ManifestPathSegment = ManifestPathSegment{
+        bytes: ByteList{ ptr: null, len: 0 },
+        index: 0 as usize,
+        start: 0 as usize,
+        end: 0 as usize,
+        is_last: false,
+    };
+    var count: usize = 0;
+    while manifest_path_iterator_next(&iter, &segment) {
+        if count >= 65535 as usize {
+            return error.ManifestPrefixTooDeep;
+        }
+        count = count + 1;
+    }
+    return count as u16;
+}
+
+fn path_has_prefix(path: &ByteList, prefix: &ByteList) bool {
+    if prefix.len == 0 {
+        return true;
+    }
+    if prefix.len > path.len {
+        return false;
+    }
+
+    var i: usize = 0;
+    while i < prefix.len {
+        if path.ptr[i] != prefix.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+
+    if prefix.len == path.len {
+        return true;
+    }
+    return path.ptr[prefix.len] == '/' as byte;
+}
+
+fn path_is_strict_descendant(parent: &ByteList, child: &ByteList) bool {
+    if parent.len == 0 || parent.len >= child.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < parent.len {
+        if parent.ptr[i] != child.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return child.ptr[parent.len] == '/' as byte;
+}
+
+fn path_suffix_after_prefix(path: &ByteList, prefix: &ByteList) !ByteList {
+    if !path_has_prefix(path, prefix) {
+        return error.ManifestLeafPrefixMismatch;
+    }
+    if prefix.len == 0 {
+        if path.len == 0 {
+            return error.ManifestLeafPrefixMismatch;
+        }
+        return ByteList{ ptr: path.ptr, len: path.len };
+    }
+    if path.len <= prefix.len {
+        return error.ManifestLeafPrefixMismatch;
+    }
+
+    const start: usize = prefix.len + 1 as usize;
+    if start >= path.len {
+        return error.ManifestLeafPrefixMismatch;
+    }
+    const suffix: &[byte] = path.ptr[start: path.len - start];
+    if suffix.len == 0 {
+        return error.ManifestLeafPrefixMismatch;
+    }
+    return ByteList{ ptr: suffix.ptr, len: suffix.len };
+}
+
+fn min_usize(left: usize, right: usize) usize {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+fn sort_leaf_indexes(arena: &Arena, inputs: &ManifestLeafInputList) !&usize {
+    const bytes_len: usize = @size_of(usize) as usize * inputs.len;
+    const indexes: &usize = arena_alloc(arena, bytes_len) as &usize;
+    if indexes == null {
+        return error.ManifestAlloc;
+    }
+    const scratch: &usize = arena_alloc(arena, bytes_len) as &usize;
+    if scratch == null {
+        return error.ManifestAlloc;
+    }
+
+    var i: usize = 0;
+    while i < inputs.len {
+        indexes[i] = i;
+        i = i + 1;
+    }
+
+    var width: usize = 1;
+    while width < inputs.len {
+        var start: usize = 0;
+        while start < inputs.len {
+            const mid: usize = min_usize(start + width, inputs.len);
+            const end: usize = min_usize(mid + width, inputs.len);
+
+            var left: usize = start;
+            var right: usize = mid;
+            var out: usize = start;
+            while left < mid && right < end {
+                const left_idx: usize = indexes[left];
+                const right_idx: usize = indexes[right];
+                const cmp: i32 = manifest_path_compare(&inputs.ptr[left_idx].path, &inputs.ptr[right_idx].path);
+                if cmp <= 0 {
+                    scratch[out] = left_idx;
+                    left = left + 1;
+                } else {
+                    scratch[out] = right_idx;
+                    right = right + 1;
+                }
+                out = out + 1;
+            }
+            while left < mid {
+                scratch[out] = indexes[left];
+                left = left + 1;
+                out = out + 1;
+            }
+            while right < end {
+                scratch[out] = indexes[right];
+                right = right + 1;
+                out = out + 1;
+            }
+
+            i = start;
+            while i < end {
+                indexes[i] = scratch[i];
+                i = i + 1;
+            }
+            start = end;
+        }
+        width = width * 2 as usize;
+    }
+
+    return indexes;
+}
+
+fn sort_child_indexes(arena: &Arena, inputs: &ManifestChildInputList) !&usize {
+    const bytes_len: usize = @size_of(usize) as usize * inputs.len;
+    const indexes: &usize = arena_alloc(arena, bytes_len) as &usize;
+    if indexes == null {
+        return error.ManifestAlloc;
+    }
+    const scratch: &usize = arena_alloc(arena, bytes_len) as &usize;
+    if scratch == null {
+        return error.ManifestAlloc;
+    }
+
+    var i: usize = 0;
+    while i < inputs.len {
+        indexes[i] = i;
+        i = i + 1;
+    }
+
+    var width: usize = 1;
+    while width < inputs.len {
+        var start: usize = 0;
+        while start < inputs.len {
+            const mid: usize = min_usize(start + width, inputs.len);
+            const end: usize = min_usize(mid + width, inputs.len);
+
+            var left: usize = start;
+            var right: usize = mid;
+            var out: usize = start;
+            while left < mid && right < end {
+                const left_idx: usize = indexes[left];
+                const right_idx: usize = indexes[right];
+                const cmp: i32 = manifest_path_compare(&inputs.ptr[left_idx].min_path, &inputs.ptr[right_idx].min_path);
+                if cmp <= 0 {
+                    scratch[out] = left_idx;
+                    left = left + 1;
+                } else {
+                    scratch[out] = right_idx;
+                    right = right + 1;
+                }
+                out = out + 1;
+            }
+            while left < mid {
+                scratch[out] = indexes[left];
+                left = left + 1;
+                out = out + 1;
+            }
+            while right < end {
+                scratch[out] = indexes[right];
+                right = right + 1;
+                out = out + 1;
+            }
+
+            i = start;
+            while i < end {
+                indexes[i] = scratch[i];
+                i = i + 1;
+            }
+            start = end;
+        }
+        width = width * 2 as usize;
+    }
+
+    return indexes;
+}
+
+export fn manifest_leaf_build(arena: &Arena, prefix: &ByteList, inputs: ManifestLeafInputList) !ManifestNodePayload {
+    if inputs.len == 0 {
+        return error.ManifestEmptyLeaf;
+    }
+
+    const copied_prefix: ByteList = try arena_copy_byte_list(arena, prefix);
+    const level: u16 = try path_segment_count(prefix);
+    const sorted_indexes: &usize = try sort_leaf_indexes(arena, &inputs);
+    const raw_entries: &ManifestEntry = arena_alloc(arena, @size_of(ManifestEntry) as usize * inputs.len) as &ManifestEntry;
+    if raw_entries == null {
+        return error.ManifestAlloc;
+    }
+
+    var previous_path: ByteList = ByteList{ ptr: null, len: 0 };
+    var i: usize = 0;
+    while i < inputs.len {
+        const input_index: usize = sorted_indexes[i];
+        const input: &ManifestLeafInputEntry = &inputs.ptr[input_index];
+        const suffix: ByteList = try path_suffix_after_prefix(&input.path, prefix);
+
+        if i > 0 {
+            const cmp: i32 = manifest_path_compare(&previous_path, &input.path);
+            if cmp == 0 {
+                return error.ManifestLeafDuplicatePath;
+            }
+            if path_is_strict_descendant(&previous_path, &input.path) {
+                return error.ManifestFileDirectoryConflict;
+            }
+        }
+
+        raw_entries[i] = ManifestEntry{
+            name: try arena_copy_byte_list(arena, &suffix),
+            kind: input.kind,
+            mode: input.mode,
+            object_id: input.object_id,
+            logical_size: input.logical_size,
+            content_type: input.content_type,
+            policy_id: input.policy_id,
+        };
+        previous_path = ByteList{ ptr: input.path.ptr, len: input.path.len };
+        i = i + 1;
+    }
+
+    const payload: ManifestNodePayload = ManifestNodePayload{
+        prefix: PathPrefix{ bytes: copied_prefix },
+        level: level,
+        entry_count: inputs.len as u32,
+        child_count: 0 as u32,
+        entries: manifest_entry_list_from_slice(raw_entries[0: inputs.len]),
+        children: ManifestChildList{ ptr: null, len: 0 },
+    };
+    try validate_manifest_node_payload(&payload);
+    return payload;
+}
+
+export fn manifest_internal_build(arena: &Arena, prefix: &ByteList, direct_entries: ManifestLeafInputList, child_inputs: ManifestChildInputList) !ManifestNodePayload {
+    if child_inputs.len == 0 {
+        return error.ManifestEmptyInternal;
+    }
+
+    const copied_prefix: ByteList = try arena_copy_byte_list(arena, prefix);
+    const level: u16 = try path_segment_count(prefix);
+    const entry_indexes: &usize = try sort_leaf_indexes(arena, &direct_entries);
+    const child_indexes: &usize = try sort_child_indexes(arena, &child_inputs);
+
+    var entry_alloc_count: usize = direct_entries.len;
+    if entry_alloc_count == 0 {
+        entry_alloc_count = 1 as usize;
+    }
+    const raw_entries: &ManifestEntry = arena_alloc(arena, @size_of(ManifestEntry) as usize * entry_alloc_count) as &ManifestEntry;
+    if raw_entries == null {
+        return error.ManifestAlloc;
+    }
+
+    const raw_children: &ManifestChild = arena_alloc(arena, @size_of(ManifestChild) as usize * child_inputs.len) as &ManifestChild;
+    if raw_children == null {
+        return error.ManifestAlloc;
+    }
+
+    var previous_entry_path: ByteList = ByteList{ ptr: null, len: 0 };
+    var i: usize = 0;
+    while i < direct_entries.len {
+        const input_index: usize = entry_indexes[i];
+        const input: &ManifestLeafInputEntry = &direct_entries.ptr[input_index];
+        const suffix: ByteList = path_suffix_after_prefix(&input.path, prefix) catch {
+            return error.ManifestInternalPrefixMismatch;
+        };
+        if try path_segment_count(&suffix) != 1 as u16 {
+            return error.ManifestInternalEntryNotDirect;
+        }
+
+        if i > 0 {
+            const cmp: i32 = manifest_path_compare(&previous_entry_path, &input.path);
+            if cmp == 0 {
+                return error.ManifestInternalDuplicateEntry;
+            }
+        }
+
+        raw_entries[i] = ManifestEntry{
+            name: try arena_copy_byte_list(arena, &suffix),
+            kind: input.kind,
+            mode: input.mode,
+            object_id: input.object_id,
+            logical_size: input.logical_size,
+            content_type: input.content_type,
+            policy_id: input.policy_id,
+        };
+        previous_entry_path = ByteList{ ptr: input.path.ptr, len: input.path.len };
+        i = i + 1;
+    }
+
+    var previous_child_max_path: ByteList = ByteList{ ptr: null, len: 0 };
+    i = 0;
+    while i < child_inputs.len {
+        const child_index: usize = child_indexes[i];
+        const child: &ManifestChildInput = &child_inputs.ptr[child_index];
+        const min_suffix: ByteList = path_suffix_after_prefix(&child.min_path, prefix) catch {
+            return error.ManifestInternalPrefixMismatch;
+        };
+        const max_suffix: ByteList = path_suffix_after_prefix(&child.max_path, prefix) catch {
+            return error.ManifestInternalPrefixMismatch;
+        };
+        if manifest_path_compare(&child.min_path, &child.max_path) > 0 {
+            return error.ManifestChildRangeInvalid;
+        }
+        if i > 0 && manifest_path_compare(&previous_child_max_path, &child.min_path) >= 0 {
+            return error.ManifestChildRangeOverlap;
+        }
+
+        raw_children[i] = ManifestChild{
+            min_name: try arena_copy_byte_list(arena, &min_suffix),
+            max_name: try arena_copy_byte_list(arena, &max_suffix),
+            child_id: child.child_id,
+            child_hash: child.child_hash,
+        };
+        previous_child_max_path = ByteList{ ptr: child.max_path.ptr, len: child.max_path.len };
+        i = i + 1;
+    }
+
+    var entry_pos: usize = 0;
+    var child_pos: usize = 0;
+    while entry_pos < direct_entries.len && child_pos < child_inputs.len {
+        const entry_input: &ManifestLeafInputEntry = &direct_entries.ptr[entry_indexes[entry_pos]];
+        const child_input: &ManifestChildInput = &child_inputs.ptr[child_indexes[child_pos]];
+        if path_is_strict_descendant(&entry_input.path, &child_input.min_path) {
+            return error.ManifestFileDirectoryConflict;
+        }
+
+        const before_min: i32 = manifest_path_compare(&entry_input.path, &child_input.min_path);
+        if before_min < 0 {
+            entry_pos = entry_pos + 1;
+            continue;
+        }
+
+        const before_or_equal_max: i32 = manifest_path_compare(&entry_input.path, &child_input.max_path);
+        if before_or_equal_max <= 0 {
+            return error.ManifestFileDirectoryConflict;
+        }
+        child_pos = child_pos + 1;
+    }
+
+    const payload: ManifestNodePayload = ManifestNodePayload{
+        prefix: PathPrefix{ bytes: copied_prefix },
+        level: level,
+        entry_count: direct_entries.len as u32,
+        child_count: child_inputs.len as u32,
+        entries: manifest_entry_list_from_slice(raw_entries[0: direct_entries.len]),
+        children: manifest_child_list_from_slice(raw_children[0: child_inputs.len]),
+    };
+    try validate_manifest_node_payload(&payload);
+    return payload;
+}

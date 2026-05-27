@@ -1,0 +1,334 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.manifest_id_from_object;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ManifestNodePayload;
+use manifest.path.manifest_path_normalize;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestChildInput;
+use manifest.trie.manifest_leaf_build;
+use manifest.trie.manifest_internal_build;
+use manifest.trie.manifest_child_input_list_from_slice;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1;
+    }
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn make_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(make_hash(seed));
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(make_object_id(seed));
+}
+
+fn make_manifest_id(seed: byte) ManifestId {
+    return manifest_id_from_object(make_object_id(seed));
+}
+
+fn normalize_literal(arena: &Arena, text: &const byte) !ByteList {
+    return try manifest_path_normalize(arena, literal_bytes(text));
+}
+
+fn make_leaf_input(arena: &Arena, text: &const byte, seed: byte) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try normalize_literal(arena, text),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id(seed),
+        logical_size: seed as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id(seed + 32 as byte),
+    };
+}
+
+fn make_child_input(arena: &Arena, min_text: &const byte, max_text: &const byte, seed: byte) !ManifestChildInput {
+    return ManifestChildInput{
+        min_path: try normalize_literal(arena, min_text),
+        max_path: try normalize_literal(arena, max_text),
+        child_id: make_manifest_id(seed),
+        child_hash: make_hash(seed + 40 as byte),
+    };
+}
+
+fn expect_leaf_error(prefix: &ByteList, inputs: &[ManifestLeafInputEntry], expected_error_id: u32) !void {
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const payload: ManifestNodePayload = manifest_leaf_build(&build_arena, prefix, manifest_leaf_input_list_from_slice(inputs)) catch |err| {
+        try expect(@error_id(err) == expected_error_id);
+        return;
+    };
+    _ = payload;
+    return error.AssertionFailed;
+}
+
+fn expect_internal_error(prefix: &ByteList, direct_entries: &[ManifestLeafInputEntry], child_inputs: &[ManifestChildInput], expected_error_id: u32) !void {
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const payload: ManifestNodePayload = manifest_internal_build(
+        &build_arena,
+        prefix,
+        manifest_leaf_input_list_from_slice(direct_entries),
+        manifest_child_input_list_from_slice(child_inputs),
+    ) catch |err| {
+        try expect(@error_id(err) == expected_error_id);
+        return;
+    };
+    _ = payload;
+    return error.AssertionFailed;
+}
+
+fn test_manifest_leaf_build_root_prefix_and_segment_sort() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const input0: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "a.b", 1 as byte);
+    const input1: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "a/c", 2 as byte);
+    const input2: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "a/b", 3 as byte);
+    var inputs: [ManifestLeafInputEntry: 3] = [input0, input1, input2];
+    const root_prefix: ByteList = try normalize_literal(&build_arena, "");
+
+    const payload: ManifestNodePayload = try manifest_leaf_build(
+        &build_arena,
+        &root_prefix,
+        manifest_leaf_input_list_from_slice(inputs[0: 3]),
+    );
+    try expect(payload.level == 0 as u16);
+    try expect(payload.entry_count == 3u32);
+    try expect(payload.child_count == 0u32);
+    try expect(payload.prefix.bytes.len == 0 as usize);
+
+    try expect_byte_list_eq(payload.entries.ptr[0].name, literal_bytes("a/b"));
+    try expect_byte_list_eq(payload.entries.ptr[1].name, literal_bytes("a/c"));
+    try expect_byte_list_eq(payload.entries.ptr[2].name, literal_bytes("a.b"));
+}
+
+fn test_manifest_leaf_build_strips_prefix_and_computes_level() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "src/backend");
+    const input0: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/backend/util/str.uya", 10 as byte);
+    const input1: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/backend/auth/login.uya", 11 as byte);
+    var inputs: [ManifestLeafInputEntry: 2] = [input0, input1];
+
+    const payload: ManifestNodePayload = try manifest_leaf_build(&build_arena, &prefix, manifest_leaf_input_list_from_slice(inputs[0: 2]));
+    try expect(payload.level == 2 as u16);
+    try expect(payload.entry_count == 2u32);
+    try expect_byte_list_eq(payload.prefix.bytes, literal_bytes("src/backend"));
+    try expect_byte_list_eq(payload.entries.ptr[0].name, literal_bytes("auth/login.uya"));
+    try expect_byte_list_eq(payload.entries.ptr[1].name, literal_bytes("util/str.uya"));
+}
+
+fn test_manifest_leaf_rejects_empty_input() !void {
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "");
+    const dummy: ManifestLeafInputEntry = ManifestLeafInputEntry{
+        path: ByteList{ ptr: prefix.ptr, len: prefix.len },
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id(90 as byte),
+        logical_size: 0u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id(91 as byte),
+    };
+    var inputs: [ManifestLeafInputEntry: 1] = [dummy];
+    try expect_leaf_error(&prefix, inputs[0: 0], @error_id(error.ManifestEmptyLeaf));
+}
+
+fn test_manifest_leaf_rejects_prefix_mismatch_and_empty_suffix() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "src/backend");
+    const outside: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/frontend/main.uya", 20 as byte);
+    var outside_inputs: [ManifestLeafInputEntry: 1] = [outside];
+    try expect_leaf_error(&prefix, outside_inputs[0: 1], @error_id(error.ManifestLeafPrefixMismatch));
+
+    const equal_path: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/backend", 21 as byte);
+    var equal_inputs: [ManifestLeafInputEntry: 1] = [equal_path];
+    try expect_leaf_error(&prefix, equal_inputs[0: 1], @error_id(error.ManifestLeafPrefixMismatch));
+}
+
+fn test_manifest_leaf_rejects_duplicate_and_file_dir_conflict() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "src");
+    const dup0: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/app/main.uya", 30 as byte);
+    const dup1: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/app/main.uya", 31 as byte);
+    var dup_inputs: [ManifestLeafInputEntry: 2] = [dup0, dup1];
+    try expect_leaf_error(&prefix, dup_inputs[0: 2], @error_id(error.ManifestLeafDuplicatePath));
+
+    const file_path: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/app", 32 as byte);
+    const nested_path: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/app/main.uya", 33 as byte);
+    var conflict_inputs: [ManifestLeafInputEntry: 2] = [file_path, nested_path];
+    try expect_leaf_error(&prefix, conflict_inputs[0: 2], @error_id(error.ManifestFileDirectoryConflict));
+}
+
+fn test_manifest_internal_build_mixes_direct_entries_and_children() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "");
+    const direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "README.md", 40 as byte);
+    var direct_entries: [ManifestLeafInputEntry: 1] = [direct];
+    const child0: ManifestChildInput = try make_child_input(&input_arena, "tests/a.uya", "tests/z.uya", 41 as byte);
+    const child1: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/z.uya", 42 as byte);
+    var children: [ManifestChildInput: 2] = [child0, child1];
+
+    const payload: ManifestNodePayload = try manifest_internal_build(
+        &build_arena,
+        &prefix,
+        manifest_leaf_input_list_from_slice(direct_entries[0: 1]),
+        manifest_child_input_list_from_slice(children[0: 2]),
+    );
+    try expect(payload.level == 0 as u16);
+    try expect(payload.entry_count == 1u32);
+    try expect(payload.child_count == 2u32);
+    try expect_byte_list_eq(payload.entries.ptr[0].name, literal_bytes("README.md"));
+    try expect_byte_list_eq(payload.children.ptr[0].min_name, literal_bytes("src/a.uya"));
+    try expect_byte_list_eq(payload.children.ptr[0].max_name, literal_bytes("src/z.uya"));
+    try expect_byte_list_eq(payload.children.ptr[1].min_name, literal_bytes("tests/a.uya"));
+    try expect_byte_list_eq(payload.children.ptr[1].max_name, literal_bytes("tests/z.uya"));
+}
+
+fn test_manifest_internal_build_strips_prefix() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "src");
+    const direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/main.uya", 50 as byte);
+    var direct_entries: [ManifestLeafInputEntry: 1] = [direct];
+    const child: ManifestChildInput = try make_child_input(&input_arena, "src/lib/a.uya", "src/lib/z.uya", 51 as byte);
+    var children: [ManifestChildInput: 1] = [child];
+
+    const payload: ManifestNodePayload = try manifest_internal_build(
+        &build_arena,
+        &prefix,
+        manifest_leaf_input_list_from_slice(direct_entries[0: 1]),
+        manifest_child_input_list_from_slice(children[0: 1]),
+    );
+    try expect(payload.level == 1 as u16);
+    try expect_byte_list_eq(payload.prefix.bytes, literal_bytes("src"));
+    try expect_byte_list_eq(payload.entries.ptr[0].name, literal_bytes("main.uya"));
+    try expect_byte_list_eq(payload.children.ptr[0].min_name, literal_bytes("lib/a.uya"));
+    try expect_byte_list_eq(payload.children.ptr[0].max_name, literal_bytes("lib/z.uya"));
+}
+
+fn test_manifest_internal_rejects_invalid_layouts() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "src");
+    const direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/main.uya", 60 as byte);
+    var direct_entries: [ManifestLeafInputEntry: 1] = [direct];
+    var empty_children: [ManifestChildInput: 1] = [try make_child_input(&input_arena, "src/a", "src/b", 61 as byte)];
+    try expect_internal_error(&prefix, direct_entries[0: 0], empty_children[0: 0], @error_id(error.ManifestEmptyInternal));
+
+    const bad_direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/lib/util.uya", 62 as byte);
+    var bad_direct_entries: [ManifestLeafInputEntry: 1] = [bad_direct];
+    var one_child: [ManifestChildInput: 1] = [try make_child_input(&input_arena, "src/lib/a.uya", "src/lib/z.uya", 63 as byte)];
+    try expect_internal_error(&prefix, bad_direct_entries[0: 1], one_child[0: 1], @error_id(error.ManifestInternalEntryNotDirect));
+
+    const overlap_child0: ManifestChildInput = try make_child_input(&input_arena, "src/lib/a.uya", "src/lib/m.uya", 64 as byte);
+    const overlap_child1: ManifestChildInput = try make_child_input(&input_arena, "src/lib/h.uya", "src/lib/z.uya", 65 as byte);
+    var overlap_children: [ManifestChildInput: 2] = [overlap_child0, overlap_child1];
+    try expect_internal_error(&prefix, direct_entries[0: 0], overlap_children[0: 2], @error_id(error.ManifestChildRangeOverlap));
+
+    const conflict_direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/lib", 66 as byte);
+    var conflict_direct_entries: [ManifestLeafInputEntry: 1] = [conflict_direct];
+    const conflict_child: ManifestChildInput = try make_child_input(&input_arena, "src/lib/a.uya", "src/lib/z.uya", 67 as byte);
+    var conflict_children: [ManifestChildInput: 1] = [conflict_child];
+    try expect_internal_error(&prefix, conflict_direct_entries[0: 1], conflict_children[0: 1], @error_id(error.ManifestFileDirectoryConflict));
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Manifest Trie Tests");
+    run_test("manifest leaf build root prefix and segment sort", test_manifest_leaf_build_root_prefix_and_segment_sort);
+    run_test("manifest leaf build strips prefix and computes level", test_manifest_leaf_build_strips_prefix_and_computes_level);
+    run_test("manifest leaf rejects empty input", test_manifest_leaf_rejects_empty_input);
+    run_test("manifest leaf rejects prefix mismatch and empty suffix", test_manifest_leaf_rejects_prefix_mismatch_and_empty_suffix);
+    run_test("manifest leaf rejects duplicate and file dir conflict", test_manifest_leaf_rejects_duplicate_and_file_dir_conflict);
+    run_test("manifest internal build mixes direct entries and children", test_manifest_internal_build_mixes_direct_entries_and_children);
+    run_test("manifest internal build strips prefix", test_manifest_internal_build_strips_prefix);
+    run_test("manifest internal rejects invalid layouts", test_manifest_internal_rejects_invalid_layouts);
+    return test_suite_end();
+}

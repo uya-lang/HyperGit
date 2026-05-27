@@ -139,16 +139,16 @@
 
 ## 8. Manifest
 
-- [ ] 实现 path normalization。
-- [ ] 实现 path segment iterator。
-- [ ] 实现 path byte order comparator。
-- [ ] 实现 manifest leaf builder。
-- [ ] 实现 manifest internal node builder。
-- [ ] 实现 shard split。
-- [ ] 实现 shard lookup by path。
-- [ ] 实现 pathspec matcher。
-- [ ] 实现 manifest range query。
-- [ ] 实现 manifest hash skip。
+- [x] 实现 path normalization。
+- [x] 实现 path segment iterator。
+- [x] 实现 path byte order comparator。
+- [x] 实现 manifest leaf builder。
+- [x] 实现 manifest internal node builder。
+- [x] 实现 shard split。
+- [x] 实现 shard lookup by path。
+- [x] 实现 pathspec matcher。
+- [x] 实现 manifest range query。
+- [x] 实现 manifest hash skip。
 - [ ] 实现 manifest diff。
 - [ ] 测试百万路径 synthetic builder。
 - [ ] 测试同 hash shard diff 跳过。

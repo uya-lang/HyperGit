@@ -1,6 +1,7 @@
 use core.codec.codec_hash_payload;
 use core.ids.Hash32;
 use core.ids.hash32_compare;
+use manifest.path.manifest_path_compare;
 use object.types.ByteList;
 use object.types.Identity;
 use object.types.CommitPayload;
@@ -26,32 +27,6 @@ error ObjectSmallBlobHashMismatch;
 error ObjectInvalidChunkRef;
 error ObjectChunkCountMismatch;
 error ObjectChunkSizeMismatch;
-
-fn byte_list_compare(left: ByteList, right: ByteList) i32 {
-    var i: usize = 0;
-    var limit: usize = left.len;
-    if right.len < limit {
-        limit = right.len;
-    }
-
-    while i < limit {
-        if left.ptr[i] < right.ptr[i] {
-            return -1;
-        }
-        if left.ptr[i] > right.ptr[i] {
-            return 1;
-        }
-        i = i + 1;
-    }
-
-    if left.len < right.len {
-        return -1;
-    }
-    if left.len > right.len {
-        return 1;
-    }
-    return 0;
-}
 
 fn byte_list_contains(value: ByteList, needle: byte) bool {
     var i: usize = 0;
@@ -94,7 +69,7 @@ export fn validate_manifest_child(child: &ManifestChild) !void {
     if child.min_name.len == 0 || child.max_name.len == 0 {
         return error.ObjectInvalidManifestChild;
     }
-    if byte_list_compare(child.min_name, child.max_name) > 0 {
+    if manifest_path_compare(&child.min_name, &child.max_name) > 0 {
         return error.ObjectInvalidManifestChild;
     }
 }
@@ -110,7 +85,7 @@ export fn validate_manifest_node_payload(payload: &ManifestNodePayload) !void {
     var i: usize = 0;
     while i < payload.entries.len {
         try validate_manifest_entry(&payload.entries.ptr[i]);
-        if i > 0 && byte_list_compare(payload.entries.ptr[i - 1].name, payload.entries.ptr[i].name) >= 0 {
+        if i > 0 && manifest_path_compare(&payload.entries.ptr[i - 1].name, &payload.entries.ptr[i].name) >= 0 {
             return error.ObjectManifestEntryOrder;
         }
         i = i + 1;
@@ -120,10 +95,10 @@ export fn validate_manifest_node_payload(payload: &ManifestNodePayload) !void {
     while i < payload.children.len {
         try validate_manifest_child(&payload.children.ptr[i]);
         if i > 0 {
-            if byte_list_compare(payload.children.ptr[i - 1].min_name, payload.children.ptr[i].min_name) >= 0 {
+            if manifest_path_compare(&payload.children.ptr[i - 1].min_name, &payload.children.ptr[i].min_name) >= 0 {
                 return error.ObjectManifestChildOrder;
             }
-            if byte_list_compare(payload.children.ptr[i - 1].max_name, payload.children.ptr[i].min_name) >= 0 {
+            if manifest_path_compare(&payload.children.ptr[i - 1].max_name, &payload.children.ptr[i].min_name) >= 0 {
                 return error.ObjectManifestChildOverlap;
             }
         }
