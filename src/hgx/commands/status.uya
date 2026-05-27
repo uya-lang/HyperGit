@@ -1,0 +1,126 @@
+use libc.Stat;
+use libc.errno;
+use libc.fprintf;
+use libc.stat;
+use libc.stderr;
+use libc.stdout;
+use libc.EACCES;
+use libc.EPERM;
+
+use cli.EXIT_NOT_IMPLEMENTED;
+use cli.EXIT_OK;
+use cli.EXIT_RUNTIME_ERROR;
+use store.repo_layout.HGIT_REFS_HEADS_REL;
+use store.repo_layout.REPO_PATH_MAX;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_read_config;
+use store.repo_layout.repo_path_cstr;
+
+export const STATUS_EMPTY_TEXT: &const byte = "On branch %s\n\nNo commits yet\n\nnothing to commit\n";
+export const STATUS_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
+export const STATUS_PERMISSION_TEXT: &const byte = "error: permission denied while reading repository status\n";
+export const STATUS_ROOT_FAILURE_TEXT: &const byte = "error: failed to locate repository root\n";
+export const STATUS_CONFIG_FAILURE_TEXT: &const byte = "error: failed to read repository config\n";
+export const STATUS_HEAD_FAILURE_TEXT: &const byte = "error: failed to inspect repository head\n";
+export const STATUS_NONEMPTY_TEXT: &const byte = "error: 'status' beyond an empty repository is not implemented yet\n";
+
+fn status_errno_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn status_path_copy_bytes(path: &RepoPath, out: &RepoPath, limit: usize) void {
+    var i: usize = 0;
+    while i < limit {
+        out.bytes[i] = path.bytes[i];
+        i = i + 1;
+    }
+}
+
+fn status_head_ref_path(root: &RepoPath, config: &RepoConfig) !RepoPath {
+    var out: RepoPath = RepoPath{ bytes: [], len: 0 };
+    status_path_copy_bytes(root, &out, root.len);
+    var pos: usize = root.len;
+
+    if pos > 0 {
+        const last_index: usize = pos - 1 as usize;
+        if last_index >= REPO_PATH_MAX {
+            return error.RepoPathTooLong;
+        }
+        if out.bytes[last_index] != '/' as byte {
+            if pos + 1 as usize >= REPO_PATH_MAX {
+                return error.RepoPathTooLong;
+            }
+            out.bytes[pos] = '/' as byte;
+            pos = pos + 1 as usize;
+        }
+    }
+
+    const refs_len: usize = 16 as usize;
+    if pos + refs_len + 1 as usize + config.default_branch_len >= REPO_PATH_MAX {
+        return error.RepoPathTooLong;
+    }
+
+    var i: usize = 0;
+    while i < refs_len {
+        out.bytes[pos + i] = HGIT_REFS_HEADS_REL[i];
+        i = i + 1;
+    }
+    pos = pos + refs_len;
+    out.bytes[pos] = '/' as byte;
+    pos = pos + 1 as usize;
+
+    i = 0;
+    while i < config.default_branch_len {
+        out.bytes[pos + i] = config.default_branch[i];
+        i = i + 1;
+    }
+    pos = pos + config.default_branch_len;
+    out.bytes[pos] = 0 as byte;
+    out.len = pos;
+    return out;
+}
+
+fn status_head_ref_exists(root: &RepoPath, config: &RepoConfig) !bool {
+    const head_path: RepoPath = try status_head_ref_path(root, config);
+    var st: Stat = Stat{};
+    return stat(repo_path_cstr(&head_path) as &const byte, &st) == 0;
+}
+
+export fn run_status() i32 {
+    const root: RepoPath = repo_find_root_from_cwd() catch |err| {
+        if @error_id(err) == @error_id(error.RepoNotFound) {
+            fprintf(stderr, "%s" as *byte, STATUS_NOT_REPO_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, STATUS_ROOT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const config: RepoConfig = repo_read_config(&root) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, STATUS_CONFIG_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const has_head: bool = status_head_ref_exists(&root, &config) catch |err| {
+        fprintf(stderr, "%s" as *byte, STATUS_HEAD_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    if has_head {
+        fprintf(stderr, "%s" as *byte, STATUS_NONEMPTY_TEXT);
+        return EXIT_NOT_IMPLEMENTED;
+    }
+
+    fprintf(stdout, STATUS_EMPTY_TEXT as *byte, &config.default_branch[0]);
+    return EXIT_OK;
+}

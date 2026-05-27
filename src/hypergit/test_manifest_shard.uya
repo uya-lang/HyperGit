@@ -8,6 +8,8 @@ use std.mem.arena.arena_alloc;
 use std.mem.arena.arena_init;
 use std.string.strlen;
 
+use libc.free;
+use libc.malloc;
 use core.ids.Hash32;
 use core.ids.ManifestId;
 use core.ids.ObjectId;
@@ -29,6 +31,7 @@ use manifest.trie.manifest_leaf_input_list_from_slice;
 use object.types.ByteList;
 use object.types.ContentType;
 use object.types.EntryKind;
+use object.types.ManifestEntry;
 use object.types.ManifestNodePayload;
 
 fn literal_bytes(text: &const byte) &[byte] {
@@ -95,9 +98,44 @@ fn make_zero_padded_bytes(arena: &Arena, prefix: &const byte, value: usize, suff
     return ByteList{ ptr: out.ptr, len: prefix_len + 4 as usize + suffix_len };
 }
 
+fn make_decimal_padded_bytes(arena: &Arena, prefix: &const byte, value: usize, digits: usize) !ByteList {
+    const prefix_len: usize = strlen(prefix);
+    const raw: &byte = arena_alloc(arena, prefix_len + digits);
+    if raw == null {
+        return error.ManifestAlloc;
+    }
+    const out: &[byte] = raw[0: prefix_len + digits];
+    var i: usize = 0;
+    while i < prefix_len {
+        out.ptr[i] = prefix[i];
+        i = i + 1;
+    }
+
+    var remaining: usize = value;
+    var pos: usize = prefix_len + digits;
+    while pos > prefix_len {
+        pos = pos - 1 as usize;
+        out.ptr[pos] = ('0' as byte) + (remaining % 10 as usize) as byte;
+        remaining = remaining / 10 as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: prefix_len + digits };
+}
+
 fn make_generated_leaf_input(arena: &Arena, index: usize) !ManifestLeafInputEntry {
     return ManifestLeafInputEntry{
         path: try make_zero_padded_bytes(arena, "f", index, ".uya"),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id((index % 200 as usize) as byte),
+        logical_size: index as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id((index % 200 as usize) as byte + 20 as byte),
+    };
+}
+
+fn make_generated_million_leaf_input(arena: &Arena, index: usize) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try make_decimal_padded_bytes(arena, "f", index, 6 as usize),
         kind: EntryKind.File,
         mode: 33188u32,
         object_id: make_object_id((index % 200 as usize) as byte),
@@ -222,9 +260,60 @@ fn test_manifest_shard_split_internal_by_child_threshold() !void {
     try expect(total_seen == total_children);
 }
 
+fn test_manifest_leaf_build_million_synthetic_paths() !void {
+    const total_entries: usize = 1000000 as usize;
+    const path_bytes: usize = total_entries * 7 as usize;
+    const input_bytes: usize = @size_of(ManifestLeafInputEntry) as usize * total_entries + path_bytes + 1048576 as usize;
+    const build_bytes: usize = @size_of(ManifestEntry) as usize * total_entries +
+        @size_of(usize) as usize * total_entries * 2 as usize +
+        path_bytes +
+        1048576 as usize;
+
+    const input_storage: &byte = malloc(input_bytes) as &byte;
+    if input_storage == null {
+        return error.ManifestAlloc;
+    }
+    defer {
+        free(input_storage as &void);
+    }
+
+    var input_arena: Arena = Arena{ buffer: input_storage, size: 0, used: 0 };
+    arena_init(&input_arena, input_storage, input_bytes);
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(&input_arena, @size_of(ManifestLeafInputEntry) as usize * total_entries) as &ManifestLeafInputEntry;
+    if raw_inputs == null {
+        return error.ManifestAlloc;
+    }
+
+    var i: usize = 0;
+    while i < total_entries {
+        raw_inputs[i] = try make_generated_million_leaf_input(&input_arena, i);
+        i = i + 1;
+    }
+
+    const build_storage: &byte = malloc(build_bytes) as &byte;
+    if build_storage == null {
+        return error.ManifestAlloc;
+    }
+    defer {
+        free(build_storage as &void);
+    }
+
+    var build_arena: Arena = Arena{ buffer: build_storage, size: 0, used: 0 };
+    arena_init(&build_arena, build_storage, build_bytes);
+    const prefix: ByteList = try normalize_literal(&build_arena, "");
+    const payload: ManifestNodePayload = try manifest_leaf_build(&build_arena, &prefix, manifest_leaf_input_list_from_slice(raw_inputs[0: total_entries]));
+
+    try expect(payload.entries.len == total_entries);
+    try expect(payload.children.len == 0 as usize);
+    try expect(manifest_shard_needs_split(&payload));
+    try expect_byte_list_eq(payload.entries.ptr[0].name, literal_bytes("f000000"));
+    try expect_byte_list_eq(payload.entries.ptr[total_entries - 1 as usize].name, literal_bytes("f999999"));
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Manifest Shard Tests");
     run_test("manifest shard split leaf by entry threshold", test_manifest_shard_split_leaf_by_entry_threshold);
     run_test("manifest shard split internal by child threshold", test_manifest_shard_split_internal_by_child_threshold);
+    run_test("manifest leaf build million synthetic paths", test_manifest_leaf_build_million_synthetic_paths);
     return test_suite_end();
 }

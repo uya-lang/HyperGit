@@ -1,2 +1,2 @@
-error: unknown command 'status'
+error: unknown command 'bogus'
 run 'hgx --help' for usage.

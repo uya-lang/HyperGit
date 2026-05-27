@@ -320,6 +320,23 @@ fn test_manifest_internal_rejects_invalid_layouts() !void {
     try expect_internal_error(&prefix, conflict_direct_entries[0: 1], conflict_children[0: 1], @error_id(error.ManifestFileDirectoryConflict));
 }
 
+fn test_manifest_internal_rejects_direct_entry_inside_child_range() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var build_arena_buf: [byte: 8192] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 8192 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "src");
+    const direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/m.uya", 80 as byte);
+    var direct_entries: [ManifestLeafInputEntry: 1] = [direct];
+    const child: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/z.uya", 81 as byte);
+    var children: [ManifestChildInput: 1] = [child];
+    try expect_internal_error(&prefix, direct_entries[0: 1], children[0: 1], @error_id(error.ManifestFileDirectoryConflict));
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Manifest Trie Tests");
     run_test("manifest leaf build root prefix and segment sort", test_manifest_leaf_build_root_prefix_and_segment_sort);
@@ -330,5 +347,6 @@ export fn main() i32 {
     run_test("manifest internal build mixes direct entries and children", test_manifest_internal_build_mixes_direct_entries_and_children);
     run_test("manifest internal build strips prefix", test_manifest_internal_build_strips_prefix);
     run_test("manifest internal rejects invalid layouts", test_manifest_internal_rejects_invalid_layouts);
+    run_test("manifest internal rejects direct entry inside child range", test_manifest_internal_rejects_direct_entry_inside_child_range);
     return test_suite_end();
 }

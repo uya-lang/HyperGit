@@ -38,6 +38,12 @@ fn test_doctor_placeholder() !void {
     try assert_eq_i32(plan.exit_code, EXIT_NOT_IMPLEMENTED);
 }
 
+fn test_status_command() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "status");
+    try expect(plan.action == DispatchAction.Status);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
+}
+
 fn test_init_placeholder() !void {
     const plan: DispatchPlan = plan_from_first_arg(2, "init");
     try expect(plan.action == DispatchAction.Init);
@@ -45,10 +51,10 @@ fn test_init_placeholder() !void {
 }
 
 fn test_unknown_command() !void {
-    const plan: DispatchPlan = plan_from_first_arg(2, "status");
+    const plan: DispatchPlan = plan_from_first_arg(2, "bogus");
     try expect(plan.action == DispatchAction.Unknown);
     try assert_eq_i32(plan.exit_code, EXIT_USAGE_ERROR);
-    try expect(strcmp(plan.subject as &const byte, "status") == 0);
+    try expect(strcmp(plan.subject as &const byte, "bogus") == 0);
 }
 
 export fn main() i32 {
@@ -57,6 +63,7 @@ export fn main() i32 {
     run_test("help flag", test_help_flag);
     run_test("version flag", test_version_flag);
     run_test("doctor placeholder", test_doctor_placeholder);
+    run_test("status command", test_status_command);
     run_test("init placeholder", test_init_placeholder);
     run_test("unknown command", test_unknown_command);
     return test_suite_end();

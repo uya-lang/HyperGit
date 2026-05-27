@@ -35,5 +35,5 @@ run_case() {
     diff -u "$ROOT/$expected_stderr" "$stderr_file"
 }
 
-run_case unknown 2 tests/golden/unknown.stderr status
+run_case unknown 2 tests/golden/unknown.stderr bogus
 run_case doctor 3 tests/golden/doctor.stderr doctor

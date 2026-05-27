@@ -1,0 +1,98 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use libc.system;
+use core.ids.Hash32;
+use core.ids.CommitId;
+use core.ids.ObjectId;
+use core.ids.commit_id_from_object;
+use core.ids.object_id_from_hash;
+use object.types.ByteList;
+use workspace.stage.StageEntry;
+use workspace.stage.StageEntryKind;
+use workspace.stage.StageSnapshot;
+use workspace.stage.StageState;
+use workspace.stage.stage_entry_list_from_slice;
+use workspace.stage.stage_snapshot_init;
+use workspace.stage.stage_state_with_entry_count;
+use workspace.stage_file.stage_file_read;
+use workspace.stage_file.stage_file_write;
+use workspace.stage_file.stage_file_write_empty;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(make_hash(seed));
+}
+
+fn make_commit_id(seed: byte) CommitId {
+    return commit_id_from_object(make_object_id(seed));
+}
+
+fn test_stage_file_write_empty_roundtrip() !void {
+    const setup_status: i32 = system("rm -rf build/stage-file-test && mkdir -p build/stage-file-test");
+    try expect(setup_status == 0);
+
+    try stage_file_write_empty("build/stage-file-test/stage.hgi", 99i64);
+
+    var arena_buf: [byte: 1179648] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1179648 as usize);
+    const snapshot: StageSnapshot = try stage_file_read("build/stage-file-test/stage.hgi", &arena);
+    try expect(snapshot.state.entry_count == 0u64);
+    try expect(snapshot.state.last_update_ms == 99i64);
+    try expect(snapshot.entries.len == 0 as usize);
+}
+
+fn test_stage_file_roundtrip_with_entry() !void {
+    const setup_status: i32 = system("rm -rf build/stage-file-entry && mkdir -p build/stage-file-entry");
+    try expect(setup_status == 0);
+
+    var path_buf: [byte: 12] = ['s' as byte, 'r' as byte, 'c' as byte, '/' as byte, 'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte];
+    const entry: StageEntry = StageEntry{
+        path: ByteList{ ptr: path_buf[0: 12].ptr, len: 12 as usize },
+        kind: StageEntryKind.Modify,
+        base_object: make_object_id(10 as byte),
+        has_staged_object: true,
+        staged_object: make_object_id(11 as byte),
+        file_mode: 33188u32,
+    };
+    var entries: [StageEntry: 1] = [entry];
+    const state: StageState = stage_state_with_entry_count(make_commit_id(9 as byte), 1u64, 1234i64);
+    const snapshot: StageSnapshot = stage_snapshot_init(state, stage_entry_list_from_slice(entries[0: 1]));
+
+    try stage_file_write("build/stage-file-entry/stage.hgi", &snapshot);
+
+    var arena_buf: [byte: 1179648] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1179648 as usize);
+    const decoded: StageSnapshot = try stage_file_read("build/stage-file-entry/stage.hgi", &arena);
+    try expect(decoded.state.entry_count == 1u64);
+    try expect(decoded.state.last_update_ms == 1234i64);
+    try expect(decoded.entries.len == 1 as usize);
+    try expect(decoded.entries.ptr[0].kind == StageEntryKind.Modify);
+    try expect(decoded.entries.ptr[0].path.len == 12 as usize);
+    try expect(decoded.entries.ptr[0].path.ptr[0] == 's' as byte);
+    try expect(decoded.entries.ptr[0].has_staged_object);
+    try expect(decoded.entries.ptr[0].file_mode == 33188u32);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Stage File Tests");
+    run_test("stage file write empty roundtrip", test_stage_file_write_empty_roundtrip);
+    run_test("stage file roundtrip with entry", test_stage_file_roundtrip_with_entry);
+    return test_suite_end();
+}

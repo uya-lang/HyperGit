@@ -276,6 +276,58 @@ fn test_manifest_range_query_filters_child_ranges() !void {
     try expect(result.child_indexes.ptr[0] == 1 as usize);
 }
 
+fn test_manifest_range_query_respects_pathspec_boundaries() !void {
+    var input_arena_buf: [byte: 12288] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 12288 as usize);
+
+    var build_arena_buf: [byte: 12288] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 12288 as usize);
+
+    const prefix: ByteList = try normalize_literal(&build_arena, "src");
+    const direct: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/main.uya", 60 as byte);
+    var directs: [ManifestLeafInputEntry: 1] = [direct];
+    const child0: ManifestChildInput = try make_child_input(&input_arena, "src/lib/a.uya", "src/lib/z.uya", 61 as byte);
+    const child1: ManifestChildInput = try make_child_input(&input_arena, "src/library/a.uya", "src/library/z.uya", 62 as byte);
+    var children: [ManifestChildInput: 2] = [child0, child1];
+    const payload: ManifestNodePayload = try manifest_internal_build(
+        &build_arena,
+        &prefix,
+        manifest_leaf_input_list_from_slice(directs[0: 1]),
+        manifest_child_input_list_from_slice(children[0: 2]),
+    );
+
+    const lib_spec: ByteList = try normalize_literal(&input_arena, "src/lib");
+    var lib_specs: [ByteList: 1] = [lib_spec];
+    var lib_query_buf: [byte: 4096] = [];
+    var lib_query_arena: Arena = Arena{ buffer: &lib_query_buf[0], size: 0, used: 0 };
+    arena_init(&lib_query_arena, &lib_query_buf[0], 4096 as usize);
+    const lib_result: ManifestRangeQueryResult = try manifest_range_query(&lib_query_arena, &payload, manifest_pathspec_list_from_slice(lib_specs[0: 1]));
+    try expect(lib_result.entry_indexes.len == 0 as usize);
+    try expect(lib_result.child_indexes.len == 1 as usize);
+    try expect(lib_result.child_indexes.ptr[0] == 0 as usize);
+
+    const missing_spec: ByteList = try normalize_literal(&input_arena, "src/main");
+    var missing_specs: [ByteList: 1] = [missing_spec];
+    var missing_query_buf: [byte: 4096] = [];
+    var missing_query_arena: Arena = Arena{ buffer: &missing_query_buf[0], size: 0, used: 0 };
+    arena_init(&missing_query_arena, &missing_query_buf[0], 4096 as usize);
+    const missing_result: ManifestRangeQueryResult = try manifest_range_query(&missing_query_arena, &payload, manifest_pathspec_list_from_slice(missing_specs[0: 1]));
+    try expect(missing_result.entry_indexes.len == 0 as usize);
+    try expect(missing_result.child_indexes.len == 0 as usize);
+
+    const library_spec: ByteList = try normalize_literal(&input_arena, "src/library");
+    var library_specs: [ByteList: 1] = [library_spec];
+    var library_query_buf: [byte: 4096] = [];
+    var library_query_arena: Arena = Arena{ buffer: &library_query_buf[0], size: 0, used: 0 };
+    arena_init(&library_query_arena, &library_query_buf[0], 4096 as usize);
+    const library_result: ManifestRangeQueryResult = try manifest_range_query(&library_query_arena, &payload, manifest_pathspec_list_from_slice(library_specs[0: 1]));
+    try expect(library_result.entry_indexes.len == 0 as usize);
+    try expect(library_result.child_indexes.len == 1 as usize);
+    try expect(library_result.child_indexes.ptr[0] == 1 as usize);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Manifest Query Tests");
     run_test("manifest lookup leaf exact hit and miss", test_manifest_lookup_leaf_exact_hit_and_miss);
@@ -285,5 +337,6 @@ export fn main() i32 {
     run_test("manifest pathspec empty and multi match", test_manifest_pathspec_empty_and_multi_match);
     run_test("manifest range query filters leaf entries", test_manifest_range_query_filters_leaf_entries);
     run_test("manifest range query filters child ranges", test_manifest_range_query_filters_child_ranges);
+    run_test("manifest range query respects pathspec boundaries", test_manifest_range_query_respects_pathspec_boundaries);
     return test_suite_end();
 }

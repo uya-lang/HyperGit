@@ -43,6 +43,7 @@ export const HGIT_OBJECTS_LOOSE_REL: &const byte = ".hgit/objects/loose";
 export const HGIT_OBJECTS_PACKS_REL: &const byte = ".hgit/objects/packs";
 export const HGIT_INDEXES_REL: &const byte = ".hgit/indexes";
 export const HGIT_WORKSPACE_REL: &const byte = ".hgit/workspace";
+export const HGIT_WORKSPACE_STAGE_REL: &const byte = ".hgit/workspace/stage.hgi";
 
 error RepoPathTooLong;
 error RepoCurrentDirUnavailable;

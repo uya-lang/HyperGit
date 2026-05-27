@@ -7,6 +7,7 @@ use cli.DispatchPlan;
 use cli.plan_from_first_arg;
 use commands.help.run_help;
 use commands.version.run_version;
+use commands.status.run_status;
 use commands.doctor.run_doctor;
 use commands.init.run_init;
 use commands.errors.run_unknown_command;
@@ -20,6 +21,8 @@ export fn main() i32 {
         return run_help();
     } else if plan.action == DispatchAction.Version {
         return run_version();
+    } else if plan.action == DispatchAction.Status {
+        return run_status();
     } else if plan.action == DispatchAction.Doctor {
         return run_doctor();
     } else if plan.action == DispatchAction.Init {

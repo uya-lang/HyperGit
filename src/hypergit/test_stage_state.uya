@@ -1,0 +1,88 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+
+use core.ids.Hash32;
+use core.ids.CommitId;
+use core.ids.ObjectId;
+use core.ids.commit_id_from_object;
+use core.ids.object_id_from_hash;
+use object.types.ByteList;
+use workspace.stage.StageEntry;
+use workspace.stage.StageEntryKind;
+use workspace.stage.StageState;
+use workspace.stage.stage_entry_has_staged_content;
+use workspace.stage.stage_entry_is_delete;
+use workspace.stage.stage_state_init;
+use workspace.stage.stage_state_is_empty;
+use workspace.stage.stage_state_with_entry_count;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn make_commit_id(seed: byte) CommitId {
+    const object_id: ObjectId = object_id_from_hash(make_hash(seed));
+    return commit_id_from_object(object_id);
+}
+
+fn test_stage_state_init_starts_empty() !void {
+    const base_commit: CommitId = make_commit_id(1 as byte);
+    const state: StageState = stage_state_init(base_commit, 1234i64);
+    try expect(state.entry_count == 0u64);
+    try expect(state.last_update_ms == 1234i64);
+    try expect(stage_state_is_empty(&state));
+}
+
+fn test_stage_state_with_entry_count_tracks_non_empty() !void {
+    const base_commit: CommitId = make_commit_id(2 as byte);
+    const state: StageState = stage_state_with_entry_count(base_commit, 3u64, 5678i64);
+    try expect(state.entry_count == 3u64);
+    try expect(state.last_update_ms == 5678i64);
+    try expect(!stage_state_is_empty(&state));
+}
+
+fn test_stage_entry_detects_staged_content() !void {
+    var path_buf: [byte: 10] = ['s' as byte, 'r' as byte, 'c' as byte, '/' as byte, 'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte, '.' as byte, 'u' as byte];
+    const entry: StageEntry = StageEntry{
+        path: ByteList{ ptr: path_buf[0: 10].ptr, len: 10 as usize },
+        kind: StageEntryKind.Modify,
+        base_object: object_id_from_hash(make_hash(3 as byte)),
+        has_staged_object: true,
+        staged_object: object_id_from_hash(make_hash(4 as byte)),
+        file_mode: 33188u32,
+    };
+    try expect(stage_entry_has_staged_content(&entry));
+    try expect(!stage_entry_is_delete(&entry));
+}
+
+fn test_stage_entry_delete_does_not_require_staged_content() !void {
+    var path_buf: [byte: 8] = ['R' as byte, 'E' as byte, 'A' as byte, 'D' as byte, 'M' as byte, 'E' as byte, '.' as byte, 'm' as byte];
+    const entry: StageEntry = StageEntry{
+        path: ByteList{ ptr: path_buf[0: 8].ptr, len: 8 as usize },
+        kind: StageEntryKind.Delete,
+        base_object: object_id_from_hash(make_hash(5 as byte)),
+        has_staged_object: false,
+        staged_object: object_id_from_hash(make_hash(6 as byte)),
+        file_mode: 33188u32,
+    };
+    try expect(!stage_entry_has_staged_content(&entry));
+    try expect(stage_entry_is_delete(&entry));
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Stage State Tests");
+    run_test("stage state init starts empty", test_stage_state_init_starts_empty);
+    run_test("stage state with entry count tracks non empty", test_stage_state_with_entry_count_tracks_non_empty);
+    run_test("stage entry detects staged content", test_stage_entry_detects_staged_content);
+    run_test("stage entry delete does not require staged content", test_stage_entry_delete_does_not_require_staged_content);
+    return test_suite_end();
+}

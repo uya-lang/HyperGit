@@ -3,16 +3,50 @@ use std.testing.expect;
 use std.testing.test_suite_begin;
 use std.testing.test_suite_end;
 use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
 
 use core.ids.Hash32;
-use core.ids.ObjectId;
 use core.ids.ManifestId;
-use core.ids.object_id_from_hash;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
 use core.ids.manifest_id_from_object;
-use object.types.ByteList;
-use object.types.ManifestChild;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.diff.ManifestDiffChildRange;
+use manifest.diff.ManifestDiffChildRangeKind;
+use manifest.diff.ManifestDiffEntryChange;
+use manifest.diff.ManifestDiffEntryKind;
+use manifest.diff.ManifestDiffResult;
+use manifest.diff.manifest_diff;
 use manifest.diff.manifest_diff_skip_by_id;
 use manifest.diff.manifest_diff_skip_child;
+use manifest.path.manifest_path_normalize;
+use manifest.query.manifest_pathspec_list_from_slice;
+use manifest.trie.ManifestChildInput;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.manifest_child_input_list_from_slice;
+use manifest.trie.manifest_internal_build;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ManifestChild;
+use object.types.ManifestNodePayload;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1;
+    }
+}
 
 fn make_hash(seed: byte) Hash32 {
     var hash: Hash32 = Hash32{ bytes: [] };
@@ -24,18 +58,52 @@ fn make_hash(seed: byte) Hash32 {
     return hash;
 }
 
-fn make_manifest_id(seed: byte) ManifestId {
-    const object_id: ObjectId = object_id_from_hash(make_hash(seed));
-    return manifest_id_from_object(object_id);
+fn make_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(make_hash(seed));
 }
 
-fn make_child(min_name: &[byte], max_name: &[byte], seed: byte) ManifestChild {
-    return ManifestChild{
-        min_name: ByteList{ ptr: min_name.ptr, len: min_name.len },
-        max_name: ByteList{ ptr: max_name.ptr, len: max_name.len },
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(make_object_id(seed));
+}
+
+fn make_manifest_id(seed: byte) ManifestId {
+    return manifest_id_from_object(make_object_id(seed));
+}
+
+fn normalize_literal(arena: &Arena, text: &const byte) !ByteList {
+    return try manifest_path_normalize(arena, literal_bytes(text));
+}
+
+fn make_leaf_input(arena: &Arena, text: &const byte, seed: byte) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try normalize_literal(arena, text),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id(seed),
+        logical_size: seed as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id(seed + 32 as byte),
+    };
+}
+
+fn make_child_input(arena: &Arena, min_text: &const byte, max_text: &const byte, seed: byte) !ManifestChildInput {
+    return ManifestChildInput{
+        min_path: try normalize_literal(arena, min_text),
+        max_path: try normalize_literal(arena, max_text),
         child_id: make_manifest_id(seed),
         child_hash: make_hash(seed + 40 as byte),
     };
+}
+
+fn expect_entry_change(change: &ManifestDiffEntryChange, kind: ManifestDiffEntryKind, expected_path: &const byte) !void {
+    try expect(change.kind == kind);
+    try expect_byte_list_eq(change.path, literal_bytes(expected_path));
+}
+
+fn expect_child_range_paths(range: &ManifestDiffChildRange, kind: ManifestDiffChildRangeKind, min_path: &const byte, max_path: &const byte) !void {
+    try expect(range.kind == kind);
+    try expect_byte_list_eq(range.min_path, literal_bytes(min_path));
+    try expect_byte_list_eq(range.max_path, literal_bytes(max_path));
 }
 
 fn test_manifest_diff_skip_by_id() !void {
@@ -51,19 +119,225 @@ fn test_manifest_diff_skip_child_requires_same_range_and_hash() !void {
     var max_name: [byte: 9] = ['s' as byte, 'r' as byte, 'c' as byte, '/' as byte, 'z' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte];
     var other_max: [byte: 11] = ['s' as byte, 'r' as byte, 'c' as byte, '2' as byte, '/' as byte, 'z' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte, 'x' as byte];
 
-    const left: ManifestChild = make_child(min_name[0: 9], max_name[0: 9], 5 as byte);
-    const same: ManifestChild = make_child(min_name[0: 9], max_name[0: 9], 5 as byte);
-    const changed_hash: ManifestChild = make_child(min_name[0: 9], max_name[0: 9], 6 as byte);
-    const changed_range: ManifestChild = make_child(min_name[0: 9], other_max[0: 11], 5 as byte);
+    const left: ManifestChild = ManifestChild{
+        min_name: ByteList{ ptr: min_name[0: 9].ptr, len: 9 as usize },
+        max_name: ByteList{ ptr: max_name[0: 9].ptr, len: 9 as usize },
+        child_id: make_manifest_id(5 as byte),
+        child_hash: make_hash(45 as byte),
+    };
+    const same: ManifestChild = ManifestChild{
+        min_name: ByteList{ ptr: min_name[0: 9].ptr, len: 9 as usize },
+        max_name: ByteList{ ptr: max_name[0: 9].ptr, len: 9 as usize },
+        child_id: make_manifest_id(5 as byte),
+        child_hash: make_hash(45 as byte),
+    };
+    const changed_hash: ManifestChild = ManifestChild{
+        min_name: ByteList{ ptr: min_name[0: 9].ptr, len: 9 as usize },
+        max_name: ByteList{ ptr: max_name[0: 9].ptr, len: 9 as usize },
+        child_id: make_manifest_id(5 as byte),
+        child_hash: make_hash(46 as byte),
+    };
+    const changed_range: ManifestChild = ManifestChild{
+        min_name: ByteList{ ptr: min_name[0: 9].ptr, len: 9 as usize },
+        max_name: ByteList{ ptr: other_max[0: 11].ptr, len: 11 as usize },
+        child_id: make_manifest_id(5 as byte),
+        child_hash: make_hash(45 as byte),
+    };
 
     try expect(manifest_diff_skip_child(&left, &same));
     try expect(!manifest_diff_skip_child(&left, &changed_hash));
     try expect(!manifest_diff_skip_child(&left, &changed_range));
 }
 
+fn test_manifest_diff_reports_entry_changes_and_aligns_split_ranges() !void {
+    var input_arena_buf: [byte: 16384] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 16384 as usize);
+
+    var left_arena_buf: [byte: 16384] = [];
+    var left_arena: Arena = Arena{ buffer: &left_arena_buf[0], size: 0, used: 0 };
+    arena_init(&left_arena, &left_arena_buf[0], 16384 as usize);
+
+    var right_arena_buf: [byte: 16384] = [];
+    var right_arena: Arena = Arena{ buffer: &right_arena_buf[0], size: 0, used: 0 };
+    arena_init(&right_arena, &right_arena_buf[0], 16384 as usize);
+
+    const root_left: ByteList = try normalize_literal(&left_arena, "");
+    const root_right: ByteList = try normalize_literal(&right_arena, "");
+
+    const left_readme: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "README.md", 10 as byte);
+    const left_config: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "config.json", 11 as byte);
+    const left_legacy: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "legacy.txt", 12 as byte);
+    var left_directs: [ManifestLeafInputEntry: 3] = [left_readme, left_config, left_legacy];
+    const left_src0: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/m.uya", 20 as byte);
+    const left_vendor: ManifestChildInput = try make_child_input(&input_arena, "vendor/a.bin", "vendor/z.bin", 21 as byte);
+    const left_src1: ManifestChildInput = try make_child_input(&input_arena, "src/n.uya", "src/z.uya", 22 as byte);
+    var left_children: [ManifestChildInput: 3] = [left_src0, left_vendor, left_src1];
+    const left_payload: ManifestNodePayload = try manifest_internal_build(
+        &left_arena,
+        &root_left,
+        manifest_leaf_input_list_from_slice(left_directs[0: 3]),
+        manifest_child_input_list_from_slice(left_children[0: 3]),
+    );
+
+    const right_readme: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "README.md", 10 as byte);
+    const right_config: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "config.json", 13 as byte);
+    const right_guide: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "guide.md", 14 as byte);
+    var right_directs: [ManifestLeafInputEntry: 3] = [right_readme, right_config, right_guide];
+    const right_src0: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/f.uya", 30 as byte);
+    const right_src1: ManifestChildInput = try make_child_input(&input_arena, "src/g.uya", "src/z.uya", 31 as byte);
+    const right_vendor: ManifestChildInput = try make_child_input(&input_arena, "vendor/a.bin", "vendor/z.bin", 21 as byte);
+    var right_children: [ManifestChildInput: 3] = [right_src0, right_src1, right_vendor];
+    const right_payload: ManifestNodePayload = try manifest_internal_build(
+        &right_arena,
+        &root_right,
+        manifest_leaf_input_list_from_slice(right_directs[0: 3]),
+        manifest_child_input_list_from_slice(right_children[0: 3]),
+    );
+
+    var no_specs: [ByteList: 1] = [root_left];
+    var diff_arena_buf: [byte: 16384] = [];
+    var diff_arena: Arena = Arena{ buffer: &diff_arena_buf[0], size: 0, used: 0 };
+    arena_init(&diff_arena, &diff_arena_buf[0], 16384 as usize);
+    const result: ManifestDiffResult = try manifest_diff(
+        &diff_arena,
+        &left_payload,
+        &right_payload,
+        manifest_pathspec_list_from_slice(no_specs[0: 0]),
+    );
+
+    try expect(result.entry_changes.len == 3 as usize);
+    try expect_entry_change(&result.entry_changes.ptr[0], ManifestDiffEntryKind.Modified, "config.json");
+    try expect_entry_change(&result.entry_changes.ptr[1], ManifestDiffEntryKind.Added, "guide.md");
+    try expect_entry_change(&result.entry_changes.ptr[2], ManifestDiffEntryKind.Removed, "legacy.txt");
+
+    try expect(result.child_ranges.len == 1 as usize);
+    try expect_child_range_paths(&result.child_ranges.ptr[0], ManifestDiffChildRangeKind.Changed, "src/a.uya", "src/z.uya");
+    try expect(result.child_ranges.ptr[0].left_indexes.len == 2 as usize);
+    try expect(result.child_ranges.ptr[0].left_indexes.ptr[0] == 0 as usize);
+    try expect(result.child_ranges.ptr[0].left_indexes.ptr[1] == 1 as usize);
+    try expect(result.child_ranges.ptr[0].right_indexes.len == 2 as usize);
+    try expect(result.child_ranges.ptr[0].right_indexes.ptr[0] == 0 as usize);
+    try expect(result.child_ranges.ptr[0].right_indexes.ptr[1] == 1 as usize);
+}
+
+fn test_manifest_diff_filters_pathspec_and_skips_equal_children() !void {
+    var input_arena_buf: [byte: 16384] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 16384 as usize);
+
+    var left_arena_buf: [byte: 16384] = [];
+    var left_arena: Arena = Arena{ buffer: &left_arena_buf[0], size: 0, used: 0 };
+    arena_init(&left_arena, &left_arena_buf[0], 16384 as usize);
+
+    var right_arena_buf: [byte: 16384] = [];
+    var right_arena: Arena = Arena{ buffer: &right_arena_buf[0], size: 0, used: 0 };
+    arena_init(&right_arena, &right_arena_buf[0], 16384 as usize);
+
+    const root_left: ByteList = try normalize_literal(&left_arena, "");
+    const root_right: ByteList = try normalize_literal(&right_arena, "");
+
+    const left_readme: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "README.md", 40 as byte);
+    var left_directs: [ManifestLeafInputEntry: 1] = [left_readme];
+    const left_src: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/z.uya", 41 as byte);
+    const left_tests: ManifestChildInput = try make_child_input(&input_arena, "tests/a.uya", "tests/z.uya", 42 as byte);
+    var left_children: [ManifestChildInput: 2] = [left_src, left_tests];
+    const left_payload: ManifestNodePayload = try manifest_internal_build(
+        &left_arena,
+        &root_left,
+        manifest_leaf_input_list_from_slice(left_directs[0: 1]),
+        manifest_child_input_list_from_slice(left_children[0: 2]),
+    );
+
+    const right_readme: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "README.md", 50 as byte);
+    var right_directs: [ManifestLeafInputEntry: 1] = [right_readme];
+    const right_src: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/z.uya", 41 as byte);
+    const right_tests: ManifestChildInput = try make_child_input(&input_arena, "tests/a.uya", "tests/z.uya", 43 as byte);
+    var right_children: [ManifestChildInput: 2] = [right_src, right_tests];
+    const right_payload: ManifestNodePayload = try manifest_internal_build(
+        &right_arena,
+        &root_right,
+        manifest_leaf_input_list_from_slice(right_directs[0: 1]),
+        manifest_child_input_list_from_slice(right_children[0: 2]),
+    );
+
+    const tests_spec: ByteList = try normalize_literal(&input_arena, "tests");
+    var specs: [ByteList: 1] = [tests_spec];
+    var diff_arena_buf: [byte: 16384] = [];
+    var diff_arena: Arena = Arena{ buffer: &diff_arena_buf[0], size: 0, used: 0 };
+    arena_init(&diff_arena, &diff_arena_buf[0], 16384 as usize);
+    const result: ManifestDiffResult = try manifest_diff(
+        &diff_arena,
+        &left_payload,
+        &right_payload,
+        manifest_pathspec_list_from_slice(specs[0: 1]),
+    );
+
+    try expect(result.entry_changes.len == 0 as usize);
+    try expect(result.child_ranges.len == 1 as usize);
+    try expect_child_range_paths(&result.child_ranges.ptr[0], ManifestDiffChildRangeKind.Changed, "tests/a.uya", "tests/z.uya");
+    try expect(result.child_ranges.ptr[0].left_indexes.len == 1 as usize);
+    try expect(result.child_ranges.ptr[0].right_indexes.len == 1 as usize);
+    try expect(result.child_ranges.ptr[0].left_indexes.ptr[0] == 1 as usize);
+    try expect(result.child_ranges.ptr[0].right_indexes.ptr[0] == 1 as usize);
+}
+
+fn test_manifest_diff_skips_same_hash_child_ranges() !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+
+    var left_arena_buf: [byte: 8192] = [];
+    var left_arena: Arena = Arena{ buffer: &left_arena_buf[0], size: 0, used: 0 };
+    arena_init(&left_arena, &left_arena_buf[0], 8192 as usize);
+
+    var right_arena_buf: [byte: 8192] = [];
+    var right_arena: Arena = Arena{ buffer: &right_arena_buf[0], size: 0, used: 0 };
+    arena_init(&right_arena, &right_arena_buf[0], 8192 as usize);
+
+    const root_left: ByteList = try normalize_literal(&left_arena, "");
+    const root_right: ByteList = try normalize_literal(&right_arena, "");
+    var no_entries_left: [ManifestLeafInputEntry: 1] = [try make_leaf_input(&input_arena, "README.md", 70 as byte)];
+    var no_entries_right: [ManifestLeafInputEntry: 1] = [try make_leaf_input(&input_arena, "README.md", 71 as byte)];
+    const left_child: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/z.uya", 72 as byte);
+    const right_child: ManifestChildInput = try make_child_input(&input_arena, "src/a.uya", "src/z.uya", 72 as byte);
+    var left_children: [ManifestChildInput: 1] = [left_child];
+    var right_children: [ManifestChildInput: 1] = [right_child];
+
+    const left_payload: ManifestNodePayload = try manifest_internal_build(
+        &left_arena,
+        &root_left,
+        manifest_leaf_input_list_from_slice(no_entries_left[0: 0]),
+        manifest_child_input_list_from_slice(left_children[0: 1]),
+    );
+    const right_payload: ManifestNodePayload = try manifest_internal_build(
+        &right_arena,
+        &root_right,
+        manifest_leaf_input_list_from_slice(no_entries_right[0: 0]),
+        manifest_child_input_list_from_slice(right_children[0: 1]),
+    );
+
+    var no_specs: [ByteList: 1] = [root_left];
+    var diff_arena_buf: [byte: 8192] = [];
+    var diff_arena: Arena = Arena{ buffer: &diff_arena_buf[0], size: 0, used: 0 };
+    arena_init(&diff_arena, &diff_arena_buf[0], 8192 as usize);
+    const result: ManifestDiffResult = try manifest_diff(
+        &diff_arena,
+        &left_payload,
+        &right_payload,
+        manifest_pathspec_list_from_slice(no_specs[0: 0]),
+    );
+
+    try expect(result.entry_changes.len == 0 as usize);
+    try expect(result.child_ranges.len == 0 as usize);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Manifest Diff Tests");
     run_test("manifest diff skip by id", test_manifest_diff_skip_by_id);
     run_test("manifest diff skip child requires same range and hash", test_manifest_diff_skip_child_requires_same_range_and_hash);
+    run_test("manifest diff reports entry changes and aligns split ranges", test_manifest_diff_reports_entry_changes_and_aligns_split_ranges);
+    run_test("manifest diff filters pathspec and skips equal children", test_manifest_diff_filters_pathspec_and_skips_equal_children);
+    run_test("manifest diff skips same hash child ranges", test_manifest_diff_skips_same_hash_child_ranges);
     return test_suite_end();
 }

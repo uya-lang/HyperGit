@@ -1,8 +1,234 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
 use core.ids.ManifestId;
-use core.ids.manifest_id_compare;
 use core.ids.hash32_compare;
+use core.ids.manifest_id_compare;
+use core.ids.object_id_compare;
+use core.ids.policy_id_compare;
 use manifest.path.manifest_path_compare;
+use manifest.query.ManifestIndexList;
+use manifest.query.ManifestPathspecList;
+use manifest.query.ManifestRangeQueryResult;
+use manifest.query.manifest_range_query;
+use object.types.ByteList;
 use object.types.ManifestChild;
+use object.types.ManifestEntry;
+use object.types.ManifestNodePayload;
+
+error ManifestDiffPrefixMismatch;
+
+export enum ManifestDiffEntryKind {
+    Added,
+    Removed,
+    Modified
+}
+
+export struct ManifestDiffEntryChange {
+    kind: ManifestDiffEntryKind,
+    path: ByteList,
+    left_index: usize,
+    right_index: usize
+}
+
+export struct ManifestDiffEntryChangeList {
+    ptr: &ManifestDiffEntryChange,
+    len: usize
+}
+
+export enum ManifestDiffChildRangeKind {
+    Added,
+    Removed,
+    Changed
+}
+
+export struct ManifestDiffChildRange {
+    kind: ManifestDiffChildRangeKind,
+    min_path: ByteList,
+    max_path: ByteList,
+    left_indexes: ManifestIndexList,
+    right_indexes: ManifestIndexList
+}
+
+export struct ManifestDiffChildRangeList {
+    ptr: &ManifestDiffChildRange,
+    len: usize
+}
+
+export struct ManifestDiffResult {
+    entry_changes: ManifestDiffEntryChangeList,
+    child_ranges: ManifestDiffChildRangeList
+}
+
+fn manifest_diff_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.ManifestAlloc;
+    }
+    return raw[0: len];
+}
+
+fn manifest_diff_copy_bytes(arena: &Arena, value: &ByteList) !ByteList {
+    const out: &[byte] = try manifest_diff_arena_bytes(arena, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn manifest_diff_join_path(arena: &Arena, prefix: &ByteList, name: &ByteList) !ByteList {
+    if prefix.len == 0 {
+        return try manifest_diff_copy_bytes(arena, name);
+    }
+
+    const out_len: usize = prefix.len + 1 as usize + name.len;
+    const out: &[byte] = try manifest_diff_arena_bytes(arena, out_len);
+    var i: usize = 0;
+    while i < prefix.len {
+        out.ptr[i] = prefix.ptr[i];
+        i = i + 1;
+    }
+    out.ptr[prefix.len] = '/' as byte;
+    i = 0;
+    while i < name.len {
+        out.ptr[prefix.len + 1 as usize + i] = name.ptr[i];
+        i = i + 1;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn manifest_diff_entry_equal(left: &ManifestEntry, right: &ManifestEntry) bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.mode != right.mode {
+        return false;
+    }
+    if object_id_compare(&left.object_id, &right.object_id) != 0 {
+        return false;
+    }
+    if left.logical_size != right.logical_size {
+        return false;
+    }
+    if left.content_type != right.content_type {
+        return false;
+    }
+    return policy_id_compare(&left.policy_id, &right.policy_id) == 0;
+}
+
+fn manifest_diff_copy_index_range(arena: &Arena, indexes: ManifestIndexList, start: usize, len: usize) !ManifestIndexList {
+    if len == 0 {
+        return ManifestIndexList{ ptr: null, len: 0 };
+    }
+
+    const raw: &usize = arena_alloc(arena, @size_of(usize) as usize * len) as &usize;
+    if raw == null {
+        return error.ManifestAlloc;
+    }
+
+    var i: usize = 0;
+    while i < len {
+        raw[i] = indexes.ptr[start + i];
+        i = i + 1;
+    }
+    return ManifestIndexList{ ptr: raw, len: len };
+}
+
+fn manifest_diff_emit_entry_change(
+    arena: &Arena,
+    raw: &ManifestDiffEntryChange,
+    out_index: usize,
+    prefix: &ByteList,
+    name: &ByteList,
+    kind: ManifestDiffEntryKind,
+    left_index: usize,
+    right_index: usize,
+) !usize {
+    raw[out_index] = ManifestDiffEntryChange{
+        kind: kind,
+        path: try manifest_diff_join_path(arena, prefix, name),
+        left_index: left_index,
+        right_index: right_index,
+    };
+    return out_index + 1 as usize;
+}
+
+fn manifest_diff_emit_child_range(
+    arena: &Arena,
+    raw: &ManifestDiffChildRange,
+    out_index: usize,
+    prefix: &ByteList,
+    kind: ManifestDiffChildRangeKind,
+    min_name: &ByteList,
+    max_name: &ByteList,
+    left_indexes: ManifestIndexList,
+    left_start: usize,
+    left_len: usize,
+    right_indexes: ManifestIndexList,
+    right_start: usize,
+    right_len: usize,
+) !usize {
+    raw[out_index] = ManifestDiffChildRange{
+        kind: kind,
+        min_path: try manifest_diff_join_path(arena, prefix, min_name),
+        max_path: try manifest_diff_join_path(arena, prefix, max_name),
+        left_indexes: try manifest_diff_copy_index_range(arena, left_indexes, left_start, left_len),
+        right_indexes: try manifest_diff_copy_index_range(arena, right_indexes, right_start, right_len),
+    };
+    return out_index + 1 as usize;
+}
+
+fn manifest_diff_emit_single_child(
+    arena: &Arena,
+    raw: &ManifestDiffChildRange,
+    out_index: usize,
+    prefix: &ByteList,
+    kind: ManifestDiffChildRangeKind,
+    child: &ManifestChild,
+    indexes: ManifestIndexList,
+    index_pos: usize,
+    use_left: bool,
+) !usize {
+    if use_left {
+        return try manifest_diff_emit_child_range(
+            arena,
+            raw,
+            out_index,
+            prefix,
+            kind,
+            &child.min_name,
+            &child.max_name,
+            indexes,
+            index_pos,
+            1 as usize,
+            ManifestIndexList{ ptr: null, len: 0 },
+            0 as usize,
+            0 as usize,
+        );
+    }
+
+    return try manifest_diff_emit_child_range(
+        arena,
+        raw,
+        out_index,
+        prefix,
+        kind,
+        &child.min_name,
+        &child.max_name,
+        ManifestIndexList{ ptr: null, len: 0 },
+        0 as usize,
+        0 as usize,
+        indexes,
+        index_pos,
+        1 as usize,
+    );
+}
 
 export fn manifest_diff_skip_by_id(left: &ManifestId, right: &ManifestId) bool {
     return manifest_id_compare(left, right) == 0;
@@ -19,4 +245,271 @@ export fn manifest_diff_skip_child(left: &ManifestChild, right: &ManifestChild) 
         return false;
     }
     return hash32_compare(&left.child_hash, &right.child_hash) == 0;
+}
+
+export fn manifest_diff(arena: &Arena, left: &ManifestNodePayload, right: &ManifestNodePayload, pathspecs: ManifestPathspecList) !ManifestDiffResult {
+    if manifest_path_compare(&left.prefix.bytes, &right.prefix.bytes) != 0 {
+        return error.ManifestDiffPrefixMismatch;
+    }
+
+    const right_pathspecs: ManifestPathspecList = ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len };
+    const left_ranges: ManifestRangeQueryResult = try manifest_range_query(arena, left, pathspecs);
+    const right_ranges: ManifestRangeQueryResult = try manifest_range_query(arena, right, right_pathspecs);
+
+    const entry_cap: usize = left_ranges.entry_indexes.len + right_ranges.entry_indexes.len;
+    var entry_raw: &ManifestDiffEntryChange = null;
+    if entry_cap > 0 {
+        entry_raw = arena_alloc(arena, @size_of(ManifestDiffEntryChange) as usize * entry_cap) as &ManifestDiffEntryChange;
+        if entry_raw == null {
+            return error.ManifestAlloc;
+        }
+    }
+
+    const child_cap: usize = left_ranges.child_indexes.len + right_ranges.child_indexes.len;
+    var child_raw: &ManifestDiffChildRange = null;
+    if child_cap > 0 {
+        child_raw = arena_alloc(arena, @size_of(ManifestDiffChildRange) as usize * child_cap) as &ManifestDiffChildRange;
+        if child_raw == null {
+            return error.ManifestAlloc;
+        }
+    }
+
+    var entry_len: usize = 0;
+    var left_entry_pos: usize = 0;
+    var right_entry_pos: usize = 0;
+    while left_entry_pos < left_ranges.entry_indexes.len || right_entry_pos < right_ranges.entry_indexes.len {
+        if left_entry_pos >= left_ranges.entry_indexes.len {
+            const right_index: usize = right_ranges.entry_indexes.ptr[right_entry_pos];
+            const right_entry: &ManifestEntry = &right.entries.ptr[right_index];
+            entry_len = try manifest_diff_emit_entry_change(
+                arena,
+                entry_raw,
+                entry_len,
+                &left.prefix.bytes,
+                &right_entry.name,
+                ManifestDiffEntryKind.Added,
+                0 as usize,
+                right_index,
+            );
+            right_entry_pos = right_entry_pos + 1 as usize;
+            continue;
+        }
+        if right_entry_pos >= right_ranges.entry_indexes.len {
+            const left_index: usize = left_ranges.entry_indexes.ptr[left_entry_pos];
+            const left_entry: &ManifestEntry = &left.entries.ptr[left_index];
+            entry_len = try manifest_diff_emit_entry_change(
+                arena,
+                entry_raw,
+                entry_len,
+                &left.prefix.bytes,
+                &left_entry.name,
+                ManifestDiffEntryKind.Removed,
+                left_index,
+                0 as usize,
+            );
+            left_entry_pos = left_entry_pos + 1 as usize;
+            continue;
+        }
+
+        const left_index: usize = left_ranges.entry_indexes.ptr[left_entry_pos];
+        const right_index: usize = right_ranges.entry_indexes.ptr[right_entry_pos];
+        const left_entry: &ManifestEntry = &left.entries.ptr[left_index];
+        const right_entry: &ManifestEntry = &right.entries.ptr[right_index];
+        const cmp: i32 = manifest_path_compare(&left_entry.name, &right_entry.name);
+        if cmp < 0 {
+            entry_len = try manifest_diff_emit_entry_change(
+                arena,
+                entry_raw,
+                entry_len,
+                &left.prefix.bytes,
+                &left_entry.name,
+                ManifestDiffEntryKind.Removed,
+                left_index,
+                0 as usize,
+            );
+            left_entry_pos = left_entry_pos + 1 as usize;
+            continue;
+        }
+        if cmp > 0 {
+            entry_len = try manifest_diff_emit_entry_change(
+                arena,
+                entry_raw,
+                entry_len,
+                &left.prefix.bytes,
+                &right_entry.name,
+                ManifestDiffEntryKind.Added,
+                0 as usize,
+                right_index,
+            );
+            right_entry_pos = right_entry_pos + 1 as usize;
+            continue;
+        }
+
+        if !manifest_diff_entry_equal(left_entry, right_entry) {
+            entry_len = try manifest_diff_emit_entry_change(
+                arena,
+                entry_raw,
+                entry_len,
+                &left.prefix.bytes,
+                &left_entry.name,
+                ManifestDiffEntryKind.Modified,
+                left_index,
+                right_index,
+            );
+        }
+        left_entry_pos = left_entry_pos + 1 as usize;
+        right_entry_pos = right_entry_pos + 1 as usize;
+    }
+
+    var child_len: usize = 0;
+    var left_child_pos: usize = 0;
+    var right_child_pos: usize = 0;
+    while left_child_pos < left_ranges.child_indexes.len || right_child_pos < right_ranges.child_indexes.len {
+        if left_child_pos >= left_ranges.child_indexes.len {
+            const right_index: usize = right_ranges.child_indexes.ptr[right_child_pos];
+            const right_child: &ManifestChild = &right.children.ptr[right_index];
+            child_len = try manifest_diff_emit_single_child(
+                arena,
+                child_raw,
+                child_len,
+                &left.prefix.bytes,
+                ManifestDiffChildRangeKind.Added,
+                right_child,
+                right_ranges.child_indexes,
+                right_child_pos,
+                false,
+            );
+            right_child_pos = right_child_pos + 1 as usize;
+            continue;
+        }
+        if right_child_pos >= right_ranges.child_indexes.len {
+            const left_index: usize = left_ranges.child_indexes.ptr[left_child_pos];
+            const left_child: &ManifestChild = &left.children.ptr[left_index];
+            child_len = try manifest_diff_emit_single_child(
+                arena,
+                child_raw,
+                child_len,
+                &left.prefix.bytes,
+                ManifestDiffChildRangeKind.Removed,
+                left_child,
+                left_ranges.child_indexes,
+                left_child_pos,
+                true,
+            );
+            left_child_pos = left_child_pos + 1 as usize;
+            continue;
+        }
+
+        const left_index: usize = left_ranges.child_indexes.ptr[left_child_pos];
+        const right_index: usize = right_ranges.child_indexes.ptr[right_child_pos];
+        const left_child: &ManifestChild = &left.children.ptr[left_index];
+        const right_child: &ManifestChild = &right.children.ptr[right_index];
+
+        if manifest_diff_skip_child(left_child, right_child) {
+            left_child_pos = left_child_pos + 1 as usize;
+            right_child_pos = right_child_pos + 1 as usize;
+            continue;
+        }
+
+        if manifest_path_compare(&left_child.max_name, &right_child.min_name) < 0 {
+            child_len = try manifest_diff_emit_single_child(
+                arena,
+                child_raw,
+                child_len,
+                &left.prefix.bytes,
+                ManifestDiffChildRangeKind.Removed,
+                left_child,
+                left_ranges.child_indexes,
+                left_child_pos,
+                true,
+            );
+            left_child_pos = left_child_pos + 1 as usize;
+            continue;
+        }
+
+        if manifest_path_compare(&right_child.max_name, &left_child.min_name) < 0 {
+            child_len = try manifest_diff_emit_single_child(
+                arena,
+                child_raw,
+                child_len,
+                &left.prefix.bytes,
+                ManifestDiffChildRangeKind.Added,
+                right_child,
+                right_ranges.child_indexes,
+                right_child_pos,
+                false,
+            );
+            right_child_pos = right_child_pos + 1 as usize;
+            continue;
+        }
+
+        const left_group_start: usize = left_child_pos;
+        const right_group_start: usize = right_child_pos;
+        var group_min_name: &ByteList = &left_child.min_name;
+        if manifest_path_compare(&right_child.min_name, group_min_name) < 0 {
+            group_min_name = &right_child.min_name;
+        }
+        var group_max_name: &ByteList = &left_child.max_name;
+        if manifest_path_compare(&right_child.max_name, group_max_name) > 0 {
+            group_max_name = &right_child.max_name;
+        }
+
+        left_child_pos = left_child_pos + 1 as usize;
+        right_child_pos = right_child_pos + 1 as usize;
+
+        while true {
+            var advanced: bool = false;
+
+            while left_child_pos < left_ranges.child_indexes.len {
+                const next_left_index: usize = left_ranges.child_indexes.ptr[left_child_pos];
+                const next_left_child: &ManifestChild = &left.children.ptr[next_left_index];
+                if manifest_path_compare(&next_left_child.min_name, group_max_name) > 0 {
+                    break;
+                }
+                if manifest_path_compare(&next_left_child.max_name, group_max_name) > 0 {
+                    group_max_name = &next_left_child.max_name;
+                }
+                left_child_pos = left_child_pos + 1 as usize;
+                advanced = true;
+            }
+
+            while right_child_pos < right_ranges.child_indexes.len {
+                const next_right_index: usize = right_ranges.child_indexes.ptr[right_child_pos];
+                const next_right_child: &ManifestChild = &right.children.ptr[next_right_index];
+                if manifest_path_compare(&next_right_child.min_name, group_max_name) > 0 {
+                    break;
+                }
+                if manifest_path_compare(&next_right_child.max_name, group_max_name) > 0 {
+                    group_max_name = &next_right_child.max_name;
+                }
+                right_child_pos = right_child_pos + 1 as usize;
+                advanced = true;
+            }
+
+            if !advanced {
+                break;
+            }
+        }
+
+        child_len = try manifest_diff_emit_child_range(
+            arena,
+            child_raw,
+            child_len,
+            &left.prefix.bytes,
+            ManifestDiffChildRangeKind.Changed,
+            group_min_name,
+            group_max_name,
+            left_ranges.child_indexes,
+            left_group_start,
+            left_child_pos - left_group_start,
+            right_ranges.child_indexes,
+            right_group_start,
+            right_child_pos - right_group_start,
+        );
+    }
+
+    return ManifestDiffResult{
+        entry_changes: ManifestDiffEntryChangeList{ ptr: entry_raw, len: entry_len },
+        child_ranges: ManifestDiffChildRangeList{ ptr: child_raw, len: child_len },
+    };
 }

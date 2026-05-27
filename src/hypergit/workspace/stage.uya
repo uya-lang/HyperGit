@@ -1,0 +1,86 @@
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.commit_id_from_object;
+use core.ids.object_id_from_hash;
+use object.types.ByteList;
+
+export enum StageEntryKind {
+    Add,
+    Modify,
+    Delete,
+    ModeOnly
+}
+
+export struct StageEntry {
+    path: ByteList,
+    kind: StageEntryKind,
+    base_object: ObjectId,
+    has_staged_object: bool,
+    staged_object: ObjectId,
+    file_mode: u32
+}
+
+export struct StageEntryList {
+    ptr: &StageEntry,
+    len: usize
+}
+
+export struct StageState {
+    base_commit: CommitId,
+    entry_count: u64,
+    last_update_ms: i64
+}
+
+export struct StageSnapshot {
+    state: StageState,
+    entries: StageEntryList
+}
+
+export fn stage_entry_list_from_slice(slice: &[StageEntry]) StageEntryList {
+    return StageEntryList{ ptr: slice.ptr, len: slice.len };
+}
+
+export fn stage_state_init(base_commit: CommitId, last_update_ms: i64) StageState {
+    return StageState{
+        base_commit: base_commit,
+        entry_count: 0u64,
+        last_update_ms: last_update_ms,
+    };
+}
+
+export fn stage_state_with_entry_count(base_commit: CommitId, entry_count: u64, last_update_ms: i64) StageState {
+    return StageState{
+        base_commit: base_commit,
+        entry_count: entry_count,
+        last_update_ms: last_update_ms,
+    };
+}
+
+export fn stage_state_is_empty(state: &StageState) bool {
+    return state.entry_count == 0u64;
+}
+
+export fn stage_entry_has_staged_content(entry: &StageEntry) bool {
+    return entry.has_staged_object && entry.kind != StageEntryKind.Delete;
+}
+
+export fn stage_entry_is_delete(entry: &StageEntry) bool {
+    return entry.kind == StageEntryKind.Delete;
+}
+
+export fn stage_snapshot_init(state: StageState, entries: StageEntryList) StageSnapshot {
+    return StageSnapshot{
+        state: state,
+        entries: entries,
+    };
+}
+
+export fn stage_zero_commit_id() CommitId {
+    return commit_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
+}
+
+export fn stage_empty_snapshot(last_update_ms: i64) StageSnapshot {
+    const state: StageState = stage_state_init(stage_zero_commit_id(), last_update_ms);
+    return stage_snapshot_init(state, StageEntryList{ ptr: null, len: 0 });
+}

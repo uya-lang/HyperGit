@@ -149,18 +149,18 @@
 - [x] 实现 pathspec matcher。
 - [x] 实现 manifest range query。
 - [x] 实现 manifest hash skip。
-- [ ] 实现 manifest diff。
-- [ ] 测试百万路径 synthetic builder。
-- [ ] 测试同 hash shard diff 跳过。
-- [ ] 测试 pathspec 查询边界。
-- [ ] 测试 file/dir 冲突检测。
+- [x] 实现 manifest diff。
+- [x] 测试百万路径 synthetic builder。
+- [x] 测试同 hash shard diff 跳过。
+- [x] 测试 pathspec 查询边界。
+- [x] 测试 file/dir 冲突检测。
 
 ## 9. Status / Add / Commit
 
-- [ ] 实现 `hgx status` 空仓库输出。
-- [ ] 实现 `StageState`。
-- [ ] 实现 `StageEntry`。
-- [ ] 实现 `workspace/stage.hgi`。
+- [x] 实现 `hgx status` 空仓库输出。
+- [x] 实现 `StageState`。
+- [x] 实现 `StageEntry`。
+- [x] 实现 `workspace/stage.hgi`。
 - [ ] 实现工作区文件枚举。
 - [ ] 实现 small blob hash。
 - [ ] 实现 `hgx add <pathspec>`。
