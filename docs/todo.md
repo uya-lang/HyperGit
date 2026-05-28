@@ -242,12 +242,12 @@
 
 - [x] 设计 `.hgp` pack header。
 - [x] 设计 `.hgi` pack index。
-- [ ] 实现 segment writer。
-- [ ] 实现 segment reader。
-- [ ] 实现 object record checksum。
-- [ ] 实现 footer checksum。
-- [ ] 实现 object id -> offset 查询。
-- [ ] 实现 pack bloom 占位。
+- [x] 实现 segment writer。
+- [x] 实现 segment reader。
+- [x] 实现 object record checksum。
+- [x] 实现 footer checksum。
+- [x] 实现 object id -> offset 查询。
+- [x] 实现 pack bloom 占位。
 - [ ] 实现 loose -> pack compaction。
 - [ ] 实现 composite store 读路径。
 - [ ] 测试 pack 写读 roundtrip。

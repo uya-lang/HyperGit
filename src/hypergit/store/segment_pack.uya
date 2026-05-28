@@ -1,0 +1,742 @@
+use std.crypto.crc32.crc32_compute;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.fwrite;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use libc.Stat;
+use libc.errno;
+use libc.free;
+use libc.malloc;
+use libc.stat;
+use libc.ENOENT;
+use core.codec.codec_decode_hash32;
+use core.codec.codec_decode_i64;
+use core.codec.codec_decode_u16;
+use core.codec.codec_decode_u32;
+use core.codec.codec_decode_u64;
+use core.codec.codec_encode_hash32;
+use core.codec.codec_encode_i64;
+use core.codec.codec_encode_u16;
+use core.codec.codec_encode_u32;
+use core.codec.codec_encode_u64;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.object_id_compare;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use object.types.object_kind_from_u16;
+use object.types.object_kind_to_u16;
+
+export const SEGMENT_PACK_MAGIC: u32 = 0x31504748u32;
+export const SEGMENT_PACK_VERSION: u16 = 1u16;
+export const SEGMENT_PACK_HEADER_BYTES: usize = 64 as usize;
+export const SEGMENT_PACK_RECORD_HEADER_BYTES: usize = 44 as usize;
+export const SEGMENT_PACK_RECORD_TRAILER_BYTES: usize = 4 as usize;
+export const SEGMENT_PACK_FOOTER_BYTES: usize = 48 as usize;
+
+export const PACK_INDEX_MAGIC: u32 = 0x31494748u32;
+export const PACK_INDEX_VERSION: u16 = 1u16;
+export const PACK_INDEX_HEADER_BYTES: usize = 48 as usize;
+export const PACK_INDEX_ENTRY_BYTES: usize = 64 as usize;
+export const PACK_INDEX_FOOTER_BYTES: usize = 72 as usize;
+export const SEGMENT_PACK_MAX_BYTES: usize = 67108864 as usize;
+
+const SEGMENT_PACK_HEADER_CRC_OFFSET: usize = 60 as usize;
+const PACK_INDEX_HEADER_CRC_OFFSET: usize = 40 as usize;
+const SEGMENT_PACK_MAX_RECORD_BYTES: usize = 4294967295 as usize;
+
+error SegmentPackOpenFailed;
+error SegmentPackNotFound;
+error SegmentPackReadFailed;
+error SegmentPackWriteFailed;
+error SegmentPackAlloc;
+error SegmentPackInvalid;
+error SegmentPackTooLarge;
+error SegmentPackDuplicateObjectId;
+error SegmentPackObjectNotFound;
+
+export struct SegmentPackWriteInput {
+    object_id: ObjectId,
+    kind: ObjectKind,
+    flags: u16,
+    logical_size: u64,
+    object_bytes: ByteList
+}
+
+export struct SegmentPackWriteResult {
+    object_count: u64,
+    data_bytes: u64,
+    pack_bytes: u64,
+    index_bytes: u64,
+    pack_footer_offset: u64,
+    index_footer_offset: u64
+}
+
+export struct SegmentPackHeader {
+    segment_seq: u64,
+    object_count: u64,
+    data_bytes: u64,
+    index_ref_offset: u64,
+    created_at_ms: i64,
+    base_generation: u64,
+    flags: u32,
+    header_crc32: u32
+}
+
+export struct SegmentPackFooter {
+    segment_seq: u64,
+    index_hash: Hash32,
+    reserved: u32,
+    footer_crc32: u32
+}
+
+export struct SegmentPackRecord {
+    record_offset: u64,
+    record_bytes: u32,
+    kind: ObjectKind,
+    flags: u16,
+    object_id: ObjectId,
+    payload_crc32: u32,
+    object_bytes: ByteList,
+    trailer_crc32: u32
+}
+
+export struct SegmentPackRecordList {
+    ptr: &SegmentPackRecord,
+    len: usize
+}
+
+export struct SegmentPackSnapshot {
+    header: SegmentPackHeader,
+    records: SegmentPackRecordList,
+    footer: SegmentPackFooter,
+    raw_bytes: ByteList
+}
+
+export struct SegmentPackIndexHeader {
+    segment_seq: u64,
+    entry_count: u64,
+    entries_offset: u64,
+    bloom_offset: u64,
+    header_crc32: u32,
+    reserved: u32
+}
+
+export struct SegmentPackIndexFooter {
+    pack_hash: Hash32,
+    entries_hash: Hash32,
+    reserved: u32,
+    footer_crc32: u32
+}
+
+export struct SegmentPackIndexEntry {
+    object_id: ObjectId,
+    record_offset: u64,
+    record_bytes: u32,
+    kind: ObjectKind,
+    flags: u16,
+    logical_size: u64,
+    prefix_hint: u32,
+    entry_crc32: u32
+}
+
+export struct SegmentPackIndexSnapshot {
+    header: SegmentPackIndexHeader,
+    bloom_block: ByteList,
+    footer: SegmentPackIndexFooter,
+    raw_bytes: ByteList
+}
+
+fn segment_pack_zero_hash() Hash32 {
+    return Hash32{ bytes: [] };
+}
+
+fn segment_pack_record_total_bytes(record: &SegmentPackWriteInput) !u32 {
+    const total: usize = SEGMENT_PACK_RECORD_HEADER_BYTES + record.object_bytes.len + SEGMENT_PACK_RECORD_TRAILER_BYTES;
+    if total > SEGMENT_PACK_MAX_RECORD_BYTES {
+        return error.SegmentPackTooLarge;
+    }
+    return total as u32;
+}
+
+fn segment_pack_store_u32(output: &[byte], offset: usize, value: u32) !void {
+    if offset + 4 as usize > output.len {
+        return error.SegmentPackWriteFailed;
+    }
+    output.ptr[offset] = (value & 255u32) as byte;
+    output.ptr[offset + 1 as usize] = ((value >> 8) & 255u32) as byte;
+    output.ptr[offset + 2 as usize] = ((value >> 16) & 255u32) as byte;
+    output.ptr[offset + 3 as usize] = ((value >> 24) & 255u32) as byte;
+}
+
+fn segment_pack_write_file(path: &const byte, payload: &[byte]) !void {
+    if path == null {
+        return error.SegmentPackOpenFailed;
+    }
+    const stream: &FILE = fopen(path, "w");
+    if stream == null {
+        return error.SegmentPackOpenFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+    if fwrite(payload.ptr as &const byte, 1 as usize, payload.len, stream) != payload.len {
+        return error.SegmentPackWriteFailed;
+    }
+}
+
+fn segment_pack_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.SegmentPackAlloc;
+    }
+    return raw[0: len];
+}
+
+fn segment_pack_validate_unique_inputs(records: &[SegmentPackWriteInput]) !void {
+    var i: usize = 0 as usize;
+    while i < records.len {
+        var j: usize = i + 1 as usize;
+        while j < records.len {
+            if object_id_compare(&records.ptr[i].object_id, &records.ptr[j].object_id) == 0 {
+                return error.SegmentPackDuplicateObjectId;
+            }
+            j = j + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+}
+
+fn segment_pack_record_offset_for_index(records: &[SegmentPackWriteInput], target: usize) !u64 {
+    var offset: u64 = SEGMENT_PACK_HEADER_BYTES as u64;
+    var i: usize = 0 as usize;
+    while i < target {
+        offset = offset + (try segment_pack_record_total_bytes(&records.ptr[i])) as u64;
+        i = i + 1 as usize;
+    }
+    return offset;
+}
+
+fn segment_pack_find_next_sorted_index(records: &[SegmentPackWriteInput], has_floor: bool, floor: &ObjectId) !usize {
+    var found: bool = false;
+    var best_index: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < records.len {
+        if has_floor && object_id_compare(&records.ptr[i].object_id, floor) <= 0 {
+            i = i + 1 as usize;
+            continue;
+        }
+        if !found || object_id_compare(&records.ptr[i].object_id, &records.ptr[best_index].object_id) < 0 {
+            best_index = i;
+            found = true;
+        }
+        i = i + 1 as usize;
+    }
+    if !found {
+        return error.SegmentPackWriteFailed;
+    }
+    return best_index;
+}
+
+fn segment_pack_read_header(input: &[byte], offset: &usize) !SegmentPackHeader {
+    if try codec_decode_u32(input, offset) != SEGMENT_PACK_MAGIC {
+        return error.SegmentPackInvalid;
+    }
+    if try codec_decode_u16(input, offset) != SEGMENT_PACK_VERSION {
+        return error.SegmentPackInvalid;
+    }
+    if try codec_decode_u16(input, offset) != SEGMENT_PACK_HEADER_BYTES as u16 {
+        return error.SegmentPackInvalid;
+    }
+    const header: SegmentPackHeader = SegmentPackHeader{
+        segment_seq: try codec_decode_u64(input, offset),
+        object_count: try codec_decode_u64(input, offset),
+        data_bytes: try codec_decode_u64(input, offset),
+        index_ref_offset: try codec_decode_u64(input, offset),
+        created_at_ms: try codec_decode_i64(input, offset),
+        base_generation: try codec_decode_u64(input, offset),
+        flags: try codec_decode_u32(input, offset),
+        header_crc32: try codec_decode_u32(input, offset),
+    };
+    if header.flags != 0u32 {
+        return error.SegmentPackInvalid;
+    }
+    if header.header_crc32 != crc32_compute(input[0: SEGMENT_PACK_HEADER_CRC_OFFSET]) {
+        return error.SegmentPackInvalid;
+    }
+    return header;
+}
+
+fn segment_pack_read_footer(input: &[byte], offset: &usize) !SegmentPackFooter {
+    return SegmentPackFooter{
+        segment_seq: try codec_decode_u64(input, offset),
+        index_hash: try codec_decode_hash32(input, offset),
+        reserved: try codec_decode_u32(input, offset),
+        footer_crc32: try codec_decode_u32(input, offset),
+    };
+}
+
+fn segment_pack_read_index_header(input: &[byte], offset: &usize) !SegmentPackIndexHeader {
+    if try codec_decode_u32(input, offset) != PACK_INDEX_MAGIC {
+        return error.SegmentPackInvalid;
+    }
+    if try codec_decode_u16(input, offset) != PACK_INDEX_VERSION {
+        return error.SegmentPackInvalid;
+    }
+    if try codec_decode_u16(input, offset) != PACK_INDEX_HEADER_BYTES as u16 {
+        return error.SegmentPackInvalid;
+    }
+    const header: SegmentPackIndexHeader = SegmentPackIndexHeader{
+        segment_seq: try codec_decode_u64(input, offset),
+        entry_count: try codec_decode_u64(input, offset),
+        entries_offset: try codec_decode_u64(input, offset),
+        bloom_offset: try codec_decode_u64(input, offset),
+        header_crc32: try codec_decode_u32(input, offset),
+        reserved: try codec_decode_u32(input, offset),
+    };
+    if header.reserved != 0u32 {
+        return error.SegmentPackInvalid;
+    }
+    if header.header_crc32 != crc32_compute(input[0: PACK_INDEX_HEADER_CRC_OFFSET]) {
+        return error.SegmentPackInvalid;
+    }
+    return header;
+}
+
+fn segment_pack_read_index_footer(input: &[byte], offset: &usize) !SegmentPackIndexFooter {
+    return SegmentPackIndexFooter{
+        pack_hash: try codec_decode_hash32(input, offset),
+        entries_hash: try codec_decode_hash32(input, offset),
+        reserved: try codec_decode_u32(input, offset),
+        footer_crc32: try codec_decode_u32(input, offset),
+    };
+}
+
+fn segment_pack_decode_index_entry(input: &[byte], entry_offset: usize) !SegmentPackIndexEntry {
+    var offset: usize = entry_offset;
+    const entry: SegmentPackIndexEntry = SegmentPackIndexEntry{
+        object_id: ObjectId{ hash: try codec_decode_hash32(input, &offset) },
+        record_offset: try codec_decode_u64(input, &offset),
+        record_bytes: try codec_decode_u32(input, &offset),
+        kind: object_kind_from_u16(try codec_decode_u16(input, &offset)) catch {
+            return error.SegmentPackInvalid;
+        },
+        flags: try codec_decode_u16(input, &offset),
+        logical_size: try codec_decode_u64(input, &offset),
+        prefix_hint: try codec_decode_u32(input, &offset),
+        entry_crc32: try codec_decode_u32(input, &offset),
+    };
+    if offset != entry_offset + PACK_INDEX_ENTRY_BYTES {
+        return error.SegmentPackInvalid;
+    }
+    if entry.entry_crc32 != crc32_compute(input.ptr[entry_offset: PACK_INDEX_ENTRY_BYTES - 4 as usize]) {
+        return error.SegmentPackInvalid;
+    }
+    return entry;
+}
+
+export fn segment_pack_read(path: &const byte, arena: &Arena) !SegmentPackSnapshot {
+    if path == null {
+        return error.SegmentPackNotFound;
+    }
+
+    var st: Stat = Stat{};
+    if stat(path, &st) != 0 {
+        if errno == ENOENT {
+            return error.SegmentPackNotFound;
+        }
+        return error.SegmentPackOpenFailed;
+    }
+    const file_size: usize = st.st_size as usize;
+    if file_size < SEGMENT_PACK_HEADER_BYTES + SEGMENT_PACK_FOOTER_BYTES {
+        return error.SegmentPackInvalid;
+    }
+    if file_size > SEGMENT_PACK_MAX_BYTES {
+        return error.SegmentPackTooLarge;
+    }
+
+    const raw_bytes: &[byte] = try segment_pack_arena_bytes(arena, file_size);
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return error.SegmentPackOpenFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+    if fread(raw_bytes.ptr, 1 as usize, file_size, stream) != file_size {
+        return error.SegmentPackReadFailed;
+    }
+
+    var offset: usize = 0 as usize;
+    const input: &[byte] = raw_bytes.ptr[0: file_size];
+    const header: SegmentPackHeader = try segment_pack_read_header(input, &offset);
+    if offset != SEGMENT_PACK_HEADER_BYTES {
+        return error.SegmentPackInvalid;
+    }
+    if header.index_ref_offset < SEGMENT_PACK_HEADER_BYTES as u64 || header.index_ref_offset > file_size as u64 {
+        return error.SegmentPackInvalid;
+    }
+    if header.index_ref_offset + SEGMENT_PACK_FOOTER_BYTES as u64 != file_size as u64 {
+        return error.SegmentPackInvalid;
+    }
+
+    var raw_records: &SegmentPackRecord = null;
+    if header.object_count > 0u64 {
+        raw_records = arena_alloc(arena, @size_of(SegmentPackRecord) as usize * header.object_count as usize) as &SegmentPackRecord;
+        if raw_records == null {
+            return error.SegmentPackAlloc;
+        }
+    }
+
+    var record_index: usize = 0 as usize;
+    while record_index < header.object_count as usize {
+        const record_offset: usize = offset;
+        const record_bytes: u32 = try codec_decode_u32(input, &offset);
+        if record_bytes < SEGMENT_PACK_RECORD_HEADER_BYTES + SEGMENT_PACK_RECORD_TRAILER_BYTES {
+            return error.SegmentPackInvalid;
+        }
+        if record_offset as u64 + record_bytes as u64 > header.index_ref_offset {
+            return error.SegmentPackInvalid;
+        }
+        const kind: ObjectKind = object_kind_from_u16(try codec_decode_u16(input, &offset)) catch {
+            return error.SegmentPackInvalid;
+        };
+        const flags: u16 = try codec_decode_u16(input, &offset);
+        const object_id: ObjectId = ObjectId{ hash: try codec_decode_hash32(input, &offset) };
+        const payload_crc32: u32 = try codec_decode_u32(input, &offset);
+        const object_len: usize = record_bytes as usize - SEGMENT_PACK_RECORD_HEADER_BYTES - SEGMENT_PACK_RECORD_TRAILER_BYTES;
+        if offset + object_len > input.len {
+            return error.SegmentPackInvalid;
+        }
+        const object_bytes: ByteList = ByteList{ ptr: &input.ptr[offset], len: object_len };
+        offset = offset + object_len;
+        const trailer_crc32: u32 = try codec_decode_u32(input, &offset);
+        if payload_crc32 != crc32_compute(object_bytes.ptr[0: object_bytes.len]) {
+            return error.SegmentPackInvalid;
+        }
+        if trailer_crc32 != crc32_compute(input.ptr[record_offset: record_bytes as usize - SEGMENT_PACK_RECORD_TRAILER_BYTES]) {
+            return error.SegmentPackInvalid;
+        }
+        if raw_records == null {
+            return error.SegmentPackInvalid;
+        }
+        raw_records[record_index] = SegmentPackRecord{
+            record_offset: record_offset as u64,
+            record_bytes: record_bytes,
+            kind: kind,
+            flags: flags,
+            object_id: ObjectId{ hash: object_id.hash },
+            payload_crc32: payload_crc32,
+            object_bytes: ByteList{ ptr: object_bytes.ptr, len: object_bytes.len },
+            trailer_crc32: trailer_crc32,
+        };
+        record_index = record_index + 1 as usize;
+    }
+
+    if offset as u64 != header.index_ref_offset {
+        return error.SegmentPackInvalid;
+    }
+    const footer: SegmentPackFooter = try segment_pack_read_footer(input, &offset);
+    if footer.footer_crc32 != crc32_compute(input.ptr[header.index_ref_offset as usize: SEGMENT_PACK_FOOTER_BYTES - 4 as usize]) {
+        return error.SegmentPackInvalid;
+    }
+    if footer.segment_seq != header.segment_seq || offset != file_size {
+        return error.SegmentPackInvalid;
+    }
+
+    return SegmentPackSnapshot{
+        header: header,
+        records: SegmentPackRecordList{ ptr: raw_records, len: header.object_count as usize },
+        footer: footer,
+        raw_bytes: ByteList{ ptr: input.ptr, len: input.len },
+    };
+}
+
+export fn segment_pack_index_lookup(path: &const byte, id: ObjectId, arena: &Arena) !SegmentPackIndexEntry {
+    if path == null {
+        return error.SegmentPackNotFound;
+    }
+
+    var st: Stat = Stat{};
+    if stat(path, &st) != 0 {
+        if errno == ENOENT {
+            return error.SegmentPackNotFound;
+        }
+        return error.SegmentPackOpenFailed;
+    }
+    const file_size: usize = st.st_size as usize;
+    if file_size < PACK_INDEX_HEADER_BYTES + PACK_INDEX_FOOTER_BYTES {
+        return error.SegmentPackInvalid;
+    }
+    if file_size > SEGMENT_PACK_MAX_BYTES {
+        return error.SegmentPackTooLarge;
+    }
+
+    const raw_bytes: &[byte] = try segment_pack_arena_bytes(arena, file_size);
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return error.SegmentPackOpenFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+    if fread(raw_bytes.ptr, 1 as usize, file_size, stream) != file_size {
+        return error.SegmentPackReadFailed;
+    }
+
+    var offset: usize = 0 as usize;
+    const input: &[byte] = raw_bytes.ptr[0: file_size];
+    const header: SegmentPackIndexHeader = try segment_pack_read_index_header(input, &offset);
+    if offset != PACK_INDEX_HEADER_BYTES {
+        return error.SegmentPackInvalid;
+    }
+    if header.entries_offset != PACK_INDEX_HEADER_BYTES as u64 || header.bloom_offset > file_size as u64 {
+        return error.SegmentPackInvalid;
+    }
+    if header.bloom_offset + PACK_INDEX_FOOTER_BYTES as u64 != file_size as u64 {
+        return error.SegmentPackInvalid;
+    }
+    if header.entry_count as u64 * PACK_INDEX_ENTRY_BYTES as u64 != header.bloom_offset - header.entries_offset {
+        return error.SegmentPackInvalid;
+    }
+
+    var footer_offset: usize = header.bloom_offset as usize;
+    const footer: SegmentPackIndexFooter = try segment_pack_read_index_footer(input, &footer_offset);
+    _ = footer;
+    if footer_offset != file_size {
+        return error.SegmentPackInvalid;
+    }
+    if footer.footer_crc32 != crc32_compute(input.ptr[header.bloom_offset as usize: PACK_INDEX_FOOTER_BYTES - 4 as usize]) {
+        return error.SegmentPackInvalid;
+    }
+
+    var low: usize = 0 as usize;
+    var high: usize = header.entry_count as usize;
+    while low < high {
+        const mid: usize = low + ((high - low) / 2 as usize);
+        const entry_offset: usize = header.entries_offset as usize + (mid * PACK_INDEX_ENTRY_BYTES);
+        const entry: SegmentPackIndexEntry = try segment_pack_decode_index_entry(input, entry_offset);
+        const cmp: i32 = object_id_compare(&id, &entry.object_id);
+        if cmp == 0 {
+            return entry;
+        }
+        if cmp < 0 {
+            high = mid;
+        } else {
+            low = mid + 1 as usize;
+        }
+    }
+
+    return error.SegmentPackObjectNotFound;
+}
+
+export fn segment_pack_index_read(path: &const byte, arena: &Arena) !SegmentPackIndexSnapshot {
+    if path == null {
+        return error.SegmentPackNotFound;
+    }
+
+    var st: Stat = Stat{};
+    if stat(path, &st) != 0 {
+        if errno == ENOENT {
+            return error.SegmentPackNotFound;
+        }
+        return error.SegmentPackOpenFailed;
+    }
+    const file_size: usize = st.st_size as usize;
+    if file_size < PACK_INDEX_HEADER_BYTES + PACK_INDEX_FOOTER_BYTES {
+        return error.SegmentPackInvalid;
+    }
+    if file_size > SEGMENT_PACK_MAX_BYTES {
+        return error.SegmentPackTooLarge;
+    }
+
+    const raw_bytes: &[byte] = try segment_pack_arena_bytes(arena, file_size);
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return error.SegmentPackOpenFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+    if fread(raw_bytes.ptr, 1 as usize, file_size, stream) != file_size {
+        return error.SegmentPackReadFailed;
+    }
+
+    var offset: usize = 0 as usize;
+    const input: &[byte] = raw_bytes.ptr[0: file_size];
+    const header: SegmentPackIndexHeader = try segment_pack_read_index_header(input, &offset);
+    if offset != PACK_INDEX_HEADER_BYTES {
+        return error.SegmentPackInvalid;
+    }
+    if header.entries_offset != PACK_INDEX_HEADER_BYTES as u64 || header.bloom_offset > file_size as u64 {
+        return error.SegmentPackInvalid;
+    }
+    const footer_offset: usize = file_size - PACK_INDEX_FOOTER_BYTES;
+    if header.bloom_offset as usize > footer_offset {
+        return error.SegmentPackInvalid;
+    }
+
+    var footer_cursor: usize = footer_offset;
+    const footer: SegmentPackIndexFooter = try segment_pack_read_index_footer(input, &footer_cursor);
+    if footer_cursor != file_size {
+        return error.SegmentPackInvalid;
+    }
+    if footer.footer_crc32 != crc32_compute(input.ptr[footer_offset: PACK_INDEX_FOOTER_BYTES - 4 as usize]) {
+        return error.SegmentPackInvalid;
+    }
+
+    return SegmentPackIndexSnapshot{
+        header: header,
+        bloom_block: ByteList{ ptr: &input.ptr[header.bloom_offset as usize], len: footer_offset - header.bloom_offset as usize },
+        footer: footer,
+        raw_bytes: ByteList{ ptr: input.ptr, len: input.len },
+    };
+}
+
+export fn segment_pack_write(pack_path: &const byte, index_path: &const byte, segment_seq: u64, created_at_ms: i64, base_generation: u64, records: &[SegmentPackWriteInput]) !SegmentPackWriteResult {
+    try segment_pack_validate_unique_inputs(records);
+
+    var data_bytes: u64 = 0u64;
+    var pack_total_len: usize = SEGMENT_PACK_HEADER_BYTES + SEGMENT_PACK_FOOTER_BYTES;
+    var index_total_len: usize = PACK_INDEX_HEADER_BYTES + PACK_INDEX_FOOTER_BYTES;
+
+    var i: usize = 0 as usize;
+    while i < records.len {
+        const record: &SegmentPackWriteInput = &records.ptr[i];
+        const record_bytes: u32 = try segment_pack_record_total_bytes(record);
+        data_bytes = data_bytes + record_bytes as u64;
+        pack_total_len = pack_total_len + record_bytes as usize;
+        index_total_len = index_total_len + PACK_INDEX_ENTRY_BYTES;
+        i = i + 1 as usize;
+    }
+
+    const pack_footer_offset: u64 = SEGMENT_PACK_HEADER_BYTES as u64 + data_bytes;
+    const index_footer_offset: u64 = PACK_INDEX_HEADER_BYTES as u64 + (records.len as u64 * PACK_INDEX_ENTRY_BYTES as u64);
+
+    const pack_raw: &byte = malloc(pack_total_len) as &byte;
+    if pack_raw == null {
+        return error.SegmentPackAlloc;
+    }
+    defer {
+        free(pack_raw as &void);
+    }
+    const pack_output: &[byte] = pack_raw[0: pack_total_len];
+
+    var pack_offset: usize = 0 as usize;
+    try codec_encode_u32(pack_output, &pack_offset, SEGMENT_PACK_MAGIC);
+    try codec_encode_u16(pack_output, &pack_offset, SEGMENT_PACK_VERSION);
+    try codec_encode_u16(pack_output, &pack_offset, SEGMENT_PACK_HEADER_BYTES as u16);
+    try codec_encode_u64(pack_output, &pack_offset, segment_seq);
+    try codec_encode_u64(pack_output, &pack_offset, records.len as u64);
+    try codec_encode_u64(pack_output, &pack_offset, data_bytes);
+    try codec_encode_u64(pack_output, &pack_offset, pack_footer_offset);
+    try codec_encode_i64(pack_output, &pack_offset, created_at_ms);
+    try codec_encode_u64(pack_output, &pack_offset, base_generation);
+    try codec_encode_u32(pack_output, &pack_offset, 0u32);
+    try codec_encode_u32(pack_output, &pack_offset, 0u32);
+    try segment_pack_store_u32(pack_output, SEGMENT_PACK_HEADER_CRC_OFFSET, crc32_compute(pack_output[0: SEGMENT_PACK_HEADER_CRC_OFFSET]));
+
+    i = 0 as usize;
+    while i < records.len {
+        const record: &SegmentPackWriteInput = &records.ptr[i];
+        const record_bytes: u32 = try segment_pack_record_total_bytes(record);
+        const record_start: usize = pack_offset;
+        const payload_crc32: u32 = crc32_compute(record.object_bytes.ptr[0: record.object_bytes.len]);
+        try codec_encode_u32(pack_output, &pack_offset, record_bytes);
+        try codec_encode_u16(pack_output, &pack_offset, object_kind_to_u16(record.kind));
+        try codec_encode_u16(pack_output, &pack_offset, record.flags);
+        try codec_encode_hash32(pack_output, &pack_offset, &record.object_id.hash);
+        try codec_encode_u32(pack_output, &pack_offset, payload_crc32);
+        var byte_index: usize = 0 as usize;
+        while byte_index < record.object_bytes.len {
+            pack_output.ptr[pack_offset + byte_index] = record.object_bytes.ptr[byte_index];
+            byte_index = byte_index + 1 as usize;
+        }
+        pack_offset = pack_offset + record.object_bytes.len;
+        // Trailer CRC covers the record bytes before the trailer field.
+        try codec_encode_u32(pack_output, &pack_offset, crc32_compute(pack_output.ptr[record_start: pack_offset - record_start]));
+        i = i + 1 as usize;
+    }
+
+    const zero_hash: Hash32 = segment_pack_zero_hash();
+    const footer_start: usize = pack_offset;
+    try codec_encode_u64(pack_output, &pack_offset, segment_seq);
+    try codec_encode_hash32(pack_output, &pack_offset, &zero_hash);
+    try codec_encode_u32(pack_output, &pack_offset, 0u32);
+    try codec_encode_u32(pack_output, &pack_offset, crc32_compute(pack_output.ptr[footer_start: pack_offset - footer_start]));
+    if pack_offset != pack_total_len {
+        return error.SegmentPackWriteFailed;
+    }
+
+    const index_raw: &byte = malloc(index_total_len) as &byte;
+    if index_raw == null {
+        return error.SegmentPackAlloc;
+    }
+    defer {
+        free(index_raw as &void);
+    }
+    const index_output: &[byte] = index_raw[0: index_total_len];
+
+    var index_offset: usize = 0 as usize;
+    try codec_encode_u32(index_output, &index_offset, PACK_INDEX_MAGIC);
+    try codec_encode_u16(index_output, &index_offset, PACK_INDEX_VERSION);
+    try codec_encode_u16(index_output, &index_offset, PACK_INDEX_HEADER_BYTES as u16);
+    try codec_encode_u64(index_output, &index_offset, segment_seq);
+    try codec_encode_u64(index_output, &index_offset, records.len as u64);
+    try codec_encode_u64(index_output, &index_offset, PACK_INDEX_HEADER_BYTES as u64);
+    try codec_encode_u64(index_output, &index_offset, index_footer_offset);
+    try codec_encode_u32(index_output, &index_offset, 0u32);
+    try codec_encode_u32(index_output, &index_offset, 0u32);
+    try segment_pack_store_u32(index_output, PACK_INDEX_HEADER_CRC_OFFSET, crc32_compute(index_output[0: PACK_INDEX_HEADER_CRC_OFFSET]));
+
+    var has_last_id: bool = false;
+    var last_id: ObjectId = ObjectId{ hash: segment_pack_zero_hash() };
+    i = 0 as usize;
+    while i < records.len {
+        const next_index: usize = try segment_pack_find_next_sorted_index(records, has_last_id, &last_id);
+        const record: &SegmentPackWriteInput = &records.ptr[next_index];
+        const entry_start: usize = index_offset;
+        try codec_encode_hash32(index_output, &index_offset, &record.object_id.hash);
+        try codec_encode_u64(index_output, &index_offset, try segment_pack_record_offset_for_index(records, next_index));
+        try codec_encode_u32(index_output, &index_offset, try segment_pack_record_total_bytes(record));
+        try codec_encode_u16(index_output, &index_offset, object_kind_to_u16(record.kind));
+        try codec_encode_u16(index_output, &index_offset, record.flags);
+        try codec_encode_u64(index_output, &index_offset, record.logical_size);
+        try codec_encode_u32(index_output, &index_offset, 0u32);
+        try codec_encode_u32(index_output, &index_offset, crc32_compute(index_output.ptr[entry_start: index_offset - entry_start]));
+        last_id = ObjectId{ hash: record.object_id.hash };
+        has_last_id = true;
+        i = i + 1 as usize;
+    }
+
+    const index_footer_start: usize = index_offset;
+    const index_footer_zero_hash: Hash32 = segment_pack_zero_hash();
+    const index_entries_zero_hash: Hash32 = segment_pack_zero_hash();
+    try codec_encode_hash32(index_output, &index_offset, &index_footer_zero_hash);
+    try codec_encode_hash32(index_output, &index_offset, &index_entries_zero_hash);
+    try codec_encode_u32(index_output, &index_offset, 0u32);
+    try codec_encode_u32(index_output, &index_offset, crc32_compute(index_output.ptr[index_footer_start: index_offset - index_footer_start]));
+    if index_offset != index_total_len {
+        return error.SegmentPackWriteFailed;
+    }
+
+    try segment_pack_write_file(pack_path, pack_output);
+    try segment_pack_write_file(index_path, index_output);
+
+    return SegmentPackWriteResult{
+        object_count: records.len as u64,
+        data_bytes: data_bytes,
+        pack_bytes: pack_total_len as u64,
+        index_bytes: index_total_len as u64,
+        pack_footer_offset: pack_footer_offset,
+        index_footer_offset: index_footer_offset,
+    };
+}
