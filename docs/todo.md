@@ -166,10 +166,10 @@
 - [x] 实现 `hgx add <pathspec>`。
 - [x] 实现 staging metadata。
 - [x] `hgx add` 按 pathspec 定向扫描，避免单文件 add 触发全仓库枚举。
-- [ ] `hgx add` 复用 `LocalChangeDB` / `(inode, mtime_ns, logical_size)` 快速路径，未改文件不重复全量 hash。
+- [x] `hgx add` 复用 `LocalChangeDB` / `(inode, mtime_ns, logical_size)` 快速路径，未改文件不重复全量 hash。
 - [x] 为 `workspace/stage.hgi` 增加原子发布语义（repo-local lock 或 CAS）。
 - [x] 测试两个 `hgx add` 并发更新 stage 不丢 staging 结果。
-- [ ] 测试 `hgx add <pathspec>` 不遍历无关目录（包括无关大目录和无关权限受限目录）。
+- [x] 测试 `hgx add <pathspec>` 不遍历无关目录（包括无关大目录和无关权限受限目录）。
 - [x] 实现 staged / unstaged 状态分离输出。
 - [x] 实现 manifest root 构建。
 - [x] 实现 commit object 构建。
@@ -295,9 +295,9 @@
 - [x] 实现 `TaskKind`。
 - [x] 实现任务队列。
 - [x] 实现 worker pool。
-- [ ] 实现 atomic 进度计数。
-- [ ] 实现任务错误聚合。
-- [ ] 实现 graceful shutdown。
+- [x] 实现 atomic 进度计数。
+- [x] 实现任务错误聚合。
+- [x] 实现 graceful shutdown。
 - [ ] 接入 parallel manifest diff。
 - [ ] 接入 parallel checkout。
 - [ ] 接入 parallel pack read。

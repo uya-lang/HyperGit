@@ -61,7 +61,7 @@ export fn task_kind_from_u16(value: u16) !TaskKind {
     return error.ExecInvalidTaskKind;
 }
 
-export struct Task {
+export struct ExecTask {
     id: u64,
     kind: TaskKind,
     priority: u16,
@@ -75,8 +75,8 @@ export fn task_init(
     priority: u16,
     input_offset: u64,
     input_len: u64,
-) Task {
-    return Task{
+) ExecTask {
+    return ExecTask{
         id: id,
         kind: kind,
         priority: priority,

@@ -4,7 +4,7 @@ use std.testing.run_test;
 use std.testing.test_suite_begin;
 use std.testing.test_suite_end;
 
-use exec.task.Task;
+use exec.task.ExecTask;
 use exec.task.TaskKind;
 use exec.task.task_init;
 use exec.task.task_kind_from_u16;
@@ -30,7 +30,7 @@ fn test_task_kind_rejects_invalid_value() !void {
 }
 
 fn test_task_init_sets_fields() !void {
-    const task: Task = task_init(
+    const task: ExecTask = task_init(
         12u64,
         TaskKind.MergeShard,
         7 as u16,

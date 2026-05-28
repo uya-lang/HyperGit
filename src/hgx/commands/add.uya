@@ -60,16 +60,23 @@ use store.loose_store.loose_store_open;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
 use store.repo_layout.RepoPath;
 use store.repo_layout.repo_find_root_from_cwd;
 use store.repo_layout.repo_path_cstr;
 use store.repo_layout.repo_path_join_literal;
+use workspace.local_change_file.local_change_file_read;
+use workspace.local_change_file.local_change_file_write;
 use workspace.scan.WorkspaceFileEntry;
 use workspace.scan.WorkspaceFileKind;
 use workspace.scan.WorkspaceFileList;
 use workspace.scan.workspace_scan_files;
 use workspace.scan.workspace_scan_files_for_pathspecs;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_list_from_slice;
 use workspace.stage.StageEntry;
 use workspace.stage.StageEntryKind;
 use workspace.stage.StageEntryList;
@@ -93,6 +100,8 @@ error AddPathTooLong;
 error AddUsage;
 error AddReadFailed;
 error AddStoreFailed;
+error AddLocalChangeReadFailed;
+error AddLocalChangeWriteFailed;
 error AddStageReadFailed;
 error AddStageWriteFailed;
 error AddTimeFailed;
@@ -116,6 +125,11 @@ struct AddFsPath {
 struct AddOwnedBytes {
     raw: &byte,
     len: usize
+}
+
+struct AddCachedObjectResult {
+    hit: bool,
+    object_id: ObjectId
 }
 
 fn add_zero_object_id() ObjectId {
@@ -303,6 +317,37 @@ fn add_stage_entry_clone(entry: &StageEntry) StageEntry {
     };
 }
 
+fn add_local_change_clone(change: &LocalChange) LocalChange {
+    return LocalChange{
+        path: ByteList{ ptr: change.path.ptr, len: change.path.len },
+        base_object: ObjectId{ hash: add_hash32_clone(&change.base_object.hash) },
+        working_hash: add_hash32_clone(&change.working_hash),
+        status: change.status,
+        last_seen_inode: change.last_seen_inode,
+        last_seen_mtime_ns: change.last_seen_mtime_ns,
+        last_seen_logical_size: change.last_seen_logical_size,
+        watcher_seq: change.watcher_seq,
+        reconcile_epoch: change.reconcile_epoch,
+    };
+}
+
+fn add_cached_object_miss() AddCachedObjectResult {
+    return AddCachedObjectResult{
+        hit: false,
+        object_id: add_zero_object_id(),
+    };
+}
+
+fn add_hash32_clone(value: &Hash32) Hash32 {
+    var out: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        out.bytes[i] = value.bytes[i];
+        i = i + 1 as usize;
+    }
+    return out;
+}
+
 fn add_byte_list_equal(left: &ByteList, right: &ByteList) bool {
     if left.len != right.len {
         return false;
@@ -326,6 +371,15 @@ fn add_load_existing_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapsh
         return error.AddStageReadFailed;
     };
     return snapshot;
+}
+
+fn add_load_local_changes(local_change_path: &RepoPath, arena: &Arena) !LocalChangeList {
+    return local_change_file_read(arena, repo_path_cstr(local_change_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.LocalChangeFileNotFound) {
+            return LocalChangeList{ ptr: null, len: 0 };
+        }
+        return error.AddLocalChangeReadFailed;
+    };
 }
 
 fn add_load_base_inputs(arena: &Arena, store: &LooseObjectStore, base_commit: &CommitId) !ManifestLeafInputList {
@@ -368,6 +422,121 @@ fn add_workspace_has_path(files: &WorkspaceFileList, path: &ByteList) bool {
     return false;
 }
 
+fn add_find_local_change(changes: &LocalChangeList, path: &ByteList) isize {
+    var i: usize = 0;
+    while i < changes.len {
+        if add_byte_list_equal(&changes.ptr[i].path, path) {
+            return i as isize;
+        }
+        i = i + 1 as usize;
+    }
+    return -1 as isize;
+}
+
+fn add_local_change_metadata_matches(change: &LocalChange, file_entry: &WorkspaceFileEntry) bool {
+    return change.last_seen_inode == file_entry.inode &&
+        change.last_seen_mtime_ns == file_entry.mtime_ns &&
+        change.last_seen_logical_size == file_entry.logical_size;
+}
+
+fn add_try_reuse_cached_object(
+    store: &LooseObjectStore,
+    local_changes: &LocalChangeList,
+    file_entry: &WorkspaceFileEntry,
+) !AddCachedObjectResult {
+    const local_change_index: isize = add_find_local_change(local_changes, &file_entry.path);
+    if local_change_index < 0 as isize {
+        return add_cached_object_miss();
+    }
+
+    const change: &LocalChange = &local_changes.ptr[local_change_index as usize];
+    if !add_local_change_metadata_matches(change, file_entry) {
+        return add_cached_object_miss();
+    }
+    if change.status == ChangeStatus.Virtual || change.status == ChangeStatus.Deleted || change.status == ChangeStatus.Conflict {
+        return add_cached_object_miss();
+    }
+
+    const object_id: ObjectId = object_id_from_hash(change.working_hash);
+    if change.status == ChangeStatus.Materialized {
+        return AddCachedObjectResult{ hit: true, object_id: object_id };
+    }
+
+    const has_cached_object: bool = store.has(object_id) catch {
+        return error.AddStoreFailed;
+    };
+    if !has_cached_object {
+        return add_cached_object_miss();
+    }
+    return AddCachedObjectResult{ hit: true, object_id: object_id };
+}
+
+fn add_sort_stage_entries(entries: &StageEntry, len: usize) void {
+    if len <= 1 as usize {
+        return;
+    }
+
+    var i: usize = 1 as usize;
+    while i < len {
+        const current_path: ByteList = ByteList{ ptr: entries[i].path.ptr, len: entries[i].path.len };
+        const current_kind: StageEntryKind = entries[i].kind;
+        const current_base_hash: Hash32 = add_hash32_clone(&entries[i].base_object.hash);
+        const current_has_staged: bool = entries[i].has_staged_object;
+        const current_staged_hash: Hash32 = add_hash32_clone(&entries[i].staged_object.hash);
+        const current_file_mode: u32 = entries[i].file_mode;
+        var j: usize = i;
+        while j > 0 as usize && manifest_path_compare(&entries[j - 1 as usize].path, &current_path) > 0 {
+            entries[j] = entries[j - 1 as usize];
+            j = j - 1 as usize;
+        }
+        entries[j] = StageEntry{
+            path: ByteList{ ptr: current_path.ptr, len: current_path.len },
+            kind: current_kind,
+            base_object: ObjectId{ hash: add_hash32_clone(&current_base_hash) },
+            has_staged_object: current_has_staged,
+            staged_object: ObjectId{ hash: add_hash32_clone(&current_staged_hash) },
+            file_mode: current_file_mode,
+        };
+        i = i + 1 as usize;
+    }
+}
+
+fn add_sort_local_changes(changes: &LocalChange, len: usize) void {
+    if len <= 1 as usize {
+        return;
+    }
+
+    var i: usize = 1 as usize;
+    while i < len {
+        const current_path: ByteList = ByteList{ ptr: changes[i].path.ptr, len: changes[i].path.len };
+        const current_base_hash: Hash32 = add_hash32_clone(&changes[i].base_object.hash);
+        const current_working_hash: Hash32 = add_hash32_clone(&changes[i].working_hash);
+        const current_status: ChangeStatus = changes[i].status;
+        const current_inode: u64 = changes[i].last_seen_inode;
+        const current_mtime_ns: i64 = changes[i].last_seen_mtime_ns;
+        const current_logical_size: u64 = changes[i].last_seen_logical_size;
+        const current_watcher_seq: u64 = changes[i].watcher_seq;
+        const current_reconcile_epoch: u64 = changes[i].reconcile_epoch;
+        var j: usize = i;
+        while j > 0 as usize && manifest_path_compare(&changes[j - 1 as usize].path, &current_path) > 0 {
+            changes[j] = changes[j - 1 as usize];
+            j = j - 1 as usize;
+        }
+        changes[j] = LocalChange{
+            path: ByteList{ ptr: current_path.ptr, len: current_path.len },
+            base_object: ObjectId{ hash: add_hash32_clone(&current_base_hash) },
+            working_hash: add_hash32_clone(&current_working_hash),
+            status: current_status,
+            last_seen_inode: current_inode,
+            last_seen_mtime_ns: current_mtime_ns,
+            last_seen_logical_size: current_logical_size,
+            watcher_seq: current_watcher_seq,
+            reconcile_epoch: current_reconcile_epoch,
+        };
+        i = i + 1 as usize;
+    }
+}
+
 fn add_merge_entries(arena: &Arena, existing: StageEntryList, updates: &StageEntry, update_len: usize) !StageEntryList {
     const max_len: usize = existing.len + update_len;
     const raw: &StageEntry = arena_alloc(arena, @size_of(StageEntry) as usize * max_len) as &StageEntry;
@@ -408,6 +577,50 @@ fn add_merge_entries(arena: &Arena, existing: StageEntryList, updates: &StageEnt
     return stage_entry_list_from_slice(raw[0: out_index]);
 }
 
+fn add_merge_local_changes(arena: &Arena, existing: LocalChangeList, updates: &LocalChange, update_len: usize) !LocalChangeList {
+    const max_len: usize = existing.len + update_len;
+    if max_len == 0 as usize {
+        return LocalChangeList{ ptr: null, len: 0 };
+    }
+
+    const raw: &LocalChange = arena_alloc(arena, @size_of(LocalChange) as usize * max_len) as &LocalChange;
+    if raw == null {
+        return error.AddAlloc;
+    }
+
+    var existing_index: usize = 0;
+    var update_index: usize = 0;
+    var out_index: usize = 0;
+    while existing_index < existing.len && update_index < update_len {
+        const cmp: i32 = manifest_path_compare(&existing.ptr[existing_index].path, &updates[update_index].path);
+        if cmp < 0 {
+            raw[out_index] = add_local_change_clone(&existing.ptr[existing_index]);
+            existing_index = existing_index + 1 as usize;
+        } else if cmp > 0 {
+            raw[out_index] = add_local_change_clone(&updates[update_index]);
+            update_index = update_index + 1 as usize;
+        } else {
+            raw[out_index] = add_local_change_clone(&updates[update_index]);
+            existing_index = existing_index + 1 as usize;
+            update_index = update_index + 1 as usize;
+        }
+        out_index = out_index + 1 as usize;
+    }
+
+    while existing_index < existing.len {
+        raw[out_index] = add_local_change_clone(&existing.ptr[existing_index]);
+        existing_index = existing_index + 1 as usize;
+        out_index = out_index + 1 as usize;
+    }
+    while update_index < update_len {
+        raw[out_index] = add_local_change_clone(&updates[update_index]);
+        update_index = update_index + 1 as usize;
+        out_index = out_index + 1 as usize;
+    }
+
+    return local_change_list_from_slice(raw[0: out_index]);
+}
+
 export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) !usize {
     const arena_storage: &byte = malloc(ADD_ARENA_BYTES) as &byte;
     if arena_storage == null {
@@ -428,6 +641,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     );
 
     const stage_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STAGE_REL);
+    const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
     const stage_lock: StageFileLock = stage_file_lock_acquire(repo_path_cstr(&stage_path) as &const byte) catch {
         return error.AddStageWriteFailed;
     };
@@ -435,6 +649,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         stage_file_lock_release(&stage_lock);
     }
     const existing_snapshot: StageSnapshot = try add_load_existing_snapshot(&stage_path, &arena);
+    const existing_local_changes: LocalChangeList = try add_load_local_changes(&local_change_path, &arena);
 
     const matched_count: usize = add_count_matches(&scanned_files, &pathspecs);
 
@@ -462,10 +677,15 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     if raw_updates == null {
         return error.AddAlloc;
     }
+    const raw_change_updates: &LocalChange = arena_alloc(&arena, @size_of(LocalChange) as usize * max_updates) as &LocalChange;
+    if raw_change_updates == null {
+        return error.AddAlloc;
+    }
 
     const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
 
     var update_index: usize = 0;
+    var change_update_index: usize = 0;
     var file_index: usize = 0;
     while file_index < scanned_files.len {
         const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
@@ -478,59 +698,105 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
             return error.AddSymlinkNotImplemented;
         }
 
-        const fs_path: AddFsPath = try add_fs_path_join(&root_fs_path, file_entry.path.ptr[0: file_entry.path.len]);
-        const file_bytes: AddOwnedBytes = try add_read_file_bytes(&fs_path, file_entry.logical_size as usize);
-        defer {
-            add_owned_bytes_free(&file_bytes);
-        }
+        const base_entry_index: isize = add_find_base_entry(
+            ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+            &file_entry.path,
+        );
+        const cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(
+            &store,
+            &existing_local_changes,
+            file_entry,
+        );
         var stored_id: ObjectId = add_zero_object_id();
-        if large_file_uses_small_blob(file_entry.logical_size) {
-            const payload: SmallBlobPayload = SmallBlobPayload{
-                logical_size: file_entry.logical_size,
-                content_hash: small_blob_content_hash(add_owned_bytes_slice(&file_bytes)),
-                payload: ByteList{ ptr: file_bytes.raw, len: file_bytes.len },
-            };
-            const encoded: AddOwnedBytes = try add_encode_small_blob_payload(&payload);
-            defer {
-                add_owned_bytes_free(&encoded);
-            }
-            stored_id = store.put(ObjectKind.SmallBlob, add_owned_bytes_slice(&encoded)) catch {
-                return error.AddStoreFailed;
-            };
+        if cached_object.hit {
+            stored_id = cached_object.object_id;
         } else {
-            const scratch_len: usize = try large_prepare_recommended_arena_bytes(file_entry.logical_size);
-            const scratch: &byte = malloc(scratch_len) as &byte;
-            if scratch == null {
-                return error.AddAlloc;
-            }
+            const fs_path: AddFsPath = try add_fs_path_join(&root_fs_path, file_entry.path.ptr[0: file_entry.path.len]);
+            const file_bytes: AddOwnedBytes = try add_read_file_bytes(&fs_path, file_entry.logical_size as usize);
             defer {
-                free(scratch as &void);
+                add_owned_bytes_free(&file_bytes);
             }
-            var large_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
-            arena_init(&large_arena, scratch, scratch_len);
 
-            const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_default(&large_arena, add_owned_bytes_slice(&file_bytes), FileType.Binary);
-            var part_index: usize = 0 as usize;
-            while part_index < prepared.parts.len {
-                const chunk: &LargeChunk = &prepared.chunks.ptr[part_index];
-                const stored: ChunkStorePutResult = try chunk_store_put(&chunk_store, chunk.bytes.ptr[0: chunk.bytes.len]);
-                if hash32_compare(&stored.storage_id, &prepared.parts.ptr[part_index].storage_id) != 0 ||
-                    hash32_compare(&stored.stored_checksum, &prepared.parts.ptr[part_index].checksum) != 0 ||
-                    stored.stored_size != prepared.parts.ptr[part_index].stored_size {
-                    return error.AddStoreFailed;
+            if large_file_uses_small_blob(file_entry.logical_size) {
+                const payload: SmallBlobPayload = SmallBlobPayload{
+                    logical_size: file_entry.logical_size,
+                    content_hash: small_blob_content_hash(add_owned_bytes_slice(&file_bytes)),
+                    payload: ByteList{ ptr: file_bytes.raw, len: file_bytes.len },
+                };
+                const encoded: AddOwnedBytes = try add_encode_small_blob_payload(&payload);
+                defer {
+                    add_owned_bytes_free(&encoded);
                 }
-                part_index = part_index + 1 as usize;
-            }
+                stored_id = store.put(ObjectKind.SmallBlob, add_owned_bytes_slice(&encoded)) catch {
+                    return error.AddStoreFailed;
+                };
+            } else {
+                const scratch_len: usize = try large_prepare_recommended_arena_bytes(file_entry.logical_size);
+                const scratch: &byte = malloc(scratch_len) as &byte;
+                if scratch == null {
+                    return error.AddAlloc;
+                }
+                defer {
+                    free(scratch as &void);
+                }
+                var large_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+                arena_init(&large_arena, scratch, scratch_len);
 
-            const encoded_payload: ByteList = try chunked_blob_payload_to_canonical(&large_arena, &prepared.payload);
-            stored_id = store.put(ObjectKind.ChunkedBlob, encoded_payload.ptr[0: encoded_payload.len]) catch {
-                return error.AddStoreFailed;
-            };
+                const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_default(&large_arena, add_owned_bytes_slice(&file_bytes), FileType.Binary);
+                var part_index: usize = 0 as usize;
+                while part_index < prepared.parts.len {
+                    const chunk: &LargeChunk = &prepared.chunks.ptr[part_index];
+                    const stored: ChunkStorePutResult = try chunk_store_put(&chunk_store, chunk.bytes.ptr[0: chunk.bytes.len]);
+                    if hash32_compare(&stored.storage_id, &prepared.parts.ptr[part_index].storage_id) != 0 ||
+                        hash32_compare(&stored.stored_checksum, &prepared.parts.ptr[part_index].checksum) != 0 ||
+                        stored.stored_size != prepared.parts.ptr[part_index].stored_size {
+                        return error.AddStoreFailed;
+                    }
+                    part_index = part_index + 1 as usize;
+                }
+
+                const encoded_payload: ByteList = try chunked_blob_payload_to_canonical(&large_arena, &prepared.payload);
+                stored_id = store.put(ObjectKind.ChunkedBlob, encoded_payload.ptr[0: encoded_payload.len]) catch {
+                    return error.AddStoreFailed;
+                };
+            }
         }
-        const base_entry_index: isize = add_find_base_entry(ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len }, &file_entry.path);
+
+        const existing_local_change_index: isize = add_find_local_change(&existing_local_changes, &file_entry.path);
+        var watcher_seq: u64 = 0u64;
+        var reconcile_epoch: u64 = 0u64;
+        if existing_local_change_index >= 0 as isize {
+            watcher_seq = existing_local_changes.ptr[existing_local_change_index as usize].watcher_seq;
+            reconcile_epoch = existing_local_changes.ptr[existing_local_change_index as usize].reconcile_epoch;
+        }
+
+        var base_object: ObjectId = add_zero_object_id();
+        var local_status: ChangeStatus = ChangeStatus.Added;
         if base_entry_index >= 0 as isize {
             const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_entry_index as usize];
+            base_object = ObjectId{ hash: base_entry.object_id.hash };
+            local_status = ChangeStatus.Modified;
             if object_id_compare(&stored_id, &base_entry.object_id) == 0 && file_entry.file_mode == base_entry.mode {
+                local_status = ChangeStatus.Materialized;
+            }
+        }
+
+        raw_change_updates[change_update_index] = LocalChange{
+            path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
+            base_object: ObjectId{ hash: add_hash32_clone(&base_object.hash) },
+            working_hash: add_hash32_clone(&stored_id.hash),
+            status: local_status,
+            last_seen_inode: file_entry.inode,
+            last_seen_mtime_ns: file_entry.mtime_ns,
+            last_seen_logical_size: file_entry.logical_size,
+            watcher_seq: watcher_seq,
+            reconcile_epoch: reconcile_epoch,
+        };
+        change_update_index = change_update_index + 1 as usize;
+
+        if base_entry_index >= 0 as isize {
+            const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_entry_index as usize];
+            if local_status == ChangeStatus.Materialized {
                 file_index = file_index + 1;
                 continue;
             }
@@ -552,7 +818,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 file_mode: file_entry.file_mode,
             };
         }
-        update_index = update_index + 1;
+        update_index = update_index + 1 as usize;
         file_index = file_index + 1;
     }
 
@@ -560,6 +826,27 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     while base_index < base_inputs.len {
         const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_index];
         if manifest_pathspec_matches_any(pathspecs, &base_entry.path) && !add_workspace_has_path(&scanned_files, &base_entry.path) {
+            const existing_local_change_index: isize = add_find_local_change(&existing_local_changes, &base_entry.path);
+            var watcher_seq: u64 = 0u64;
+            var reconcile_epoch: u64 = 0u64;
+            if existing_local_change_index >= 0 as isize {
+                watcher_seq = existing_local_changes.ptr[existing_local_change_index as usize].watcher_seq;
+                reconcile_epoch = existing_local_changes.ptr[existing_local_change_index as usize].reconcile_epoch;
+            }
+
+            raw_change_updates[change_update_index] = LocalChange{
+                path: ByteList{ ptr: base_entry.path.ptr, len: base_entry.path.len },
+                base_object: ObjectId{ hash: base_entry.object_id.hash },
+                working_hash: Hash32{ bytes: [] },
+                status: ChangeStatus.Deleted,
+                last_seen_inode: 0u64,
+                last_seen_mtime_ns: 0i64,
+                last_seen_logical_size: 0u64,
+                watcher_seq: watcher_seq,
+                reconcile_epoch: reconcile_epoch,
+            };
+            change_update_index = change_update_index + 1 as usize;
+
             raw_updates[update_index] = StageEntry{
                 path: ByteList{ ptr: base_entry.path.ptr, len: base_entry.path.len },
                 kind: StageEntryKind.Delete,
@@ -574,9 +861,22 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     }
 
     if update_index == 0 {
+        if change_update_index > 0 as usize {
+            add_sort_local_changes(raw_change_updates, change_update_index);
+            const merged_local_changes: LocalChangeList = try add_merge_local_changes(
+                &arena,
+                LocalChangeList{ ptr: existing_local_changes.ptr, len: existing_local_changes.len },
+                raw_change_updates,
+                change_update_index,
+            );
+            local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &merged_local_changes) catch {
+                return error.AddLocalChangeWriteFailed;
+            };
+        }
         return 0 as usize;
     }
 
+    add_sort_stage_entries(raw_updates, update_index);
     const merged_entries: StageEntryList = try add_merge_entries(&arena, existing_snapshot.entries, raw_updates, update_index);
     const current_ms: u64 = now_ms() catch {
         return error.AddTimeFailed;
@@ -586,6 +886,19 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     stage_file_write(repo_path_cstr(&stage_path) as &const byte, &snapshot) catch {
         return error.AddStageWriteFailed;
     };
+
+    if change_update_index > 0 as usize {
+        add_sort_local_changes(raw_change_updates, change_update_index);
+        const merged_local_changes: LocalChangeList = try add_merge_local_changes(
+            &arena,
+            LocalChangeList{ ptr: existing_local_changes.ptr, len: existing_local_changes.len },
+            raw_change_updates,
+            change_update_index,
+        );
+        local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &merged_local_changes) catch {
+            return error.AddLocalChangeWriteFailed;
+        };
+    }
     return update_index;
 }
 

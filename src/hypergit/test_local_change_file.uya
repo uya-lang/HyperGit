@@ -41,6 +41,7 @@ fn test_local_change_file_roundtrip() !void {
             status: ChangeStatus.Materialized,
             last_seen_inode: 11u64,
             last_seen_mtime_ns: 22i64,
+            last_seen_logical_size: 5u64,
             watcher_seq: 3u64,
             reconcile_epoch: 4u64,
         },
@@ -51,6 +52,7 @@ fn test_local_change_file_roundtrip() !void {
             status: ChangeStatus.Modified,
             last_seen_inode: 33u64,
             last_seen_mtime_ns: 44i64,
+            last_seen_logical_size: 5u64,
             watcher_seq: 7u64,
             reconcile_epoch: 8u64,
         },
@@ -61,6 +63,7 @@ fn test_local_change_file_roundtrip() !void {
             status: ChangeStatus.Virtual,
             last_seen_inode: 0u64,
             last_seen_mtime_ns: 0i64,
+            last_seen_logical_size: 0u64,
             watcher_seq: 0u64,
             reconcile_epoch: 0u64,
         },
@@ -79,6 +82,7 @@ fn test_local_change_file_roundtrip() !void {
     try expect(loaded.ptr[1].status == ChangeStatus.Modified);
     try expect(loaded.ptr[2].status == ChangeStatus.Virtual);
     try expect(loaded.ptr[0].last_seen_inode == 11u64);
+    try expect(loaded.ptr[0].last_seen_logical_size == 5u64);
     try expect(loaded.ptr[1].reconcile_epoch == 8u64);
 }
 

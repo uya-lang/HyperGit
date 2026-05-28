@@ -32,6 +32,7 @@ fn workspace_reconcile_entry_from_base(
     status: ChangeStatus,
     inode: u64,
     mtime_ns: i64,
+    logical_size: u64,
     watcher_seq: u64,
     reconcile_epoch: u64,
 ) LocalChange {
@@ -42,6 +43,7 @@ fn workspace_reconcile_entry_from_base(
         status: status,
         last_seen_inode: inode,
         last_seen_mtime_ns: mtime_ns,
+        last_seen_logical_size: logical_size,
         watcher_seq: watcher_seq,
         reconcile_epoch: reconcile_epoch,
     };
@@ -61,6 +63,7 @@ fn workspace_reconcile_added_change(
         ChangeStatus.Added,
         entry.inode,
         entry.mtime_ns,
+        entry.logical_size,
         watcher_seq,
         reconcile_epoch,
     );
@@ -87,6 +90,7 @@ fn workspace_reconcile_materialized_or_modified_change(
         status,
         entry.inode,
         entry.mtime_ns,
+        entry.logical_size,
         watcher_seq,
         reconcile_epoch,
     );
@@ -104,6 +108,7 @@ fn workspace_reconcile_deleted_change(
         ChangeStatus.Deleted,
         0u64,
         0i64,
+        0u64,
         watcher_seq,
         reconcile_epoch,
     );

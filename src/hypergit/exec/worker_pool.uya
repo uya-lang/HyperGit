@@ -6,6 +6,11 @@ use std.thread.thread_pool_pending_count;
 use std.thread.thread_pool_shutdown;
 use std.thread.thread_pool_started_workers;
 
+use exec.control.ExecControl;
+use exec.control.exec_control_is_finished;
+use exec.control.exec_control_request_shutdown;
+use exec.control.exec_control_should_accept;
+
 export struct WorkerPool {
     inner: ThreadPool
 }
@@ -25,6 +30,17 @@ export fn worker_pool_pending_count(pool: &WorkerPool) i32 {
 }
 
 export fn worker_pool_shutdown(pool: &WorkerPool) void {
+    thread_pool_shutdown(&pool.inner);
+}
+
+export fn worker_pool_should_accept(control: &ExecControl) bool {
+    return exec_control_should_accept(control);
+}
+
+export fn worker_pool_shutdown_graceful(pool: &WorkerPool, control: &ExecControl) void {
+    exec_control_request_shutdown(control);
+    while !exec_control_is_finished(control) {
+    }
     thread_pool_shutdown(&pool.inner);
 }
 

@@ -1,0 +1,160 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use exec.task.ExecTask;
+use exec.task.TaskKind;
+
+error ExecTaskErrorAlloc;
+error ExecTaskErrorListFull;
+
+export struct ProgressCounter {
+    total: u64,
+    completed: atomic u64,
+    failed: atomic u64
+}
+
+export struct TaskError {
+    task_id: u64,
+    kind: TaskKind,
+    error_id: u32
+}
+
+export struct TaskErrorList {
+    ptr: &TaskError,
+    len: usize,
+    cap: usize
+}
+
+export struct ShutdownState {
+    requested: atomic i32
+}
+
+export struct ExecControl {
+    progress: ProgressCounter,
+    errors: TaskErrorList,
+    shutdown: ShutdownState
+}
+
+export fn progress_counter_init(total: u64) ProgressCounter {
+    return ProgressCounter{
+        total: total,
+        completed: 0u64,
+        failed: 0u64,
+    };
+}
+
+export fn progress_counter_total(counter: &ProgressCounter) u64 {
+    return counter.total;
+}
+
+export fn progress_counter_completed(counter: &ProgressCounter) u64 {
+    return counter.completed as u64;
+}
+
+export fn progress_counter_failed(counter: &ProgressCounter) u64 {
+    return counter.failed as u64;
+}
+
+export fn progress_counter_remaining(counter: &ProgressCounter) u64 {
+    if counter.completed >= counter.total {
+        return 0u64;
+    }
+    return counter.total - counter.completed;
+}
+
+export fn progress_counter_is_finished(counter: &ProgressCounter) bool {
+    return counter.completed >= counter.total;
+}
+
+export fn progress_counter_mark_completed(counter: &ProgressCounter) void {
+    counter.completed = counter.completed + 1u64;
+}
+
+export fn progress_counter_mark_failed(counter: &ProgressCounter) void {
+    counter.failed = counter.failed + 1u64;
+    counter.completed = counter.completed + 1u64;
+}
+
+export fn task_error_list_init(arena: &Arena, capacity: usize) !TaskErrorList {
+    if capacity == 0 as usize {
+        return TaskErrorList{
+            ptr: null,
+            len: 0 as usize,
+            cap: 0 as usize,
+        };
+    }
+
+    const raw: &TaskError = arena_alloc(arena, @size_of(TaskError) as usize * capacity) as &TaskError;
+    if raw == null {
+        return error.ExecTaskErrorAlloc;
+    }
+    return TaskErrorList{
+        ptr: raw,
+        len: 0 as usize,
+        cap: capacity,
+    };
+}
+
+export fn task_error_list_push(list: &TaskErrorList, task: &ExecTask, error_id: u32) !void {
+    if list.len >= list.cap {
+        return error.ExecTaskErrorListFull;
+    }
+    list.ptr[list.len] = TaskError{
+        task_id: task.id,
+        kind: task.kind,
+        error_id: error_id,
+    };
+    list.len = list.len + 1 as usize;
+}
+
+export fn shutdown_state_init() ShutdownState {
+    return ShutdownState{
+        requested: 0,
+    };
+}
+
+export fn shutdown_state_request(state: &ShutdownState) void {
+    state.requested = 1;
+}
+
+export fn shutdown_state_is_requested(state: &ShutdownState) bool {
+    return state.requested != 0;
+}
+
+export fn exec_control_init(arena: &Arena, total: u64, error_capacity: usize) !ExecControl {
+    return ExecControl{
+        progress: progress_counter_init(total),
+        errors: try task_error_list_init(arena, error_capacity),
+        shutdown: shutdown_state_init(),
+    };
+}
+
+export fn exec_control_should_accept(control: &ExecControl) bool {
+    return !shutdown_state_is_requested(&control.shutdown);
+}
+
+export fn exec_control_request_shutdown(control: &ExecControl) void {
+    shutdown_state_request(&control.shutdown);
+}
+
+export fn exec_control_is_shutdown_requested(control: &ExecControl) bool {
+    return shutdown_state_is_requested(&control.shutdown);
+}
+
+export fn exec_control_record_success(control: &ExecControl) void {
+    progress_counter_mark_completed(&control.progress);
+}
+
+export fn exec_control_record_failure(control: &ExecControl, task: &ExecTask, error_id: u32) !void {
+    progress_counter_mark_failed(&control.progress);
+    shutdown_state_request(&control.shutdown);
+    try task_error_list_push(&control.errors, task, error_id);
+}
+
+export fn exec_control_error_count(control: &ExecControl) usize {
+    return control.errors.len;
+}
+
+export fn exec_control_is_finished(control: &ExecControl) bool {
+    return progress_counter_is_finished(&control.progress);
+}

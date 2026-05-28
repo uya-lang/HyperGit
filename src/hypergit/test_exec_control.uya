@@ -1,0 +1,85 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use exec.control.ExecControl;
+use exec.control.ProgressCounter;
+use exec.control.exec_control_error_count;
+use exec.control.exec_control_init;
+use exec.control.exec_control_is_finished;
+use exec.control.exec_control_is_shutdown_requested;
+use exec.control.exec_control_record_failure;
+use exec.control.exec_control_record_success;
+use exec.control.exec_control_request_shutdown;
+use exec.control.exec_control_should_accept;
+use exec.control.progress_counter_completed;
+use exec.control.progress_counter_failed;
+use exec.control.progress_counter_init;
+use exec.control.progress_counter_is_finished;
+use exec.control.progress_counter_mark_completed;
+use exec.control.progress_counter_mark_failed;
+use exec.control.progress_counter_remaining;
+use exec.task.ExecTask;
+use exec.task.TaskKind;
+use exec.task.task_init;
+
+fn test_progress_counter_tracks_success_and_failure() !void {
+    var counter: ProgressCounter = progress_counter_init(3u64);
+    try expect(progress_counter_remaining(&counter) == 3u64);
+    try expect(!progress_counter_is_finished(&counter));
+
+    progress_counter_mark_completed(&counter);
+    progress_counter_mark_failed(&counter);
+    try expect(progress_counter_completed(&counter) == 2u64);
+    try expect(progress_counter_failed(&counter) == 1u64);
+    try expect(progress_counter_remaining(&counter) == 1u64);
+
+    progress_counter_mark_completed(&counter);
+    try expect(progress_counter_is_finished(&counter));
+}
+
+fn test_exec_control_records_error_and_requests_shutdown() !void {
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    var control: ExecControl = try exec_control_init(&arena, 2u64, 2 as usize);
+    const task: ExecTask = task_init(99u64, TaskKind.DiffShard, 1 as u16, 0u64, 16u64);
+
+    try expect(exec_control_should_accept(&control));
+    try exec_control_record_failure(&control, &task, 1234u32);
+    try expect(exec_control_is_shutdown_requested(&control));
+    try expect(!exec_control_should_accept(&control));
+    try expect(exec_control_error_count(&control) == 1 as usize);
+    try expect(control.errors.ptr[0].task_id == 99u64);
+    try expect(control.errors.ptr[0].kind == TaskKind.DiffShard);
+    try expect(control.errors.ptr[0].error_id == 1234u32);
+
+    exec_control_record_success(&control);
+    try expect(exec_control_is_finished(&control));
+}
+
+fn test_exec_control_can_request_shutdown_without_errors() !void {
+    var arena_buf: [byte: 1024] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1024 as usize);
+
+    var control: ExecControl = try exec_control_init(&arena, 0u64, 0 as usize);
+    try expect(exec_control_should_accept(&control));
+    exec_control_request_shutdown(&control);
+    try expect(exec_control_is_shutdown_requested(&control));
+    try expect(!exec_control_should_accept(&control));
+    try expect(exec_control_is_finished(&control));
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Exec Control Tests");
+    run_test("progress counter tracks success and failure", test_progress_counter_tracks_success_and_failure);
+    run_test("exec control records error and requests shutdown", test_exec_control_records_error_and_requests_shutdown);
+    run_test("exec control can request shutdown without errors", test_exec_control_can_request_shutdown_without_errors);
+    return test_suite_end();
+}

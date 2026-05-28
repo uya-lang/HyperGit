@@ -133,6 +133,7 @@ fn local_view_build_virtual_changes(arena: &Arena, full_inputs: &ManifestLeafInp
             status: ChangeStatus.Virtual,
             last_seen_inode: 0u64,
             last_seen_mtime_ns: 0i64,
+            last_seen_logical_size: 0u64,
             watcher_seq: watcher_seq,
             reconcile_epoch: reconcile_epoch,
         };

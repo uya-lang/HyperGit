@@ -1,14 +1,14 @@
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 
-use exec.task.Task;
+use exec.task.ExecTask;
 
 error ExecQueueAlloc;
 error ExecQueueFull;
 error ExecQueueEmpty;
 
 export struct TaskQueue {
-    ptr: &Task,
+    ptr: &ExecTask,
     cap: usize,
     head: usize,
     tail: usize,
@@ -26,7 +26,7 @@ export fn task_queue_init(arena: &Arena, capacity: usize) !TaskQueue {
         };
     }
 
-    const raw: &Task = arena_alloc(arena, @size_of(Task) as usize * capacity) as &Task;
+    const raw: &ExecTask = arena_alloc(arena, @size_of(ExecTask) as usize * capacity) as &ExecTask;
     if raw == null {
         return error.ExecQueueAlloc;
     }
@@ -51,7 +51,7 @@ export fn task_queue_is_full(queue: &TaskQueue) bool {
     return queue.len == queue.cap;
 }
 
-export fn task_queue_push(queue: &TaskQueue, task: &Task) !void {
+export fn task_queue_push(queue: &TaskQueue, task: &ExecTask) !void {
     if task_queue_is_full(queue) {
         return error.ExecQueueFull;
     }
@@ -67,12 +67,12 @@ export fn task_queue_push(queue: &TaskQueue, task: &Task) !void {
     queue.len = queue.len + 1 as usize;
 }
 
-export fn task_queue_pop(queue: &TaskQueue) !Task {
+export fn task_queue_pop(queue: &TaskQueue) !ExecTask {
     if task_queue_is_empty(queue) {
         return error.ExecQueueEmpty;
     }
 
-    const task: Task = queue.ptr[queue.head];
+    const task: ExecTask = queue.ptr[queue.head];
     queue.head = queue.head + 1 as usize;
     if queue.head == queue.cap {
         queue.head = 0 as usize;

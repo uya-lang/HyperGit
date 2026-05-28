@@ -6,10 +6,19 @@ use std.testing.test_suite_end;
 
 use std.async.Future;
 use std.async.block_on;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use exec.control.ExecControl;
+use exec.control.exec_control_init;
+use exec.control.exec_control_is_finished;
+use exec.control.exec_control_is_shutdown_requested;
+use exec.control.exec_control_record_success;
 use exec.worker_pool.WorkerPool;
 use exec.worker_pool.worker_pool_async_compute_i32;
 use exec.worker_pool.worker_pool_new;
 use exec.worker_pool.worker_pool_pending_count;
+use exec.worker_pool.worker_pool_should_accept;
+use exec.worker_pool.worker_pool_shutdown_graceful;
 use exec.worker_pool.worker_pool_shutdown;
 use exec.worker_pool.worker_pool_started_workers;
 
@@ -30,8 +39,34 @@ fn test_worker_pool_runs_async_compute() !void {
     try expect(worker_pool_pending_count(&pool) == 0);
 }
 
+fn test_worker_pool_tracks_atomic_progress_and_graceful_shutdown() !void {
+    var pool: WorkerPool = worker_pool_new(2);
+    var arena_buf: [byte: 1024] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1024 as usize);
+    var control: ExecControl = try exec_control_init(&arena, 2u64, 1 as usize);
+
+    try expect(worker_pool_should_accept(&control));
+
+    const first: Future<!i32> = worker_pool_async_compute_i32(&pool, &double_i32 as &void, 10);
+    const second: Future<!i32> = worker_pool_async_compute_i32(&pool, &double_i32 as &void, 11);
+    const first_value: i32 = try block_on<i32>(first);
+    try expect(first_value == 20 as i32);
+    exec_control_record_success(&control);
+    const second_value: i32 = try block_on<i32>(second);
+    try expect(second_value == 22 as i32);
+    exec_control_record_success(&control);
+
+    try expect(exec_control_is_finished(&control));
+    worker_pool_shutdown_graceful(&pool, &control);
+    try expect(exec_control_is_shutdown_requested(&control));
+    try expect(!worker_pool_should_accept(&control));
+    try expect(worker_pool_pending_count(&pool) == 0);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Exec Worker Pool Tests");
     run_test("worker pool runs async compute", test_worker_pool_runs_async_compute);
+    run_test("worker pool tracks atomic progress and graceful shutdown", test_worker_pool_tracks_atomic_progress_and_graceful_shutdown);
     return test_suite_end();
 }

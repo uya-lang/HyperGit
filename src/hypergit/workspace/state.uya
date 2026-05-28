@@ -33,6 +33,7 @@ export struct LocalChange {
     status: ChangeStatus,
     last_seen_inode: u64,
     last_seen_mtime_ns: i64,
+    last_seen_logical_size: u64,
     watcher_seq: u64,
     reconcile_epoch: u64
 }

@@ -13,7 +13,7 @@ use exec.queue.task_queue_is_full;
 use exec.queue.task_queue_len;
 use exec.queue.task_queue_pop;
 use exec.queue.task_queue_push;
-use exec.task.Task;
+use exec.task.ExecTask;
 use exec.task.TaskKind;
 use exec.task.task_init;
 
@@ -23,16 +23,16 @@ fn test_task_queue_push_pop_roundtrip() !void {
     arena_init(&arena, &arena_buf[0], 4096 as usize);
 
     var queue: TaskQueue = try task_queue_init(&arena, 4 as usize);
-    const first: Task = task_init(1u64, TaskKind.ReadObject, 1 as u16, 0u64, 8u64);
-    const second: Task = task_init(2u64, TaskKind.WriteObject, 2 as u16, 8u64, 4u64);
+    const first: ExecTask = task_init(1u64, TaskKind.ReadObject, 1 as u16, 0u64, 8u64);
+    const second: ExecTask = task_init(2u64, TaskKind.WriteObject, 2 as u16, 8u64, 4u64);
 
     try expect(task_queue_is_empty(&queue));
     try task_queue_push(&queue, &first);
     try task_queue_push(&queue, &second);
     try expect(task_queue_len(&queue) == 2 as usize);
 
-    const pop_first: Task = try task_queue_pop(&queue);
-    const pop_second: Task = try task_queue_pop(&queue);
+    const pop_first: ExecTask = try task_queue_pop(&queue);
+    const pop_second: ExecTask = try task_queue_pop(&queue);
     try expect(pop_first.id == 1u64);
     try expect(pop_second.id == 2u64);
     try expect(task_queue_is_empty(&queue));
@@ -44,9 +44,9 @@ fn test_task_queue_reports_full_and_wraps() !void {
     arena_init(&arena, &arena_buf[0], 4096 as usize);
 
     var queue: TaskQueue = try task_queue_init(&arena, 2 as usize);
-    const first: Task = task_init(10u64, TaskKind.DiffShard, 1 as u16, 0u64, 1u64);
-    const second: Task = task_init(11u64, TaskKind.FetchSegment, 1 as u16, 1u64, 1u64);
-    const third: Task = task_init(12u64, TaskKind.MergeShard, 1 as u16, 2u64, 1u64);
+    const first: ExecTask = task_init(10u64, TaskKind.DiffShard, 1 as u16, 0u64, 1u64);
+    const second: ExecTask = task_init(11u64, TaskKind.FetchSegment, 1 as u16, 1u64, 1u64);
+    const third: ExecTask = task_init(12u64, TaskKind.MergeShard, 1 as u16, 2u64, 1u64);
 
     try task_queue_push(&queue, &first);
     try task_queue_push(&queue, &second);
@@ -64,18 +64,18 @@ fn test_task_queue_wraparound_preserves_order() !void {
     arena_init(&arena, &arena_buf[0], 4096 as usize);
 
     var queue: TaskQueue = try task_queue_init(&arena, 2 as usize);
-    const first: Task = task_init(20u64, TaskKind.ReadObject, 1 as u16, 0u64, 1u64);
-    const second: Task = task_init(21u64, TaskKind.WriteObject, 1 as u16, 1u64, 1u64);
-    const third: Task = task_init(22u64, TaskKind.HashFileRange, 1 as u16, 2u64, 1u64);
+    const first: ExecTask = task_init(20u64, TaskKind.ReadObject, 1 as u16, 0u64, 1u64);
+    const second: ExecTask = task_init(21u64, TaskKind.WriteObject, 1 as u16, 1u64, 1u64);
+    const third: ExecTask = task_init(22u64, TaskKind.HashFileRange, 1 as u16, 2u64, 1u64);
 
     try task_queue_push(&queue, &first);
     try task_queue_push(&queue, &second);
-    const pop_first: Task = try task_queue_pop(&queue);
+    const pop_first: ExecTask = try task_queue_pop(&queue);
     try expect(pop_first.id == 20u64);
     try task_queue_push(&queue, &third);
 
-    const pop_second: Task = try task_queue_pop(&queue);
-    const pop_third: Task = try task_queue_pop(&queue);
+    const pop_second: ExecTask = try task_queue_pop(&queue);
+    const pop_third: ExecTask = try task_queue_pop(&queue);
     try expect(pop_second.id == 21u64);
     try expect(pop_third.id == 22u64);
 }
