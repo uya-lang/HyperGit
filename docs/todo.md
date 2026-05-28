@@ -248,11 +248,11 @@
 - [x] 实现 footer checksum。
 - [x] 实现 object id -> offset 查询。
 - [x] 实现 pack bloom 占位。
-- [ ] 实现 loose -> pack compaction。
-- [ ] 实现 composite store 读路径。
-- [ ] 测试 pack 写读 roundtrip。
-- [ ] 测试 pack index 损坏。
-- [ ] 测试 loose 和 pack 同时存在时优先级。
+- [x] 实现 loose -> pack compaction。
+- [x] 实现 composite store 读路径。
+- [x] 测试 pack 写读 roundtrip。
+- [x] 测试 pack index 损坏。
+- [x] 测试 loose 和 pack 同时存在时优先级。
 
 ## 15. Large File
 

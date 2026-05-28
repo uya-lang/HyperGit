@@ -1,0 +1,205 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+
+use libc.Stat;
+use libc.errno;
+use libc.free;
+use libc.malloc;
+use libc.stat;
+use libc.ENOENT;
+use core.ids.ObjectId;
+use core.ids.object_id_compare;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.object_store.ObjectReader;
+use store.object_store.ObjectStore;
+use store.segment_pack.SEGMENT_PACK_FOOTER_BYTES;
+use store.segment_pack.SEGMENT_PACK_HEADER_BYTES;
+use store.segment_pack.SEGMENT_PACK_RECORD_HEADER_BYTES;
+use store.segment_pack.SEGMENT_PACK_RECORD_TRAILER_BYTES;
+use store.segment_pack.SegmentPackRecord;
+use store.segment_pack.SegmentPackSnapshot;
+use store.segment_pack.segment_pack_read;
+
+fn composite_snapshot_arena_bytes(file_size: usize) usize {
+    var max_records: usize = 0 as usize;
+    if file_size > SEGMENT_PACK_HEADER_BYTES + SEGMENT_PACK_FOOTER_BYTES {
+        const record_region: usize = file_size - SEGMENT_PACK_HEADER_BYTES - SEGMENT_PACK_FOOTER_BYTES;
+        max_records = record_region / (SEGMENT_PACK_RECORD_HEADER_BYTES + SEGMENT_PACK_RECORD_TRAILER_BYTES);
+    }
+    return file_size + ((max_records + 1 as usize) * (@size_of(SegmentPackRecord) as usize)) + 64 as usize;
+}
+
+fn composite_copy_object_bytes(arena: &Arena, source: ByteList) !ObjectBytes {
+    var want: usize = source.len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.SegmentPackAlloc;
+    }
+    var i: usize = 0 as usize;
+    while i < source.len {
+        raw[i] = source.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ObjectBytes{ bytes: ByteList{ ptr: raw, len: source.len } };
+}
+
+fn composite_pack_find_record_index(snapshot: &SegmentPackSnapshot, id: ObjectId) !usize {
+    var i: usize = 0 as usize;
+    while i < snapshot.records.len {
+        if object_id_compare(&snapshot.records.ptr[i].object_id, &id) == 0 {
+            return i;
+        }
+        i = i + 1 as usize;
+    }
+    return error.SegmentPackObjectNotFound;
+}
+
+fn composite_pack_has(pack_path: &byte, id: ObjectId) !bool {
+    if pack_path == null {
+        return error.SegmentPackNotFound;
+    }
+
+    var st: Stat = Stat{};
+    if stat(pack_path as &const byte, &st) != 0 {
+        if errno == ENOENT {
+            return error.SegmentPackNotFound;
+        }
+        return error.SegmentPackOpenFailed;
+    }
+
+    var scratch_size: usize = composite_snapshot_arena_bytes(st.st_size as usize);
+    if scratch_size == 0 as usize {
+        scratch_size = 1 as usize;
+    }
+    const scratch_raw: &byte = malloc(scratch_size) as &byte;
+    if scratch_raw == null {
+        return error.SegmentPackAlloc;
+    }
+    defer {
+        free(scratch_raw as &void);
+    }
+
+    var scratch_arena: Arena = Arena{ buffer: scratch_raw, size: 0, used: 0 };
+    arena_init(&scratch_arena, scratch_raw, scratch_size);
+
+    const snapshot: SegmentPackSnapshot = try segment_pack_read(pack_path as &const byte, &scratch_arena);
+    _ = try composite_pack_find_record_index(&snapshot, id);
+    return true;
+}
+
+fn composite_pack_get(pack_path: &byte, id: ObjectId, arena: &Arena) !ObjectBytes {
+    if pack_path == null {
+        return error.SegmentPackNotFound;
+    }
+
+    var st: Stat = Stat{};
+    if stat(pack_path as &const byte, &st) != 0 {
+        if errno == ENOENT {
+            return error.SegmentPackNotFound;
+        }
+        return error.SegmentPackOpenFailed;
+    }
+
+    var scratch_size: usize = composite_snapshot_arena_bytes(st.st_size as usize);
+    if scratch_size == 0 as usize {
+        scratch_size = 1 as usize;
+    }
+    const scratch_raw: &byte = malloc(scratch_size) as &byte;
+    if scratch_raw == null {
+        return error.SegmentPackAlloc;
+    }
+    defer {
+        free(scratch_raw as &void);
+    }
+
+    var scratch_arena: Arena = Arena{ buffer: scratch_raw, size: 0, used: 0 };
+    arena_init(&scratch_arena, scratch_raw, scratch_size);
+
+    const snapshot: SegmentPackSnapshot = try segment_pack_read(pack_path as &const byte, &scratch_arena);
+    const record_index: usize = try composite_pack_find_record_index(&snapshot, id);
+    return try composite_copy_object_bytes(arena, snapshot.records.ptr[record_index].object_bytes);
+}
+
+fn composite_pack_exists(pack_path: &byte) !bool {
+    if pack_path == null {
+        return false;
+    }
+
+    var st: Stat = Stat{};
+    if stat(pack_path as &const byte, &st) == 0 {
+        return true;
+    }
+    if errno == ENOENT {
+        return false;
+    }
+    return error.SegmentPackOpenFailed;
+}
+
+export struct CompositeObjectStore : ObjectStore {
+    loose: LooseObjectStore,
+    pack_path: &byte,
+    index_path: &byte,
+
+    fn has(self: &Self, id: ObjectId) !bool {
+        _ = self.index_path;
+        const pack_exists: bool = composite_pack_exists(self.pack_path) catch |err| {
+            if @error_id(err) == @error_id(error.SegmentPackOpenFailed) {
+                return try self.loose.has(ObjectId{ hash: id.hash });
+            }
+            return err;
+        };
+        if !pack_exists {
+            return try self.loose.has(ObjectId{ hash: id.hash });
+        }
+        const pack_found: bool = composite_pack_has(self.pack_path, ObjectId{ hash: id.hash }) catch |err| {
+            if @error_id(err) == @error_id(error.SegmentPackObjectNotFound) {
+                return try self.loose.has(ObjectId{ hash: id.hash });
+            }
+            return err;
+        };
+        return pack_found;
+    },
+
+    fn get(self: &Self, id: ObjectId, arena: &Arena) !ObjectBytes {
+        _ = self.index_path;
+        const pack_exists: bool = composite_pack_exists(self.pack_path) catch |err| {
+            if @error_id(err) == @error_id(error.SegmentPackOpenFailed) {
+                return try self.loose.get(ObjectId{ hash: id.hash }, arena);
+            }
+            return err;
+        };
+        if !pack_exists {
+            return try self.loose.get(ObjectId{ hash: id.hash }, arena);
+        }
+        return composite_pack_get(self.pack_path, ObjectId{ hash: id.hash }, arena) catch |err| {
+            if @error_id(err) == @error_id(error.SegmentPackObjectNotFound) {
+                return try self.loose.get(ObjectId{ hash: id.hash }, arena);
+            }
+            return err;
+        };
+    },
+
+    fn put(self: &Self, kind: ObjectKind, payload: &[byte]) !ObjectId {
+        return try self.loose.put(kind, payload);
+    },
+
+    fn open_reader(self: &Self, id: ObjectId) !ObjectReader {
+        return try self.loose.open_reader(ObjectId{ hash: id.hash });
+    },
+}
+
+export fn composite_store_open(loose_root: &byte, pack_path: &byte, index_path: &byte) !CompositeObjectStore {
+    return CompositeObjectStore{
+        loose: try loose_store_open(loose_root),
+        pack_path: pack_path,
+        index_path: index_path,
+    };
+}

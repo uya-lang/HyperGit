@@ -50,6 +50,8 @@ use store.segment_pack.segment_pack_index_read;
 use store.segment_pack.segment_pack_index_lookup;
 use store.segment_pack.segment_pack_read;
 use store.segment_pack.segment_pack_write;
+use store.segment_pack.loose_pack_compact;
+use store.segment_pack.CompactionResult;
 
 struct ExpectedIndexEntry {
     object_id: ObjectId,
@@ -463,11 +465,114 @@ fn test_segment_pack_reader_rejects_corrupt_footer_bytes() !void {
     return error.AssertionFailed;
 }
 
+fn test_loose_pack_compact() !void {
+    try expect(system("rm -rf build/segment-pack-compact && mkdir -p build/segment-pack-compact/objects/loose build/segment-pack-compact/packs") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/segment-pack-compact/objects/loose");
+
+    var payload_a: [byte: 6] = ['a' as byte, 'p' as byte, 'p' as byte, 'l' as byte, 'e' as byte, '1' as byte];
+    var payload_b: [byte: 6] = ['a' as byte, 'p' as byte, 'p' as byte, 'l' as byte, 'e' as byte, '2' as byte];
+    var payload_c: [byte: 6] = ['a' as byte, 'p' as byte, 'p' as byte, 'l' as byte, 'e' as byte, '3' as byte];
+    const id_a: ObjectId = try store.put(ObjectKind.Commit, payload_a[0: 6]);
+    const id_b: ObjectId = try store.put(ObjectKind.Commit, payload_b[0: 6]);
+    const id_c: ObjectId = try store.put(ObjectKind.SmallBlob, payload_c[0: 6]);
+
+    const result: CompactionResult = try loose_pack_compact(
+        "build/segment-pack-compact/objects/loose",
+        "build/segment-pack-compact/packs/seg-000001.hgp",
+        "build/segment-pack-compact/packs/seg-000001.hgi",
+        1u64,
+        1000i64,
+        0u64,
+    );
+
+    try expect(result.object_count == 3u64);
+    try expect(result.pack_bytes > 0u64);
+    try expect(result.index_bytes > 0u64);
+
+    var read_arena_buf: [byte: 32768] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 32768 as usize);
+
+    const snapshot: SegmentPackSnapshot = try segment_pack_read("build/segment-pack-compact/packs/seg-000001.hgp", &read_arena);
+    try expect(snapshot.header.object_count == 3u64);
+    try expect(snapshot.header.segment_seq == 1u64);
+    try expect(snapshot.header.created_at_ms == 1000i64);
+    try expect(snapshot.records.len == 3 as usize);
+
+    var found_ids: i32 = 0;
+    var i: usize = 0 as usize;
+    while i < snapshot.records.len {
+        if object_id_compare(&snapshot.records.ptr[i].object_id, &id_a) == 0 {
+            found_ids = found_ids | 1;
+        }
+        if object_id_compare(&snapshot.records.ptr[i].object_id, &id_b) == 0 {
+            found_ids = found_ids | 2;
+        }
+        if object_id_compare(&snapshot.records.ptr[i].object_id, &id_c) == 0 {
+            found_ids = found_ids | 4;
+        }
+        i = i + 1 as usize;
+    }
+    try expect(found_ids == 7);
+
+    var lookup_arena_buf: [byte: 32768] = [];
+    var lookup_arena: Arena = Arena{ buffer: &lookup_arena_buf[0], size: 0, used: 0 };
+    arena_init(&lookup_arena, &lookup_arena_buf[0], 32768 as usize);
+
+    const entry_a: SegmentPackIndexEntry = try segment_pack_index_lookup("build/segment-pack-compact/packs/seg-000001.hgi", ObjectId{ hash: id_a.hash }, &lookup_arena);
+    try expect(object_id_compare(&entry_a.object_id, &id_a) == 0);
+    try expect(entry_a.kind == ObjectKind.Commit);
+
+    const entry_c: SegmentPackIndexEntry = try segment_pack_index_lookup("build/segment-pack-compact/packs/seg-000001.hgi", ObjectId{ hash: id_c.hash }, &lookup_arena);
+    try expect(object_id_compare(&entry_c.object_id, &id_c) == 0);
+    try expect(entry_c.kind == ObjectKind.SmallBlob);
+}
+
+fn test_loose_pack_compact_large_object() !void {
+    try expect(system("rm -rf build/segment-pack-large && mkdir -p build/segment-pack-large/objects/loose build/segment-pack-large/packs") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/segment-pack-large/objects/loose");
+
+    var payload: [byte: 70000] = [];
+    const payload_len: usize = 70000 as usize;
+    var i: usize = 0 as usize;
+    while i < payload_len {
+        payload[i] = ('a' as byte) + ((i % 26 as usize) as byte);
+        i = i + 1 as usize;
+    }
+    const id: ObjectId = try store.put(ObjectKind.SmallBlob, payload[0: payload_len]);
+
+    const result: CompactionResult = try loose_pack_compact(
+        "build/segment-pack-large/objects/loose",
+        "build/segment-pack-large/packs/seg-000001.hgp",
+        "build/segment-pack-large/packs/seg-000001.hgi",
+        1u64,
+        2000i64,
+        0u64,
+    );
+
+    try expect(result.object_count == 1u64);
+    try expect(result.pack_bytes > 70000u64);
+
+    var read_arena_buf: [byte: 131072] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 131072 as usize);
+
+    const snapshot: SegmentPackSnapshot = try segment_pack_read("build/segment-pack-large/packs/seg-000001.hgp", &read_arena);
+    try expect(snapshot.records.len == 1 as usize);
+    try expect(object_id_compare(&snapshot.records.ptr[0].object_id, &id) == 0);
+    try expect(snapshot.records.ptr[0].kind == ObjectKind.SmallBlob);
+    try expect(snapshot.records.ptr[0].object_bytes.len > 70000 as usize);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Segment Pack Tests");
     run_test("segment pack writer emits pack and sorted index", test_segment_pack_writer_roundtrip_layout);
     run_test("segment pack writer rejects duplicate object ids", test_segment_pack_writer_rejects_duplicate_object_ids);
     run_test("segment pack reader rejects corrupt record bytes", test_segment_pack_reader_rejects_corrupt_record_bytes);
     run_test("segment pack reader rejects corrupt footer bytes", test_segment_pack_reader_rejects_corrupt_footer_bytes);
+    run_test("loose pack compact produces valid pack", test_loose_pack_compact);
+    run_test("loose pack compact handles large objects", test_loose_pack_compact_large_object);
     return test_suite_end();
 }

@@ -1,0 +1,191 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fwrite;
+
+use libc.system;
+use libc.unlink;
+use object.types.ObjectKind;
+use core.ids.ObjectId;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_object_path;
+use store.object_store.ObjectBytes;
+use store.segment_pack.CompactionResult;
+use store.segment_pack.loose_pack_compact;
+use store.composite_store.CompositeObjectStore;
+use store.composite_store.composite_store_open;
+
+fn composite_expect_bytes_eq(actual: ObjectBytes, expected: ObjectBytes) !void {
+    try expect(actual.bytes.len == expected.bytes.len);
+    var i: usize = 0 as usize;
+    while i < actual.bytes.len {
+        try expect(actual.bytes.ptr[i] == expected.bytes.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn test_composite_read_from_pack_without_index() !void {
+    try expect(system("rm -rf build/composite-pack-scan && mkdir -p build/composite-pack-scan/objects/loose build/composite-pack-scan/packs") == 0);
+
+    var store: LooseObjectStore = try loose_store_open("build/composite-pack-scan/objects/loose");
+    var payload: [byte: 3] = ['x' as byte, 'y' as byte, 'z' as byte];
+    const id: ObjectId = try store.put(ObjectKind.Commit, payload[0: 3]);
+
+    var expected_arena_buf: [byte: 32768] = [];
+    var expected_arena: Arena = Arena{ buffer: &expected_arena_buf[0], size: 0, used: 0 };
+    arena_init(&expected_arena, &expected_arena_buf[0], 32768 as usize);
+    const expected: ObjectBytes = try store.get(ObjectId{ hash: id.hash }, &expected_arena);
+
+    const compaction: CompactionResult = try loose_pack_compact(
+        "build/composite-pack-scan/objects/loose",
+        "build/composite-pack-scan/packs/seg-000001.hgp",
+        "build/composite-pack-scan/packs/seg-000001.hgi",
+        1u64,
+        0i64,
+        0u64);
+    _ = compaction;
+
+    var object_path: [byte: 4096] = [];
+    _ = try loose_store_object_path(&store, &id, object_path[0: 4096 as usize]);
+    try expect(unlink(&object_path[0] as &const byte) == 0);
+
+    const composite: CompositeObjectStore = try composite_store_open(
+        "build/composite-pack-scan/objects/loose",
+        "build/composite-pack-scan/packs/seg-000001.hgp",
+        "build/composite-pack-scan/packs/missing.hgi");
+
+    try expect(try composite.has(ObjectId{ hash: id.hash }));
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+    const ob: ObjectBytes = try composite.get(ObjectId{ hash: id.hash }, &arena);
+    try composite_expect_bytes_eq(ob, expected);
+}
+
+fn test_composite_read_from_pack_with_corrupt_index() !void {
+    try expect(system("rm -rf build/composite-bad-index && mkdir -p build/composite-bad-index/objects/loose build/composite-bad-index/packs") == 0);
+
+    var store: LooseObjectStore = try loose_store_open("build/composite-bad-index/objects/loose");
+    var payload: [byte: 4] = ['a' as byte, 'b' as byte, 'c' as byte, 'd' as byte];
+    const id: ObjectId = try store.put(ObjectKind.Commit, payload[0: 4]);
+
+    var expected_arena_buf: [byte: 32768] = [];
+    var expected_arena: Arena = Arena{ buffer: &expected_arena_buf[0], size: 0, used: 0 };
+    arena_init(&expected_arena, &expected_arena_buf[0], 32768 as usize);
+    const expected: ObjectBytes = try store.get(ObjectId{ hash: id.hash }, &expected_arena);
+
+    const compaction: CompactionResult = try loose_pack_compact(
+        "build/composite-bad-index/objects/loose",
+        "build/composite-bad-index/packs/seg-000001.hgp",
+        "build/composite-bad-index/packs/seg-000001.hgi",
+        1u64,
+        0i64,
+        0u64);
+    _ = compaction;
+
+    var object_path: [byte: 4096] = [];
+    _ = try loose_store_object_path(&store, &id, object_path[0: 4096 as usize]);
+    try expect(unlink(&object_path[0] as &const byte) == 0);
+
+    var bad_index: [byte: 1] = [0xff as byte];
+    const index_stream: &FILE = fopen("build/composite-bad-index/packs/seg-000001.hgi", "w");
+    try expect(index_stream != null);
+    try expect(fwrite(&bad_index[0] as &const byte, 1 as usize, 1 as usize, index_stream) == 1 as usize);
+    try expect(fclose(index_stream) == 0);
+
+    const composite: CompositeObjectStore = try composite_store_open(
+        "build/composite-bad-index/objects/loose",
+        "build/composite-bad-index/packs/seg-000001.hgp",
+        "build/composite-bad-index/packs/seg-000001.hgi");
+
+    try expect(try composite.has(ObjectId{ hash: id.hash }));
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+    const ob: ObjectBytes = try composite.get(ObjectId{ hash: id.hash }, &arena);
+    try composite_expect_bytes_eq(ob, expected);
+}
+
+fn test_loose_fallback() !void {
+    try expect(system("rm -rf build/composite-fallback && mkdir -p build/composite-fallback/objects/loose build/composite-fallback/packs") == 0);
+
+    var store: LooseObjectStore = try loose_store_open("build/composite-fallback/objects/loose");
+    var payload: [byte: 4] = ['a' as byte, 'b' as byte, 'c' as byte, 'd' as byte];
+    const id: ObjectId = try store.put(ObjectKind.Commit, payload[0: 4]);
+
+    var expected_arena_buf: [byte: 32768] = [];
+    var expected_arena: Arena = Arena{ buffer: &expected_arena_buf[0], size: 0, used: 0 };
+    arena_init(&expected_arena, &expected_arena_buf[0], 32768 as usize);
+    const expected: ObjectBytes = try store.get(ObjectId{ hash: id.hash }, &expected_arena);
+
+    const composite: CompositeObjectStore = try composite_store_open(
+        "build/composite-fallback/objects/loose",
+        "build/composite-fallback/packs/nonexistent.hgp",
+        "build/composite-fallback/packs/nonexistent.hgi");
+
+    try expect(try composite.has(ObjectId{ hash: id.hash }));
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+    const ob: ObjectBytes = try composite.get(ObjectId{ hash: id.hash }, &arena);
+    try composite_expect_bytes_eq(ob, expected);
+}
+
+fn test_pack_corruption_returns_hard_error() !void {
+    try expect(system("rm -rf build/composite-bad-pack && mkdir -p build/composite-bad-pack/objects/loose build/composite-bad-pack/packs") == 0);
+
+    var store: LooseObjectStore = try loose_store_open("build/composite-bad-pack/objects/loose");
+    var payload: [byte: 5] = ['h' as byte, 'e' as byte, 'l' as byte, 'l' as byte, 'o' as byte];
+    const id: ObjectId = try store.put(ObjectKind.Commit, payload[0: 5]);
+
+    const compaction: CompactionResult = try loose_pack_compact(
+        "build/composite-bad-pack/objects/loose",
+        "build/composite-bad-pack/packs/seg-000001.hgp",
+        "build/composite-bad-pack/packs/seg-000001.hgi",
+        1u64,
+        0i64,
+        0u64);
+    _ = compaction;
+
+    var bad_pack: [byte: 1] = [0x7f as byte];
+    const pack_stream: &FILE = fopen("build/composite-bad-pack/packs/seg-000001.hgp", "w");
+    try expect(pack_stream != null);
+    try expect(fwrite(&bad_pack[0] as &const byte, 1 as usize, 1 as usize, pack_stream) == 1 as usize);
+    try expect(fclose(pack_stream) == 0);
+
+    const composite: CompositeObjectStore = try composite_store_open(
+        "build/composite-bad-pack/objects/loose",
+        "build/composite-bad-pack/packs/seg-000001.hgp",
+        "build/composite-bad-pack/packs/seg-000001.hgi");
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+    const ob: ObjectBytes = composite.get(ObjectId{ hash: id.hash }, &arena) catch |err| {
+        try expect(@error_id(err) == @error_id(error.SegmentPackInvalid));
+        return;
+    };
+    _ = ob;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("Composite Store Tests");
+    run_test("composite read from pack without index", test_composite_read_from_pack_without_index);
+    run_test("composite read from pack with corrupt index", test_composite_read_from_pack_with_corrupt_index);
+    run_test("composite loose fallback", test_loose_fallback);
+    run_test("composite pack corruption returns hard error", test_pack_corruption_returns_hard_error);
+    return test_suite_end();
+}

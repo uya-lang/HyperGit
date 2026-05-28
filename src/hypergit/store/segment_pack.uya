@@ -6,15 +6,23 @@ use std.io.file.fread;
 use std.io.file.fwrite;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
 
 use libc.Stat;
+use libc.DIR;
+use libc.Dirent;
 use libc.errno;
 use libc.free;
 use libc.malloc;
+use libc.opendir;
+use libc.readdir;
+use libc.closedir;
 use libc.stat;
 use libc.ENOENT;
+use core.codec.DecodedObject;
 use core.codec.codec_decode_hash32;
 use core.codec.codec_decode_i64;
+use core.codec.codec_decode_object;
 use core.codec.codec_decode_u16;
 use core.codec.codec_decode_u32;
 use core.codec.codec_decode_u64;
@@ -30,6 +38,10 @@ use object.types.ByteList;
 use object.types.ObjectKind;
 use object.types.object_kind_from_u16;
 use object.types.object_kind_to_u16;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_object_path;
+use store.object_store.ObjectBytes;
 
 export const SEGMENT_PACK_MAGIC: u32 = 0x31504748u32;
 export const SEGMENT_PACK_VERSION: u16 = 1u16;
@@ -738,5 +750,229 @@ export fn segment_pack_write(pack_path: &const byte, index_path: &const byte, se
         index_bytes: index_total_len as u64,
         pack_footer_offset: pack_footer_offset,
         index_footer_offset: index_footer_offset,
+    };
+}
+
+const COMPACT_MAX_OBJECTS: usize = 4096 as usize;
+const COMPACT_PATH_MAX: usize = 4096 as usize;
+
+error CompactionLooseDirOpenFailed;
+error CompactionTooManyObjects;
+
+export struct CompactionResult {
+    object_count: u64,
+    pack_bytes: u64,
+    index_bytes: u64,
+    loose_removed: u64
+}
+
+fn compact_hex_nibble(c: byte) i32 {
+    if c >= '0' as byte && c <= '9' as byte {
+        return (c - '0' as byte) as i32;
+    }
+    if c >= 'a' as byte && c <= 'f' as byte {
+        return (c - 'a' as byte + 10) as i32;
+    }
+    if c >= 'A' as byte && c <= 'F' as byte {
+        return (c - 'A' as byte + 10) as i32;
+    }
+    return -1;
+}
+
+fn compact_hex_to_hash(hex: &byte, len: usize) !Hash32 {
+    if len != 64 as usize {
+        return error.SegmentPackInvalid;
+    }
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 64 as usize {
+        const hi: i32 = compact_hex_nibble(hex[i]);
+        const lo: i32 = compact_hex_nibble(hex[i + 1]);
+        if hi < 0 || lo < 0 {
+            return error.SegmentPackInvalid;
+        }
+        hash.bytes[i / 2] = ((hi << 4) | lo) as byte;
+        i = i + 2 as usize;
+    }
+    return hash;
+}
+
+fn compact_load_object_malloc(store: &LooseObjectStore, id: ObjectId) !ByteList {
+    var object_path_buf: [byte: 4096] = [];
+    _ = try loose_store_object_path(store, &id, object_path_buf[0: 4096 as usize]);
+
+    var st: Stat = Stat{};
+    if stat(&object_path_buf[0] as &const byte, &st) != 0 {
+        var missing_buf: [byte: 1] = [];
+        var missing_arena: Arena = Arena{ buffer: &missing_buf[0], size: 0, used: 0 };
+        arena_init(&missing_arena, &missing_buf[0], 1 as usize);
+        const missing: ObjectBytes = try store.get(ObjectId{ hash: id.hash }, &missing_arena);
+        _ = missing;
+        return error.SegmentPackReadFailed;
+    }
+
+    var arena_size: usize = st.st_size as usize;
+    if arena_size == 0 as usize {
+        arena_size = 1 as usize;
+    }
+    arena_size = arena_size + 8 as usize;
+
+    const arena_raw: &byte = malloc(arena_size) as &byte;
+    if arena_raw == null {
+        return error.SegmentPackAlloc;
+    }
+    defer {
+        free(arena_raw as &void);
+    }
+
+    var arena: Arena = Arena{ buffer: arena_raw, size: 0, used: 0 };
+    arena_init(&arena, arena_raw, arena_size);
+    const obj_bytes: ObjectBytes = try store.get(ObjectId{ hash: id.hash }, &arena);
+    const buf: &byte = malloc(obj_bytes.bytes.len) as &byte;
+    if buf == null {
+        return error.SegmentPackAlloc;
+    }
+    var i: usize = 0 as usize;
+    while i < obj_bytes.bytes.len {
+        buf[i] = obj_bytes.bytes.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: buf, len: obj_bytes.bytes.len };
+}
+
+export fn loose_pack_compact(loose_dir: &const byte, pack_path: &const byte, index_path: &const byte, segment_seq: u64, created_at_ms: i64, base_generation: u64) !CompactionResult {
+    var store: LooseObjectStore = try loose_store_open(loose_dir as &byte);
+    var inputs: [SegmentPackWriteInput: COMPACT_MAX_OBJECTS] = [];
+    var input_count: usize = 0 as usize;
+
+    const c_loose_dir: &const byte = loose_dir;
+    const dir: &DIR = opendir(c_loose_dir);
+    if dir == null {
+        return error.CompactionLooseDirOpenFailed;
+    }
+    if dir == null {
+        return error.CompactionLooseDirOpenFailed;
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            break;
+        }
+        if entry.d_name[0] == '.' as byte {
+            if entry.d_name[1] == 0 as byte {
+                continue;
+            }
+            if entry.d_name[1] == '.' as byte && entry.d_name[2] == 0 as byte {
+                continue;
+            }
+        }
+
+        var sub_path: [byte: COMPACT_PATH_MAX] = [];
+        var sub_len: usize = 0 as usize;
+        while sub_len < COMPACT_PATH_MAX && c_loose_dir[sub_len] != 0 as byte {
+            sub_path[sub_len] = c_loose_dir[sub_len];
+            sub_len = sub_len + 1 as usize;
+        }
+        if sub_len + 1 < COMPACT_PATH_MAX {
+            sub_path[sub_len] = '/' as byte;
+            sub_len = sub_len + 1;
+        }
+        var ni: usize = 0 as usize;
+        while ni < 2 as usize && sub_len + ni < COMPACT_PATH_MAX {
+            sub_path[sub_len + ni] = entry.d_name[ni];
+            ni = ni + 1 as usize;
+        }
+        sub_len = sub_len + 2 as usize;
+        if sub_len < COMPACT_PATH_MAX {
+            sub_path[sub_len] = 0 as byte;
+        }
+
+        const sub_dir: &DIR = opendir(&sub_path[0] as &const byte);
+        if sub_dir == null {
+            continue;
+        }
+        defer {
+            _ = closedir(sub_dir);
+        }
+
+        // Save dirname before subsequent readdir calls overwrite readdir_result
+        var dirname: [byte: 2] = [entry.d_name[0], entry.d_name[1]];
+
+        while true {
+            const file_entry: &Dirent = readdir(sub_dir);
+            if file_entry == null {
+                break;
+            }
+            if file_entry.d_name[0] == '.' as byte {
+                if file_entry.d_name[1] == 0 as byte {
+                    continue;
+                }
+                if file_entry.d_name[1] == '.' as byte && file_entry.d_name[2] == 0 as byte {
+                    continue;
+                }
+            }
+
+            if input_count >= COMPACT_MAX_OBJECTS {
+                return error.CompactionTooManyObjects;
+            }
+
+            var hex_buf: [byte: 64] = [];
+            hex_buf[0] = dirname[0];
+            hex_buf[1] = dirname[1];
+            var fj: usize = 0 as usize;
+            while fj < 62 as usize {
+                hex_buf[2 + fj] = file_entry.d_name[fj];
+                fj = fj + 1 as usize;
+            }
+
+            const hash: Hash32 = try compact_hex_to_hash(&hex_buf[0], 64);
+            const obj_bytes: ByteList = try compact_load_object_malloc(&store, ObjectId{ hash: hash });
+
+            var offset: usize = 0 as usize;
+            var decoded: DecodedObject = codec_decode_object(obj_bytes.ptr[0: obj_bytes.len], &offset) catch |err| {
+                free(obj_bytes.ptr as &void);
+                return err;
+            };
+            if offset != obj_bytes.len {
+                free(obj_bytes.ptr as &void);
+                return error.SegmentPackInvalid;
+            }
+            const kind: ObjectKind = object_kind_from_u16(decoded.envelope.kind) catch {
+                free(obj_bytes.ptr as &void);
+                return error.SegmentPackInvalid;
+            };
+
+            inputs[input_count] = SegmentPackWriteInput{
+                object_id: ObjectId{ hash: hash },
+                kind: kind,
+                flags: 0u16,
+                logical_size: decoded.envelope.payload_len,
+                object_bytes: ByteList{ ptr: obj_bytes.ptr, len: obj_bytes.len },
+            };
+            input_count = input_count + 1 as usize;
+        }
+    }
+
+    if input_count == 0 as usize {
+        return CompactionResult{ object_count: 0u64, pack_bytes: 0u64, index_bytes: 0u64, loose_removed: 0u64 };
+    }
+
+    const result: SegmentPackWriteResult = try segment_pack_write(pack_path, index_path, segment_seq, created_at_ms, base_generation, inputs[0: input_count]);
+
+    var ci: usize = 0 as usize;
+    while ci < input_count {
+        free(inputs[ci].object_bytes.ptr as &void);
+        ci = ci + 1 as usize;
+    }
+
+    return CompactionResult{
+        object_count: result.object_count,
+        pack_bytes: result.pack_bytes,
+        index_bytes: result.index_bytes,
+        loose_removed: 0u64,
     };
 }
