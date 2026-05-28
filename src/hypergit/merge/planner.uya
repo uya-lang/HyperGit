@@ -1,0 +1,200 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use manifest.path.manifest_path_compare;
+use manifest.trie.ManifestLeafInputList;
+use object.types.ByteList;
+
+error MergePlannerAlloc;
+
+export enum MergePlannerDecisionKind {
+    KeepBase,
+    TakeOurs,
+    TakeTheirs,
+    MergeText,
+    Conflict
+}
+
+export enum MergePlannerConflictKind {
+    None,
+    Text,
+    Binary,
+    DeleteModify,
+    FileDirectory,
+    Namespace,
+    CaseFold,
+    SymlinkBoundary
+}
+
+export enum MergePlannerBlockKind {
+    Namespace,
+    CaseFold,
+    SymlinkBoundary
+}
+
+export struct MergePlannerEntry {
+    path: ByteList,
+    has_base: bool,
+    base_index: usize,
+    has_ours: bool,
+    ours_index: usize,
+    has_theirs: bool,
+    theirs_index: usize,
+    decision: MergePlannerDecisionKind,
+    conflict_kind: MergePlannerConflictKind
+}
+
+export struct MergePlannerEntryList {
+    ptr: &MergePlannerEntry,
+    len: usize
+}
+
+export fn merge_planner_entry_list_from_slice(slice: &[MergePlannerEntry]) MergePlannerEntryList {
+    return MergePlannerEntryList{ ptr: slice.ptr, len: slice.len };
+}
+
+export struct MergePlannerBlock {
+    path: ByteList,
+    kind: MergePlannerBlockKind
+}
+
+export struct MergePlannerBlockList {
+    ptr: &MergePlannerBlock,
+    len: usize
+}
+
+export fn merge_planner_block_list_from_slice(slice: &[MergePlannerBlock]) MergePlannerBlockList {
+    return MergePlannerBlockList{ ptr: slice.ptr, len: slice.len };
+}
+
+export struct MergePlanner {
+    entries: MergePlannerEntryList,
+    blocks: MergePlannerBlockList
+}
+
+export fn merge_planner_init(entries: MergePlannerEntryList, blocks: MergePlannerBlockList) MergePlanner {
+    return MergePlanner{
+        entries: entries,
+        blocks: blocks,
+    };
+}
+
+export fn merge_planner_has_blocks(plan: &MergePlanner) bool {
+    return plan.blocks.len > 0;
+}
+
+export fn merge_planner_entry_has_all_sides(entry: &MergePlannerEntry) bool {
+    return entry.has_base && entry.has_ours && entry.has_theirs;
+}
+
+export fn merge_planner_has_conflicts(plan: &MergePlanner) bool {
+    if merge_planner_has_blocks(plan) {
+        return true;
+    }
+
+    var i: usize = 0;
+    while i < plan.entries.len {
+        if plan.entries.ptr[i].decision == MergePlannerDecisionKind.Conflict {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn merge_planner_default_decision(has_base: bool, has_ours: bool) MergePlannerDecisionKind {
+    if has_base {
+        return MergePlannerDecisionKind.KeepBase;
+    }
+    if has_ours {
+        return MergePlannerDecisionKind.TakeOurs;
+    }
+    return MergePlannerDecisionKind.TakeTheirs;
+}
+
+fn merge_planner_pick_next_path(
+    base: &ManifestLeafInputList,
+    base_index: usize,
+    ours: &ManifestLeafInputList,
+    ours_index: usize,
+    theirs: &ManifestLeafInputList,
+    theirs_index: usize,
+) &ByteList {
+    var chosen: &ByteList = null;
+    if base_index < base.len {
+        chosen = &base.ptr[base_index].path;
+    }
+    if ours_index < ours.len &&
+        (chosen == null || manifest_path_compare(&ours.ptr[ours_index].path, chosen) < 0) {
+        chosen = &ours.ptr[ours_index].path;
+    }
+    if theirs_index < theirs.len &&
+        (chosen == null || manifest_path_compare(&theirs.ptr[theirs_index].path, chosen) < 0) {
+        chosen = &theirs.ptr[theirs_index].path;
+    }
+    return chosen;
+}
+
+export fn merge_planner_align_inputs(
+    arena: &Arena,
+    base: &ManifestLeafInputList,
+    ours: &ManifestLeafInputList,
+    theirs: &ManifestLeafInputList,
+) !MergePlannerEntryList {
+    const max_len: usize = base.len + ours.len + theirs.len;
+    if max_len == 0 {
+        return MergePlannerEntryList{ ptr: null, len: 0 };
+    }
+
+    const raw: &MergePlannerEntry = arena_alloc(arena, @size_of(MergePlannerEntry) as usize * max_len) as &MergePlannerEntry;
+    if raw == null {
+        return error.MergePlannerAlloc;
+    }
+
+    var out_len: usize = 0;
+    var base_index: usize = 0;
+    var ours_index: usize = 0;
+    var theirs_index: usize = 0;
+    while base_index < base.len || ours_index < ours.len || theirs_index < theirs.len {
+        const next_path: &ByteList = merge_planner_pick_next_path(base, base_index, ours, ours_index, theirs, theirs_index);
+        const has_base: bool = base_index < base.len && manifest_path_compare(&base.ptr[base_index].path, next_path) == 0;
+        const has_ours: bool = ours_index < ours.len && manifest_path_compare(&ours.ptr[ours_index].path, next_path) == 0;
+        const has_theirs: bool = theirs_index < theirs.len && manifest_path_compare(&theirs.ptr[theirs_index].path, next_path) == 0;
+        var base_slot: usize = 0 as usize;
+        var ours_slot: usize = 0 as usize;
+        var theirs_slot: usize = 0 as usize;
+        if has_base {
+            base_slot = base_index;
+        }
+        if has_ours {
+            ours_slot = ours_index;
+        }
+        if has_theirs {
+            theirs_slot = theirs_index;
+        }
+
+        raw[out_len] = MergePlannerEntry{
+            path: ByteList{ ptr: next_path.ptr, len: next_path.len },
+            has_base: has_base,
+            base_index: base_slot,
+            has_ours: has_ours,
+            ours_index: ours_slot,
+            has_theirs: has_theirs,
+            theirs_index: theirs_slot,
+            decision: merge_planner_default_decision(has_base, has_ours),
+            conflict_kind: MergePlannerConflictKind.None,
+        };
+        out_len = out_len + 1 as usize;
+
+        if has_base {
+            base_index = base_index + 1 as usize;
+        }
+        if has_ours {
+            ours_index = ours_index + 1 as usize;
+        }
+        if has_theirs {
+            theirs_index = theirs_index + 1 as usize;
+        }
+    }
+    return MergePlannerEntryList{ ptr: raw, len: out_len };
+}

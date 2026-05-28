@@ -264,16 +264,16 @@
 - [x] 实现 large file threshold 配置。
 - [x] 实现 large file add。
 - [x] 实现 range read。
-- [ ] 实现 large file hydrate。
-- [ ] 实现 large file diff summary。
-- [ ] 测试 10MB 文件 chunk roundtrip。
-- [ ] 测试小修改只新增少量 chunk。
-- [ ] 测试 range read 跨 chunk 边界。
+- [x] 实现 large file hydrate。
+- [x] 实现 large file diff summary。
+- [x] 测试 10MB 文件 chunk roundtrip。
+- [x] 测试小修改只新增少量 chunk。
+- [x] 测试 range read 跨 chunk 边界。
 
 ## 16. Merge
 
-- [ ] 实现 merge planner 数据结构。
-- [ ] 实现 base/ours/theirs manifest 对齐。
+- [x] 实现 merge planner 数据结构。
+- [x] 实现 base/ours/theirs manifest 对齐。
 - [ ] 实现 namespace preflight。
 - [ ] 实现 file/file text merge。
 - [ ] 实现 delete/modify 冲突。

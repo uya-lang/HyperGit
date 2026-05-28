@@ -23,8 +23,14 @@ use core.ids.ObjectId;
 use core.ids.PolicyId;
 use core.ids.HASH32_HEX_BYTES;
 use core.ids.commit_id_decode_hex;
+use core.ids.hash32_compare;
 use core.ids.object_id_from_hash;
 use core.ids.policy_id_from_object;
+use large.config.large_file_uses_small_blob;
+use large.prepare.LargePreparedChunkedBlob;
+use large.prepare.large_prepare_recommended_arena_bytes;
+use large.prepare.prepare_chunked_blob_object_id_default;
+use large.prepare.prepare_chunked_blob_repository_default;
 use manifest.flat_diff.ManifestFlatDiffEntry;
 use manifest.flat_diff.ManifestFlatDiffEntryKind;
 use manifest.flat_diff.ManifestFlatDiffEntryList;
@@ -38,14 +44,18 @@ use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
 use manifest.trie.manifest_leaf_input_list_from_slice;
 use object.codec.decode_commit_object;
+use object.codec.decode_chunked_blob_object;
+use object.codec.decode_object_kind;
 use object.codec.decode_small_blob_object;
 use object.codec.encode_small_blob_payload;
 use object.codec.small_blob_payload_encoded_len;
 use object.hash.hash_object_payload_bytes;
 use object.types.ByteList;
+use object.types.ChunkedBlobPayload;
 use object.types.CommitPayload;
 use object.types.ContentType;
 use object.types.EntryKind;
+use object.types.FileType;
 use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
 use store.head_ref.repo_head_ref_exists;
@@ -95,6 +105,11 @@ enum DiffInputSourceKind {
     Workspace
 }
 
+enum DiffBlobKind {
+    SmallBlob,
+    ChunkedBlob
+}
+
 struct DiffInvocation {
     kind: DiffInvocationKind,
     left_spec: &byte,
@@ -120,7 +135,10 @@ struct DiffOwnedBytes {
 
 struct DiffLoadedBytes {
     bytes: ByteList,
-    owned: &byte
+    owned: &byte,
+    blob_kind: DiffBlobKind,
+    logical_size: u64,
+    chunk_units: DiffChunkUnitList
 }
 
 struct DiffLineList {
@@ -131,6 +149,22 @@ struct DiffLineList {
 struct DiffFsPath {
     bytes: [byte: 4096] = [],
     len: usize
+}
+
+struct DiffChunkUnit {
+    id: Hash32,
+    logical_size: u64
+}
+
+struct DiffChunkUnitList {
+    ptr: &DiffChunkUnit,
+    len: usize
+}
+
+struct DiffChunkSummary {
+    reused: u64,
+    added: u64,
+    removed: u64
 }
 
 export const DIFF_USAGE_TEXT: &const byte = "error: diff takes either [pathspec ...] or <left> <right> [-- pathspec ...]\n";
@@ -476,6 +510,27 @@ fn diff_hash_workspace_file_bytes(content: &DiffOwnedBytes) !ObjectId {
     return try hash_object_payload_bytes(&arena, ObjectKind.SmallBlob, diff_owned_bytes_slice(&encoded));
 }
 
+fn diff_hash_workspace_large_file_bytes(logical_size: u64, content: &DiffOwnedBytes) !ObjectId {
+    const scratch_len: usize = try large_prepare_recommended_arena_bytes(logical_size);
+    const scratch: &byte = malloc(scratch_len) as &byte;
+    if scratch == null {
+        return error.DiffAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+    var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+    arena_init(&arena, scratch, scratch_len);
+    return try prepare_chunked_blob_object_id_default(&arena, diff_owned_bytes_slice(content), FileType.Binary);
+}
+
+fn diff_hash_workspace_object_id(logical_size: u64, content: &DiffOwnedBytes) !ObjectId {
+    if large_file_uses_small_blob(logical_size) {
+        return try diff_hash_workspace_file_bytes(content);
+    }
+    return try diff_hash_workspace_large_file_bytes(logical_size, content);
+}
+
 fn diff_workspace_entry_kind(entry: &WorkspaceFileEntry) !EntryKind {
     if entry.kind == WorkspaceFileKind.Symlink {
         return error.DiffUnsupportedWorkspaceEntry;
@@ -518,7 +573,7 @@ fn diff_workspace_inputs(arena: &Arena, root: &RepoPath) !ManifestLeafInputList 
             path: ByteList{ ptr: entry.path.ptr, len: entry.path.len },
             kind: try diff_workspace_entry_kind(entry),
             mode: entry.file_mode,
-            object_id: try diff_hash_workspace_file_bytes(&file_bytes),
+            object_id: try diff_hash_workspace_object_id(entry.logical_size, &file_bytes),
             logical_size: entry.logical_size,
             content_type: ContentType.Unknown,
             policy_id: diff_zero_policy_id(),
@@ -732,6 +787,121 @@ fn diff_loaded_bytes_free(value: &DiffLoadedBytes) void {
     }
 }
 
+fn diff_chunk_units_from_single(arena: &Arena, id: &Hash32, logical_size: u64) !DiffChunkUnitList {
+    const raw: &DiffChunkUnit = arena_alloc(arena, @size_of(DiffChunkUnit) as usize) as &DiffChunkUnit;
+    if raw == null {
+        return error.DiffAlloc;
+    }
+    raw[0] = DiffChunkUnit{
+        id: Hash32{ bytes: id.bytes },
+        logical_size: logical_size,
+    };
+    return DiffChunkUnitList{ ptr: raw, len: 1 as usize };
+}
+
+fn diff_chunk_units_from_chunked_payload(arena: &Arena, payload: &ChunkedBlobPayload) !DiffChunkUnitList {
+    if payload.chunks.len == 0 {
+        return DiffChunkUnitList{ ptr: null, len: 0 };
+    }
+
+    const raw: &DiffChunkUnit = arena_alloc(arena, @size_of(DiffChunkUnit) as usize * payload.chunks.len) as &DiffChunkUnit;
+    if raw == null {
+        return error.DiffAlloc;
+    }
+
+    var i: usize = 0;
+    while i < payload.chunks.len {
+        raw[i] = DiffChunkUnit{
+            id: Hash32{ bytes: payload.chunks.ptr[i].logical_chunk_id.bytes },
+            logical_size: payload.chunks.ptr[i].logical_size as u64,
+        };
+        i = i + 1 as usize;
+    }
+    return DiffChunkUnitList{ ptr: raw, len: payload.chunks.len };
+}
+
+fn diff_chunk_unit_equal(left: &DiffChunkUnit, right: &DiffChunkUnit) bool {
+    return left.logical_size == right.logical_size &&
+        hash32_compare(&left.id, &right.id) == 0;
+}
+
+fn diff_chunk_unit_list_equal(left: DiffChunkUnitList, right: DiffChunkUnitList) bool {
+    if left.len != right.len {
+        return false;
+    }
+
+    var i: usize = 0;
+    while i < left.len {
+        if !diff_chunk_unit_equal(&left.ptr[i], &right.ptr[i]) {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn diff_chunk_summary(arena: &Arena, left: DiffChunkUnitList, right: DiffChunkUnitList) !DiffChunkSummary {
+    if left.len == 0 {
+        return DiffChunkSummary{
+            reused: 0u64,
+            added: right.len as u64,
+            removed: 0u64,
+        };
+    }
+    if right.len == 0 {
+        return DiffChunkSummary{
+            reused: 0u64,
+            added: 0u64,
+            removed: left.len as u64,
+        };
+    }
+
+    const matched_left: &byte = arena_alloc(arena, left.len) as &byte;
+    if matched_left == null {
+        return error.DiffAlloc;
+    }
+
+    var i: usize = 0;
+    while i < left.len {
+        matched_left[i] = 0 as byte;
+        i = i + 1 as usize;
+    }
+
+    var reused: u64 = 0u64;
+    i = 0;
+    while i < right.len {
+        var j: usize = 0;
+        while j < left.len {
+            if matched_left[j] == 0 as byte && diff_chunk_unit_equal(&left.ptr[j], &right.ptr[i]) {
+                matched_left[j] = 1 as byte;
+                reused = reused + 1u64;
+                break;
+            }
+            j = j + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+
+    return DiffChunkSummary{
+        reused: reused,
+        added: right.len as u64 - reused,
+        removed: left.len as u64 - reused,
+    };
+}
+
+fn diff_render_chunk_summary(arena: &Arena, left: &DiffLoadedBytes, right: &DiffLoadedBytes) !void {
+    const summary: DiffChunkSummary = try diff_chunk_summary(arena, left.chunk_units, right.chunk_units);
+    fprintf(
+        stdout,
+        "Chunk summary: %llu reused, %llu added, %llu removed\n" as *byte,
+        summary.reused,
+        summary.added,
+        summary.removed,
+    );
+    fprintf(stdout, "Chunk counts: %zu -> %zu\n" as *byte, left.chunk_units.len, right.chunk_units.len);
+    fprintf(stdout, "Logical size: %llu -> %llu bytes\n" as *byte, left.logical_size, right.logical_size);
+}
+
 fn diff_load_store_bytes(arena: &Arena, store: &LooseObjectStore, object_id: &ObjectId) !DiffLoadedBytes {
     const object_bytes: ObjectBytes = store.get(*object_id, arena) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
@@ -739,6 +909,29 @@ fn diff_load_store_bytes(arena: &Arena, store: &LooseObjectStore, object_id: &Ob
         }
         return error.DiffStoreFailed;
     };
+    var kind_offset: usize = 0;
+    const kind: ObjectKind = decode_object_kind(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &kind_offset) catch {
+        return error.DiffStoreFailed;
+    };
+    if kind == ObjectKind.ChunkedBlob {
+        var chunked_offset: usize = 0;
+        const payload: ChunkedBlobPayload = decode_chunked_blob_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &chunked_offset) catch {
+            return error.DiffStoreFailed;
+        };
+        if chunked_offset != object_bytes.bytes.len {
+            return error.DiffStoreFailed;
+        }
+        return DiffLoadedBytes{
+            bytes: ByteList{ ptr: null, len: 0 },
+            owned: null,
+            blob_kind: DiffBlobKind.ChunkedBlob,
+            logical_size: payload.logical_size,
+            chunk_units: try diff_chunk_units_from_chunked_payload(arena, &payload),
+        };
+    }
+    if kind != ObjectKind.SmallBlob {
+        return error.DiffStoreFailed;
+    }
     var offset: usize = 0;
     const payload: SmallBlobPayload = decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
         return error.DiffStoreFailed;
@@ -749,16 +942,52 @@ fn diff_load_store_bytes(arena: &Arena, store: &LooseObjectStore, object_id: &Ob
     return DiffLoadedBytes{
         bytes: ByteList{ ptr: payload.payload.ptr, len: payload.payload.len },
         owned: null,
+        blob_kind: DiffBlobKind.SmallBlob,
+        logical_size: payload.logical_size,
+        chunk_units: try diff_chunk_units_from_single(arena, &object_id.hash, payload.logical_size),
     };
 }
 
-fn diff_load_workspace_bytes(root: &RepoPath, path: &ByteList, logical_size: u64) !DiffLoadedBytes {
+fn diff_load_workspace_bytes(arena: &Arena, root: &RepoPath, entry: &ManifestLeafInputEntry) !DiffLoadedBytes {
     const root_path: DiffFsPath = diff_fs_path_from_repo_path(root);
-    const fs_path: DiffFsPath = try diff_fs_path_join(&root_path, path);
-    const owned: DiffOwnedBytes = try diff_read_file_bytes(&fs_path, logical_size as usize);
+    const fs_path: DiffFsPath = try diff_fs_path_join(&root_path, &entry.path);
+    const owned: DiffOwnedBytes = try diff_read_file_bytes(&fs_path, entry.logical_size as usize);
+    if large_file_uses_small_blob(entry.logical_size) {
+        return DiffLoadedBytes{
+            bytes: ByteList{ ptr: owned.raw, len: owned.len },
+            owned: owned.raw,
+            blob_kind: DiffBlobKind.SmallBlob,
+            logical_size: entry.logical_size,
+            chunk_units: try diff_chunk_units_from_single(arena, &entry.object_id.hash, entry.logical_size),
+        };
+    }
+
+    const scratch_len: usize = large_prepare_recommended_arena_bytes(entry.logical_size) catch {
+        diff_owned_bytes_free(&owned);
+        return error.DiffStoreFailed;
+    };
+    const scratch: &byte = malloc(scratch_len) as &byte;
+    if scratch == null {
+        diff_owned_bytes_free(&owned);
+        return error.DiffAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+    var large_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+    arena_init(&large_arena, scratch, scratch_len);
+    const prepared: LargePreparedChunkedBlob = prepare_chunked_blob_repository_default(&large_arena, diff_owned_bytes_slice(&owned), FileType.Binary) catch {
+        diff_owned_bytes_free(&owned);
+        return error.DiffStoreFailed;
+    };
+    const units: DiffChunkUnitList = try diff_chunk_units_from_chunked_payload(arena, &prepared.payload);
+    diff_owned_bytes_free(&owned);
     return DiffLoadedBytes{
-        bytes: ByteList{ ptr: owned.raw, len: owned.len },
-        owned: owned.raw,
+        bytes: ByteList{ ptr: null, len: 0 },
+        owned: null,
+        blob_kind: DiffBlobKind.ChunkedBlob,
+        logical_size: entry.logical_size,
+        chunk_units: units,
     };
 }
 
@@ -774,7 +1003,7 @@ fn diff_load_bytes_for_entry(
     if source == DiffInputSourceKind.Store {
         return try diff_load_store_bytes(arena, store, &entry.object_id);
     }
-    return try diff_load_workspace_bytes(root, &entry.path, entry.logical_size);
+    return try diff_load_workspace_bytes(arena, root, entry);
 }
 
 fn diff_render_entry(
@@ -794,8 +1023,20 @@ fn diff_render_entry(
     var stats: DiffStats = diff_stats_zero();
     stats.files_changed = 1u64;
 
-    var left_bytes: DiffLoadedBytes = DiffLoadedBytes{ bytes: ByteList{ ptr: null, len: 0 }, owned: null };
-    var right_bytes: DiffLoadedBytes = DiffLoadedBytes{ bytes: ByteList{ ptr: null, len: 0 }, owned: null };
+    var left_bytes: DiffLoadedBytes = DiffLoadedBytes{
+        bytes: ByteList{ ptr: null, len: 0 },
+        owned: null,
+        blob_kind: DiffBlobKind.SmallBlob,
+        logical_size: 0u64,
+        chunk_units: DiffChunkUnitList{ ptr: null, len: 0 },
+    };
+    var right_bytes: DiffLoadedBytes = DiffLoadedBytes{
+        bytes: ByteList{ ptr: null, len: 0 },
+        owned: null,
+        blob_kind: DiffBlobKind.SmallBlob,
+        logical_size: 0u64,
+        chunk_units: DiffChunkUnitList{ ptr: null, len: 0 },
+    };
     defer {
         diff_loaded_bytes_free(&left_bytes);
         diff_loaded_bytes_free(&right_bytes);
@@ -806,6 +1047,20 @@ fn diff_render_entry(
     }
     if has_right {
         right_bytes = try diff_load_bytes_for_entry(arena, store, root, right_source, right_entries, entry.right_index);
+    }
+
+    if left_bytes.blob_kind == DiffBlobKind.ChunkedBlob || right_bytes.blob_kind == DiffBlobKind.ChunkedBlob {
+        if entry.kind == ManifestFlatDiffEntryKind.Modified && has_left && has_right {
+            if diff_chunk_unit_list_equal(left_bytes.chunk_units, right_bytes.chunk_units) &&
+                left_bytes.logical_size == right_bytes.logical_size {
+                fprintf(stdout, "mode changed\n" as *byte);
+                return stats;
+            }
+            try diff_render_chunk_summary(arena, &left_bytes, &right_bytes);
+            return stats;
+        }
+        diff_render_binary_summary(entry.kind);
+        return stats;
     }
 
     if entry.kind == ManifestFlatDiffEntryKind.Modified && has_left && has_right {
