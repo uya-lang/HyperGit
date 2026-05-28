@@ -1,0 +1,175 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.object_id_compare;
+use manifest.path.manifest_path_compare;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use object.types.ByteList;
+use workspace.file_hash.workspace_file_object_id;
+use workspace.scan.WorkspaceFileEntry;
+use workspace.scan.WorkspaceFileKind;
+use workspace.scan.WorkspaceFileList;
+use workspace.scan.workspace_scan_files;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_list_from_slice;
+
+error WorkspaceReconcileAlloc;
+error WorkspaceReconcileReadFailed;
+
+fn workspace_reconcile_zero_object_id() ObjectId {
+    return ObjectId{ hash: Hash32{ bytes: [] } };
+}
+
+fn workspace_reconcile_entry_from_base(
+    path: &ByteList,
+    base_object: ObjectId,
+    working_hash: Hash32,
+    status: ChangeStatus,
+    inode: u64,
+    mtime_ns: i64,
+    watcher_seq: u64,
+    reconcile_epoch: u64,
+) LocalChange {
+    return LocalChange{
+        path: ByteList{ ptr: path.ptr, len: path.len },
+        base_object: base_object,
+        working_hash: working_hash,
+        status: status,
+        last_seen_inode: inode,
+        last_seen_mtime_ns: mtime_ns,
+        watcher_seq: watcher_seq,
+        reconcile_epoch: reconcile_epoch,
+    };
+}
+
+fn workspace_reconcile_added_change(
+    root_path: &const byte,
+    entry: &WorkspaceFileEntry,
+    watcher_seq: u64,
+    reconcile_epoch: u64,
+) !LocalChange {
+    const working_object: ObjectId = try workspace_file_object_id(root_path, &entry.path, entry.logical_size);
+    return workspace_reconcile_entry_from_base(
+        &entry.path,
+        workspace_reconcile_zero_object_id(),
+        working_object.hash,
+        ChangeStatus.Added,
+        entry.inode,
+        entry.mtime_ns,
+        watcher_seq,
+        reconcile_epoch,
+    );
+}
+
+fn workspace_reconcile_materialized_or_modified_change(
+    root_path: &const byte,
+    base: &ManifestLeafInputEntry,
+    entry: &WorkspaceFileEntry,
+    watcher_seq: u64,
+    reconcile_epoch: u64,
+) !LocalChange {
+    const working_object: ObjectId = try workspace_file_object_id(root_path, &entry.path, entry.logical_size);
+    var status: ChangeStatus = ChangeStatus.Materialized;
+    if entry.kind != WorkspaceFileKind.Regular ||
+        entry.file_mode != base.mode ||
+        object_id_compare(&working_object, &base.object_id) != 0 {
+        status = ChangeStatus.Modified;
+    }
+    return workspace_reconcile_entry_from_base(
+        &base.path,
+        base.object_id,
+        working_object.hash,
+        status,
+        entry.inode,
+        entry.mtime_ns,
+        watcher_seq,
+        reconcile_epoch,
+    );
+}
+
+fn workspace_reconcile_deleted_change(
+    base: &ManifestLeafInputEntry,
+    watcher_seq: u64,
+    reconcile_epoch: u64,
+) LocalChange {
+    return workspace_reconcile_entry_from_base(
+        &base.path,
+        base.object_id,
+        Hash32{ bytes: [] },
+        ChangeStatus.Deleted,
+        0u64,
+        0i64,
+        watcher_seq,
+        reconcile_epoch,
+    );
+}
+
+export fn workspace_reconcile_scan(
+    arena: &Arena,
+    root_path: &const byte,
+    base_inputs: &ManifestLeafInputList,
+    watcher_seq: u64,
+    reconcile_epoch: u64,
+) !LocalChangeList {
+    const worktree: WorkspaceFileList = workspace_scan_files(arena, root_path) catch {
+        return error.WorkspaceReconcileReadFailed;
+    };
+    const max_len: usize = base_inputs.len + worktree.len;
+    if max_len == 0 {
+        return LocalChangeList{ ptr: null, len: 0 };
+    }
+
+    const raw_changes: &LocalChange = arena_alloc(arena, @size_of(LocalChange) as usize * max_len) as &LocalChange;
+    if raw_changes == null {
+        return error.WorkspaceReconcileAlloc;
+    }
+
+    var out_len: usize = 0;
+    var base_index: usize = 0;
+    var worktree_index: usize = 0;
+    while base_index < base_inputs.len && worktree_index < worktree.len {
+        const base: &ManifestLeafInputEntry = &base_inputs.ptr[base_index];
+        const worktree_entry: &WorkspaceFileEntry = &worktree.ptr[worktree_index];
+        const cmp: i32 = manifest_path_compare(&base.path, &worktree_entry.path);
+        if cmp == 0 {
+            raw_changes[out_len] = try workspace_reconcile_materialized_or_modified_change(
+                root_path,
+                base,
+                worktree_entry,
+                watcher_seq,
+                reconcile_epoch,
+            );
+            out_len = out_len + 1 as usize;
+            base_index = base_index + 1 as usize;
+            worktree_index = worktree_index + 1 as usize;
+            continue;
+        }
+        if cmp < 0 {
+            raw_changes[out_len] = workspace_reconcile_deleted_change(base, watcher_seq, reconcile_epoch);
+            out_len = out_len + 1 as usize;
+            base_index = base_index + 1 as usize;
+            continue;
+        }
+        raw_changes[out_len] = try workspace_reconcile_added_change(root_path, worktree_entry, watcher_seq, reconcile_epoch);
+        out_len = out_len + 1 as usize;
+        worktree_index = worktree_index + 1 as usize;
+    }
+
+    while base_index < base_inputs.len {
+        raw_changes[out_len] = workspace_reconcile_deleted_change(&base_inputs.ptr[base_index], watcher_seq, reconcile_epoch);
+        out_len = out_len + 1 as usize;
+        base_index = base_index + 1 as usize;
+    }
+
+    while worktree_index < worktree.len {
+        raw_changes[out_len] = try workspace_reconcile_added_change(root_path, &worktree.ptr[worktree_index], watcher_seq, reconcile_epoch);
+        out_len = out_len + 1 as usize;
+        worktree_index = worktree_index + 1 as usize;
+    }
+    return local_change_list_from_slice(raw_changes[0: out_len]);
+}

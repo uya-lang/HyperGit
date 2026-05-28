@@ -1,0 +1,258 @@
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.fwrite;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use libc.free;
+use libc.malloc;
+use libc.Stat;
+use libc.stat;
+use core.codec.ByteSpan;
+use core.codec.codec_decode_bytes;
+use core.codec.codec_decode_hash32;
+use core.codec.codec_decode_i64;
+use core.codec.codec_decode_u16;
+use core.codec.codec_decode_u32;
+use core.codec.codec_decode_u64;
+use core.codec.codec_encode_bytes;
+use core.codec.codec_encode_hash32;
+use core.codec.codec_encode_i64;
+use core.codec.codec_encode_u16;
+use core.codec.codec_encode_u32;
+use core.codec.codec_encode_u64;
+use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
+use core.ids.ObjectId;
+use core.ids.object_id_from_hash;
+use object.types.ByteList;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_list_from_slice;
+
+export const LOCAL_CHANGE_FILE_MAGIC: u32 = 0x314C4348u32;
+export const LOCAL_CHANGE_FILE_VERSION: u16 = 1u16;
+const LOCAL_CHANGE_FILE_FLAGS: u16 = 0u16;
+const LOCAL_CHANGE_FILE_HEADER_BYTES: usize = 16 as usize;
+const LOCAL_CHANGE_FILE_MAX_BYTES: usize = 4194304 as usize;
+
+error LocalChangeFileAlloc;
+error LocalChangeFileInvalid;
+error LocalChangeFileNotFound;
+error LocalChangeFileOpenFailed;
+error LocalChangeFileReadFailed;
+error LocalChangeFileWriteFailed;
+error LocalChangeFileTooLarge;
+
+fn change_status_to_u16(status: ChangeStatus) u16 {
+    if status == ChangeStatus.Materialized {
+        return 0 as u16;
+    }
+    if status == ChangeStatus.Added {
+        return 1 as u16;
+    }
+    if status == ChangeStatus.Modified {
+        return 2 as u16;
+    }
+    if status == ChangeStatus.Deleted {
+        return 3 as u16;
+    }
+    return 4 as u16;
+}
+
+fn change_status_from_u16(value: u16) !ChangeStatus {
+    if value == 0 as u16 {
+        return ChangeStatus.Materialized;
+    }
+    if value == 1 as u16 {
+        return ChangeStatus.Added;
+    }
+    if value == 2 as u16 {
+        return ChangeStatus.Modified;
+    }
+    if value == 3 as u16 {
+        return ChangeStatus.Deleted;
+    }
+    if value == 4 as u16 {
+        return ChangeStatus.Conflict;
+    }
+    return error.LocalChangeFileInvalid;
+}
+
+fn local_change_file_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.LocalChangeFileAlloc;
+    }
+    return raw[0: len];
+}
+
+fn local_change_varuint_encoded_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1;
+    while temp >= 128u64 {
+        temp = temp >> 7;
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn local_change_encode_object_id(output: &[byte], offset: &usize, value: &ObjectId) !void {
+    return codec_encode_hash32(output, offset, &value.hash);
+}
+
+fn local_change_decode_object_id(input: &[byte], offset: &usize) !ObjectId {
+    return object_id_from_hash(try codec_decode_hash32(input, offset));
+}
+
+fn local_change_encoded_len(change: &LocalChange) usize {
+    return local_change_varuint_encoded_len(change.path.len as u64) +
+        HASH32_BYTES +
+        HASH32_BYTES +
+        2 as usize +
+        8 as usize +
+        8 as usize +
+        8 as usize +
+        8 as usize +
+        change.path.len;
+}
+
+fn local_change_list_encoded_len(changes: LocalChangeList) usize {
+    var total: usize = LOCAL_CHANGE_FILE_HEADER_BYTES;
+    var i: usize = 0;
+    while i < changes.len {
+        total = total + local_change_encoded_len(&changes.ptr[i]);
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+export fn local_change_file_write(path: &const byte, changes: &LocalChangeList) !void {
+    if path == null {
+        return error.LocalChangeFileOpenFailed;
+    }
+    const total_len: usize = local_change_list_encoded_len(changes[0]);
+    if total_len > LOCAL_CHANGE_FILE_MAX_BYTES {
+        return error.LocalChangeFileTooLarge;
+    }
+    const stream: &FILE = fopen(path, "w");
+    if stream == null {
+        return error.LocalChangeFileOpenFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    const payload: &byte = malloc(total_len) as &byte;
+    if payload == null {
+        return error.LocalChangeFileAlloc;
+    }
+    defer {
+        free(payload as &void);
+    }
+    const output: &[byte] = payload[0: total_len];
+    var offset: usize = 0;
+    try codec_encode_u32(output, &offset, LOCAL_CHANGE_FILE_MAGIC);
+    try codec_encode_u16(output, &offset, LOCAL_CHANGE_FILE_VERSION);
+    try codec_encode_u16(output, &offset, LOCAL_CHANGE_FILE_FLAGS);
+    try codec_encode_u64(output, &offset, changes.len as u64);
+
+    var i: usize = 0;
+    while i < changes.len {
+        const change: &LocalChange = &changes.ptr[i];
+        try codec_encode_bytes(output, &offset, change.path.ptr[0: change.path.len]);
+        try local_change_encode_object_id(output, &offset, &change.base_object);
+        try codec_encode_hash32(output, &offset, &change.working_hash);
+        try codec_encode_u16(output, &offset, change_status_to_u16(change.status));
+        try codec_encode_u64(output, &offset, change.last_seen_inode);
+        try codec_encode_i64(output, &offset, change.last_seen_mtime_ns);
+        try codec_encode_u64(output, &offset, change.watcher_seq);
+        try codec_encode_u64(output, &offset, change.reconcile_epoch);
+        i = i + 1 as usize;
+    }
+
+    if fwrite(payload as &const byte, 1 as usize, offset, stream) != offset {
+        return error.LocalChangeFileWriteFailed;
+    }
+}
+
+export fn local_change_file_read(arena: &Arena, path: &const byte) !LocalChangeList {
+    if path == null {
+        return error.LocalChangeFileNotFound;
+    }
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return error.LocalChangeFileNotFound;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var st: Stat = Stat{};
+    if stat(path, &st) != 0 {
+        return error.LocalChangeFileReadFailed;
+    }
+    const size: usize = st.st_size as usize;
+    if size == 0 {
+        return error.LocalChangeFileReadFailed;
+    }
+    if size > LOCAL_CHANGE_FILE_MAX_BYTES {
+        return error.LocalChangeFileTooLarge;
+    }
+    const input: &[byte] = try local_change_file_arena_bytes(arena, size);
+    const count: usize = fread(input.ptr, 1 as usize, size, stream);
+    if count != size {
+        return error.LocalChangeFileReadFailed;
+    }
+
+    var offset: usize = 0;
+    if try codec_decode_u32(input, &offset) != LOCAL_CHANGE_FILE_MAGIC {
+        return error.LocalChangeFileInvalid;
+    }
+    if try codec_decode_u16(input, &offset) != LOCAL_CHANGE_FILE_VERSION {
+        return error.LocalChangeFileInvalid;
+    }
+    if try codec_decode_u16(input, &offset) != LOCAL_CHANGE_FILE_FLAGS {
+        return error.LocalChangeFileInvalid;
+    }
+    const entry_count_u64: u64 = try codec_decode_u64(input, &offset);
+    if entry_count_u64 > 65535u64 {
+        return error.LocalChangeFileTooLarge;
+    }
+    const entry_count: usize = entry_count_u64 as usize;
+    if entry_count == 0 {
+        return LocalChangeList{ ptr: null, len: 0 };
+    }
+
+    const raw_changes: &LocalChange = arena_alloc(arena, @size_of(LocalChange) as usize * entry_count) as &LocalChange;
+    if raw_changes == null {
+        return error.LocalChangeFileAlloc;
+    }
+
+    var i: usize = 0;
+    while i < entry_count {
+        const path_span: ByteSpan = try codec_decode_bytes(input, &offset);
+        raw_changes[i] = LocalChange{
+            path: ByteList{ ptr: path_span.ptr, len: path_span.len },
+            base_object: try local_change_decode_object_id(input, &offset),
+            working_hash: try codec_decode_hash32(input, &offset),
+            status: try change_status_from_u16(try codec_decode_u16(input, &offset)),
+            last_seen_inode: try codec_decode_u64(input, &offset),
+            last_seen_mtime_ns: try codec_decode_i64(input, &offset),
+            watcher_seq: try codec_decode_u64(input, &offset),
+            reconcile_epoch: try codec_decode_u64(input, &offset),
+        };
+        i = i + 1 as usize;
+    }
+    if offset != input.len {
+        return error.LocalChangeFileInvalid;
+    }
+    return local_change_list_from_slice(raw_changes[0: entry_count]);
+}

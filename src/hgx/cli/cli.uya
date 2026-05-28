@@ -9,6 +9,8 @@ export enum DispatchAction {
     Help,
     Version,
     Status,
+    Diff,
+    Checkout,
     Add,
     Commit,
     Log,
@@ -58,6 +60,22 @@ export fn plan_from_first_arg(argc: i32, first_arg: &byte) DispatchPlan {
     if same_arg(first_arg, "status") {
         return DispatchPlan {
             action: DispatchAction.Status,
+            exit_code: EXIT_OK,
+            subject: first_arg,
+        };
+    }
+
+    if same_arg(first_arg, "diff") {
+        return DispatchPlan {
+            action: DispatchAction.Diff,
+            exit_code: EXIT_OK,
+            subject: first_arg,
+        };
+    }
+
+    if same_arg(first_arg, "checkout") {
+        return DispatchPlan {
+            action: DispatchAction.Checkout,
             exit_code: EXIT_OK,
             subject: first_arg,
         };

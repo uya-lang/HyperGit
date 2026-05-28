@@ -59,6 +59,12 @@ if ! printf '%s' "$HEAD_HEX" | grep -Eq '^[0-9a-f]{64}$'; then
     exit 1
 fi
 
+GRAPH_FILE="$REPO_DIR/.hgit/indexes/commit-graph.hgi"
+if [ ! -s "$GRAPH_FILE" ]; then
+    echo "missing commit graph after first commit" >&2
+    exit 1
+fi
+
 ENTRY_COUNT="$(od -An -t u8 -j 40 -N 8 "$REPO_DIR/.hgit/workspace/stage.hgi" | awk '{print $1}')"
 if [ "$ENTRY_COUNT" != "0" ]; then
     echo "stage entry_count should be 0 after commit, got $ENTRY_COUNT" >&2

@@ -28,11 +28,16 @@ test:
 	$(UYA) test src/hypergit/test_manifest_query.uya
 	$(UYA) test src/hypergit/test_manifest_diff.uya
 	$(UYA) test src/hypergit/test_commit_build.uya
+	$(UYA) test src/hypergit/test_commit_graph.uya
 	$(UYA) test src/hypergit/test_stage_state.uya
 	$(UYA) test src/hypergit/test_stage_file.uya
 	$(UYA) test src/hypergit/test_small_blob_hash.uya
 	$(UYA) test src/hypergit/test_workspace_scan.uya
+	$(UYA) test src/hypergit/test_workspace_state_file.uya
+	$(UYA) test src/hypergit/test_local_change_file.uya
+	$(UYA) test src/hypergit/test_workspace_reconcile.uya
 	$(UYA) test src/hypergit/test_loose_store.uya
+	$(UYA) test src/hypergit/test_checkout_plan.uya
 	$(UYA) test src/hgx/test_repo_layout.uya
 	$(UYA) test src/hgx/test_head_ref.uya
 	$(UYA) test src/hgx/test_commit_partial_stage.uya
@@ -43,6 +48,14 @@ test:
 	./tests/test_commit_first.sh
 	./tests/test_commit_second_parent.sh
 	./tests/test_log_first.sh
+	./tests/test_diff_add.sh
+	./tests/test_diff_delete.sh
+	./tests/test_diff_modify.sh
+	./tests/test_diff_pathspec.sh
+	./tests/test_diff_binary.sh
+	./tests/test_checkout_content.sh
+	./tests/test_checkout_dirty.sh
+	./tests/test_checkout_state_recovery.sh
 	./tests/test_repo_init.sh
 	./tests/test_status_empty.sh
 	./tests/test_status_clean.sh

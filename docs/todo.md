@@ -179,49 +179,49 @@
 
 ## 10. Commit Graph Index
 
-- [ ] 实现 commit graph entry。
-- [ ] 实现 generation 计算。
-- [ ] 实现 parent lookup。
-- [ ] 实现 ref head frontier。
-- [ ] 实现 changed path bloom 初版。
-- [ ] 实现 commit graph 持久化。
-- [ ] 实现 commit graph 增量加载。
-- [ ] 实现 merge-base 查询。
-- [ ] 测试线性历史。
-- [ ] 测试分叉历史。
-- [ ] 测试多 parent merge commit。
+- [x] 实现 commit graph entry。
+- [x] 实现 generation 计算。
+- [x] 实现 parent lookup。
+- [x] 实现 ref head frontier。
+- [x] 实现 changed path bloom 初版。
+- [x] 实现 commit graph 持久化。
+- [x] 实现 commit graph 增量加载。
+- [x] 实现 merge-base 查询。
+- [x] 测试线性历史。
+- [x] 测试分叉历史。
+- [x] 测试多 parent merge commit。
 
 ## 11. Diff
 
-- [ ] 实现 `hgx diff` 基本命令。
-- [ ] 实现 commit-to-commit manifest diff。
-- [ ] 实现 workspace-to-commit diff。
-- [ ] 实现 small text diff。
-- [ ] 实现 binary changed summary。
-- [ ] 实现 pathspec diff。
-- [ ] 实现 rename hint 占位。
-- [ ] 实现 diff 统计输出。
-- [ ] 测试新增文件 diff。
-- [ ] 测试删除文件 diff。
-- [ ] 测试修改文件 diff。
-- [ ] 测试目录 pathspec diff。
+- [x] 实现 `hgx diff` 基本命令。
+- [x] 实现 commit-to-commit manifest diff。
+- [x] 实现 workspace-to-commit diff。
+- [x] 实现 small text diff。
+- [x] 实现 binary changed summary。
+- [x] 实现 pathspec diff。
+- [x] 实现 rename hint 占位。
+- [x] 实现 diff 统计输出。
+- [x] 测试新增文件 diff。
+- [x] 测试删除文件 diff。
+- [x] 测试修改文件 diff。
+- [x] 测试目录 pathspec diff。
 
 ## 12. Workspace Engine
 
-- [ ] 定义 `WorkspaceState`。
-- [ ] 定义 `LocalChange`。
-- [ ] 实现 `workspace/state.json`。
-- [ ] 实现 `workspace/local-change.hgi` 初版。
-- [ ] 实现 materialized path 记录。
-- [ ] 实现 dirty path 记录。
-- [ ] 实现 watcher journal 占位。
-- [ ] 实现 reconcile 扫描。
-- [ ] 实现 `hgx checkout <ref>`。
-- [ ] 实现 checkout planner。
-- [ ] 实现 atomic workspace state 更新。
-- [ ] 测试 checkout 后文件内容正确。
-- [ ] 测试 dirty 文件不被覆盖。
-- [ ] 测试中断后 state 可恢复。
+- [x] 定义 `WorkspaceState`。
+- [x] 定义 `LocalChange`。
+- [x] 实现 `workspace/state.json`。
+- [x] 实现 `workspace/local-change.hgi` 初版。
+- [x] 实现 materialized path 记录。
+- [x] 实现 dirty path 记录。
+- [x] 实现 watcher journal 占位。
+- [x] 实现 reconcile 扫描。
+- [x] 实现 `hgx checkout <ref>`。
+- [x] 实现 checkout planner。
+- [x] 实现 atomic workspace state 更新。
+- [x] 测试 checkout 后文件内容正确。
+- [x] 测试 dirty 文件不被覆盖。
+- [x] 测试中断后 state 可恢复。
 
 ## 13. Sparse / Hydrate
 

@@ -1,0 +1,478 @@
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fwrite;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.string.strcmp;
+use std.string.strlen;
+
+use libc.Stat;
+use libc.errno;
+use libc.free;
+use libc.fprintf;
+use libc.malloc;
+use libc.mkdir;
+use libc.remove;
+use libc.stat;
+use libc.stderr;
+use libc.EACCES;
+use libc.EEXIST;
+use libc.EPERM;
+use libc.S_IRWXU;
+use cli.EXIT_OK;
+use cli.EXIT_RUNTIME_ERROR;
+use cli.EXIT_USAGE_ERROR;
+use core.ids.CommitId;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.commit_id_decode_hex;
+use manifest.load.manifest_load_flatten;
+use manifest.trie.ManifestLeafInputList;
+use object.codec.decode_commit_object;
+use object.codec.decode_small_blob_object;
+use object.types.ByteList;
+use object.types.CommitPayload;
+use object.types.SmallBlobPayload;
+use store.head_ref.repo_head_ref_exists;
+use store.head_ref.repo_read_head_commit;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
+use store.repo_layout.HGIT_WORKSPACE_STATE_REL;
+use store.repo_layout.REPO_PATH_MAX;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_join_literal;
+use store.repo_layout.repo_read_config;
+use workspace.checkout_plan.CheckoutAction;
+use workspace.checkout_plan.CheckoutActionKind;
+use workspace.checkout_plan.CheckoutPlan;
+use workspace.checkout_plan.checkout_plan_build;
+use workspace.local_change_file.local_change_file_write;
+use workspace.reconcile.workspace_reconcile_scan;
+use workspace.state.LocalChangeList;
+use workspace.state.WorkspaceState;
+use workspace.state.local_change_dirty_count;
+use workspace.state.local_change_materialized_count;
+use workspace.state.workspace_state_init;
+use workspace.state.workspace_state_with_counts;
+use workspace.state.workspace_state_zero_commit;
+use workspace.state_file.workspace_state_file_read;
+use workspace.state_file.workspace_state_file_write;
+
+const CHECKOUT_ARENA_BYTES: usize = 33554432 as usize;
+const CHECKOUT_PATH_MAX: usize = 4096 as usize;
+const CHECKOUT_STAT_S_IFMT: u32 = 61440u32;
+const CHECKOUT_STAT_S_IFDIR: u32 = 16384u32;
+
+error CheckoutAlloc;
+error CheckoutInvalidSpec;
+error CheckoutNoCommits;
+error CheckoutWriteFailed;
+error CheckoutPermissionDenied;
+error CheckoutPathTooLong;
+
+struct CheckoutFsPath {
+    bytes: [byte: 4096] = [],
+    len: usize = 0
+}
+
+export const CHECKOUT_USAGE_TEXT: &const byte = "error: checkout requires <ref>\n";
+export const CHECKOUT_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
+export const CHECKOUT_PERMISSION_TEXT: &const byte = "error: permission denied while updating workspace\n";
+export const CHECKOUT_NO_COMMITS_TEXT: &const byte = "error: no commits yet\n";
+export const CHECKOUT_DIRTY_TEXT: &const byte = "error: checkout blocked by dirty workspace\n";
+export const CHECKOUT_FAILURE_TEXT: &const byte = "error: failed to update workspace\n";
+
+fn checkout_same_arg(actual: &byte, expected: &const byte) bool {
+    if actual == null {
+        return false;
+    }
+    return strcmp(actual as &const byte, expected) == 0;
+}
+
+fn checkout_is_default_branch(config: &RepoConfig, spec: &byte) bool {
+    if spec == null {
+        return false;
+    }
+    const spec_len: usize = strlen(spec as &const byte);
+    if spec_len != config.default_branch_len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < spec_len {
+        if spec[i] != config.default_branch[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn checkout_is_hex_commit_spec(spec: &byte) bool {
+    if spec == null {
+        return false;
+    }
+    const spec_len: usize = strlen(spec as &const byte);
+    if spec_len != HASH32_HEX_BYTES {
+        return false;
+    }
+    commit_id_decode_hex((spec as &byte)[0: HASH32_HEX_BYTES]) catch {
+        return false;
+    };
+    return true;
+}
+
+fn checkout_resolve_commit_spec(root: &RepoPath, config: &RepoConfig, spec: &byte) !CommitId {
+    if checkout_same_arg(spec, "HEAD") || checkout_is_default_branch(config, spec) {
+        const has_head: bool = repo_head_ref_exists(root, config) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                return error.CheckoutPermissionDenied;
+            }
+            return error.CheckoutInvalidSpec;
+        };
+        if !has_head {
+            return error.CheckoutNoCommits;
+        }
+        return repo_read_head_commit(root, config) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                return error.CheckoutPermissionDenied;
+            }
+            return error.CheckoutInvalidSpec;
+        };
+    }
+    if checkout_is_hex_commit_spec(spec) {
+        return try commit_id_decode_hex((spec as &byte)[0: HASH32_HEX_BYTES]);
+    }
+    return error.CheckoutInvalidSpec;
+}
+
+fn checkout_repo_root_bytes(root: &RepoPath) ByteList {
+    return ByteList{ ptr: &root.bytes[0], len: root.len };
+}
+
+fn checkout_commit_payload(arena: &Arena, store: &LooseObjectStore, commit_id: &CommitId) !CommitPayload {
+    const object_bytes: ObjectBytes = store.get(commit_id.id, arena) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.CheckoutPermissionDenied;
+        }
+        return error.CheckoutFailure;
+    };
+    var offset: usize = 0;
+    const payload: CommitPayload = decode_commit_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.CheckoutFailure;
+    };
+    if offset != object_bytes.bytes.len {
+        return error.CheckoutFailure;
+    }
+    return payload;
+}
+
+fn checkout_manifest_inputs_from_commit(arena: &Arena, store: &LooseObjectStore, commit_id: &CommitId) !ManifestLeafInputList {
+    const payload: CommitPayload = try checkout_commit_payload(arena, store, commit_id);
+    return manifest_load_flatten(arena, store, &payload.manifest_root) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.CheckoutPermissionDenied;
+        }
+        return error.CheckoutFailure;
+    };
+}
+
+fn checkout_fs_path_from_repo_path(root: &RepoPath) CheckoutFsPath {
+    var out: CheckoutFsPath = CheckoutFsPath{ bytes: [], len: root.len };
+    var i: usize = 0;
+    while i < root.len {
+        out.bytes[i] = root.bytes[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[root.len] = 0 as byte;
+    return out;
+}
+
+fn checkout_fs_path_join(base: &CheckoutFsPath, suffix: &ByteList) !CheckoutFsPath {
+    var out: CheckoutFsPath = *base;
+    var pos: usize = out.len;
+    if suffix.len == 0 {
+        out.bytes[pos] = 0 as byte;
+        return out;
+    }
+    if pos > 0 {
+        const last_index: usize = pos - 1 as usize;
+        if last_index >= CHECKOUT_PATH_MAX {
+            return error.CheckoutPathTooLong;
+        }
+        if out.bytes[last_index] != '/' as byte {
+            if pos + 1 as usize >= CHECKOUT_PATH_MAX {
+                return error.CheckoutPathTooLong;
+            }
+            out.bytes[pos] = '/' as byte;
+            pos = pos + 1 as usize;
+        }
+    }
+    if pos + suffix.len >= CHECKOUT_PATH_MAX {
+        return error.CheckoutPathTooLong;
+    }
+    var i: usize = 0;
+    while i < suffix.len {
+        out.bytes[pos + i] = suffix.ptr[i];
+        i = i + 1 as usize;
+    }
+    pos = pos + suffix.len;
+    out.bytes[pos] = 0 as byte;
+    out.len = pos;
+    return out;
+}
+
+fn checkout_errno_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn checkout_path_is_dir(path: &CheckoutFsPath) bool {
+    var st: Stat = Stat{};
+    if stat(&path.bytes[0] as &const byte, &st) != 0 {
+        return false;
+    }
+    return (st.st_mode as u32 & CHECKOUT_STAT_S_IFMT) == CHECKOUT_STAT_S_IFDIR;
+}
+
+fn checkout_ensure_parent_dirs(path: &CheckoutFsPath) !void {
+    var buf: CheckoutFsPath = *path;
+    var i: usize = 1 as usize;
+    while i < path.len {
+        if buf.bytes[i] == '/' as byte {
+            const saved: byte = buf.bytes[i];
+            buf.bytes[i] = 0 as byte;
+            if mkdir(&buf.bytes[0] as &const byte, S_IRWXU as i32) != 0 && !checkout_path_is_dir(&buf) {
+                if checkout_errno_permission() {
+                    return error.CheckoutPermissionDenied;
+                }
+                return error.CheckoutWriteFailed;
+            }
+            buf.bytes[i] = saved;
+        }
+        i = i + 1 as usize;
+    }
+}
+
+fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, path: &CheckoutFsPath, action: &CheckoutAction) !void {
+    const object_bytes: ObjectBytes = store.get(action.object_id, arena) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.CheckoutPermissionDenied;
+        }
+        return error.CheckoutFailure;
+    };
+    var offset: usize = 0;
+    const payload: SmallBlobPayload = decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.CheckoutFailure;
+    };
+    if offset != object_bytes.bytes.len {
+        return error.CheckoutFailure;
+    }
+    try checkout_ensure_parent_dirs(path);
+    const stream: &FILE = fopen(&path.bytes[0] as &const byte, "w");
+    if stream == null {
+        if checkout_errno_permission() {
+            return error.CheckoutPermissionDenied;
+        }
+        return error.CheckoutWriteFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+    if fwrite(payload.payload.ptr as &const byte, 1 as usize, payload.payload.len, stream) != payload.payload.len {
+        return error.CheckoutWriteFailed;
+    }
+}
+
+fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &RepoPath, plan: &CheckoutPlan) !void {
+    const root_path: CheckoutFsPath = checkout_fs_path_from_repo_path(root);
+    var i: usize = 0;
+    while i < plan.actions.len {
+        const action: &CheckoutAction = &plan.actions.ptr[i];
+        const fs_path: CheckoutFsPath = try checkout_fs_path_join(&root_path, &action.path);
+        if action.kind == CheckoutActionKind.DeleteFile {
+            _ = remove(&fs_path.bytes[0] as &const byte);
+        } else {
+            try checkout_write_blob_to_path(arena, store, &fs_path, action);
+        }
+        i = i + 1 as usize;
+    }
+}
+
+fn checkout_current_state(arena: &Arena, root: &RepoPath, config: &RepoConfig) !WorkspaceState {
+    _ = arena;
+    const has_head: bool = repo_head_ref_exists(root, config) catch {
+        return workspace_state_init(checkout_repo_root_bytes(root), workspace_state_zero_commit());
+    };
+    if !has_head {
+        return workspace_state_init(checkout_repo_root_bytes(root), workspace_state_zero_commit());
+    }
+    const head_commit: CommitId = repo_read_head_commit(root, config) catch {
+        return workspace_state_init(checkout_repo_root_bytes(root), workspace_state_zero_commit());
+    };
+    return workspace_state_init(checkout_repo_root_bytes(root), head_commit);
+}
+
+fn checkout_sync_workspace_files(
+    arena: &Arena,
+    root: &RepoPath,
+    target_commit: &CommitId,
+    target_inputs: &ManifestLeafInputList,
+    local_changes: &LocalChangeList,
+    current_state: &WorkspaceState,
+) !void {
+    var state: WorkspaceState = workspace_state_with_counts(
+        checkout_repo_root_bytes(root),
+        target_commit[0],
+        local_change_materialized_count(local_changes),
+        local_change_dirty_count(local_changes),
+        current_state.watcher_seq + 1u64,
+    );
+    state.view_id = current_state.view_id;
+    state.sparse_profile_id = current_state.sparse_profile_id;
+
+    const state_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STATE_REL);
+    try workspace_state_file_write(repo_path_cstr(&state_path) as &const byte, &state);
+
+    const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
+    try local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, local_changes);
+}
+
+export fn run_checkout() i32 {
+    const argc: i32 = get_argc();
+    if argc != 3 {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_USAGE_TEXT);
+        return EXIT_USAGE_ERROR;
+    }
+
+    const root: RepoPath = repo_find_root_from_cwd() catch |err| {
+        if @error_id(err) == @error_id(error.RepoNotFound) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_NOT_REPO_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const config: RepoConfig = repo_read_config(&root) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const target_spec: &byte = get_argv(2);
+    const target_commit: CommitId = checkout_resolve_commit_spec(&root, &config, target_spec) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutNoCommits) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_NO_COMMITS_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const arena_storage: &byte = malloc(CHECKOUT_ARENA_BYTES) as &byte;
+    if arena_storage == null {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    defer {
+        free(arena_storage as &void);
+    }
+    var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+    arena_init(&arena, arena_storage, CHECKOUT_ARENA_BYTES);
+
+    const current_state: WorkspaceState = checkout_current_state(&arena, &root, &config) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    var current_inputs: ManifestLeafInputList = ManifestLeafInputList{ ptr: null, len: 0 };
+    if current_state.base_commit.id.hash.bytes[0] != 0 as byte || current_state.base_commit.id.hash.bytes[31] != 0 as byte {
+        current_inputs = checkout_manifest_inputs_from_commit(&arena, &store, &current_state.base_commit) catch |err| {
+            if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+    }
+    const target_inputs: ManifestLeafInputList = checkout_manifest_inputs_from_commit(&arena, &store, &target_commit) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const local_changes: LocalChangeList = workspace_reconcile_scan(
+        &arena,
+        repo_path_cstr(&root) as &const byte,
+        &current_inputs,
+        current_state.watcher_seq,
+        current_state.watcher_seq + 1u64,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const plan: CheckoutPlan = checkout_plan_build(&arena, &current_inputs, &target_inputs, &local_changes) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    if plan.blocked_paths.len > 0 {
+        checkout_sync_workspace_files(&arena, &root, &current_state.base_commit, &current_inputs, &local_changes, &current_state) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        fprintf(stderr, "%s" as *byte, CHECKOUT_DIRTY_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+
+    checkout_apply_plan(&arena, &store, &root, &plan) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const final_changes: LocalChangeList = workspace_reconcile_scan(
+        &arena,
+        repo_path_cstr(&root) as &const byte,
+        &target_inputs,
+        current_state.watcher_seq + 1u64,
+        current_state.watcher_seq + 2u64,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    checkout_sync_workspace_files(&arena, &root, &target_commit, &target_inputs, &final_changes, &current_state) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    return EXIT_OK;
+}

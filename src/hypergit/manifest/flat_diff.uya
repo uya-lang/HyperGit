@@ -1,0 +1,172 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.ids.object_id_compare;
+use core.ids.policy_id_compare;
+use manifest.path.manifest_path_compare;
+use manifest.query.ManifestPathspecList;
+use manifest.query.manifest_pathspec_matches_any;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use object.types.ByteList;
+
+error ManifestFlatDiffAlloc;
+
+export enum ManifestFlatDiffEntryKind {
+    Added,
+    Removed,
+    Modified
+}
+
+export struct ManifestFlatDiffEntry {
+    kind: ManifestFlatDiffEntryKind,
+    path: ByteList,
+    left_index: usize,
+    right_index: usize,
+    rename_hint_from: ByteList
+}
+
+export struct ManifestFlatDiffEntryList {
+    ptr: &ManifestFlatDiffEntry,
+    len: usize
+}
+
+fn manifest_flat_diff_entry_equal(left: &ManifestLeafInputEntry, right: &ManifestLeafInputEntry) bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.mode != right.mode {
+        return false;
+    }
+    if object_id_compare(&left.object_id, &right.object_id) != 0 {
+        return false;
+    }
+    if left.logical_size != right.logical_size {
+        return false;
+    }
+    if left.content_type != right.content_type {
+        return false;
+    }
+    return policy_id_compare(&left.policy_id, &right.policy_id) == 0;
+}
+
+fn manifest_flat_diff_emit(
+    raw: &ManifestFlatDiffEntry,
+    out_index: usize,
+    kind: ManifestFlatDiffEntryKind,
+    path: &ByteList,
+    left_index: usize,
+    right_index: usize,
+) usize {
+    raw[out_index] = ManifestFlatDiffEntry{
+        kind: kind,
+        path: ByteList{ ptr: path.ptr, len: path.len },
+        left_index: left_index,
+        right_index: right_index,
+        rename_hint_from: ByteList{ ptr: null, len: 0 },
+    };
+    return out_index + 1 as usize;
+}
+
+export fn manifest_flat_diff(
+    arena: &Arena,
+    left: &ManifestLeafInputList,
+    right: &ManifestLeafInputList,
+    pathspecs: ManifestPathspecList,
+) !ManifestFlatDiffEntryList {
+    const max_len: usize = left.len + right.len;
+    if max_len == 0 {
+        return ManifestFlatDiffEntryList{ ptr: null, len: 0 };
+    }
+
+    const raw: &ManifestFlatDiffEntry = arena_alloc(arena, @size_of(ManifestFlatDiffEntry) as usize * max_len) as &ManifestFlatDiffEntry;
+    if raw == null {
+        return error.ManifestFlatDiffAlloc;
+    }
+
+    var out_len: usize = 0;
+    var left_index: usize = 0;
+    var right_index: usize = 0;
+
+    while left_index < left.len && right_index < right.len {
+        const left_entry: &ManifestLeafInputEntry = &left.ptr[left_index];
+        const right_entry: &ManifestLeafInputEntry = &right.ptr[right_index];
+        const cmp: i32 = manifest_path_compare(&left_entry.path, &right_entry.path);
+
+        if cmp == 0 {
+            if !manifest_flat_diff_entry_equal(left_entry, right_entry) &&
+                manifest_pathspec_matches_any(ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len }, &left_entry.path) {
+                out_len = manifest_flat_diff_emit(
+                    raw,
+                    out_len,
+                    ManifestFlatDiffEntryKind.Modified,
+                    &left_entry.path,
+                    left_index,
+                    right_index,
+                );
+            }
+            left_index = left_index + 1 as usize;
+            right_index = right_index + 1 as usize;
+            continue;
+        }
+
+        if cmp < 0 {
+            if manifest_pathspec_matches_any(ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len }, &left_entry.path) {
+                out_len = manifest_flat_diff_emit(
+                    raw,
+                    out_len,
+                    ManifestFlatDiffEntryKind.Removed,
+                    &left_entry.path,
+                    left_index,
+                    right.len,
+                );
+            }
+            left_index = left_index + 1 as usize;
+            continue;
+        }
+
+        if manifest_pathspec_matches_any(ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len }, &right_entry.path) {
+            out_len = manifest_flat_diff_emit(
+                raw,
+                out_len,
+                ManifestFlatDiffEntryKind.Added,
+                &right_entry.path,
+                left.len,
+                right_index,
+            );
+        }
+        right_index = right_index + 1 as usize;
+    }
+
+    while left_index < left.len {
+        const left_entry: &ManifestLeafInputEntry = &left.ptr[left_index];
+        if manifest_pathspec_matches_any(ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len }, &left_entry.path) {
+            out_len = manifest_flat_diff_emit(
+                raw,
+                out_len,
+                ManifestFlatDiffEntryKind.Removed,
+                &left_entry.path,
+                left_index,
+                right.len,
+            );
+        }
+        left_index = left_index + 1 as usize;
+    }
+
+    while right_index < right.len {
+        const right_entry: &ManifestLeafInputEntry = &right.ptr[right_index];
+        if manifest_pathspec_matches_any(ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len }, &right_entry.path) {
+            out_len = manifest_flat_diff_emit(
+                raw,
+                out_len,
+                ManifestFlatDiffEntryKind.Added,
+                &right_entry.path,
+                left.len,
+                right_index,
+            );
+        }
+        right_index = right_index + 1 as usize;
+    }
+
+    return ManifestFlatDiffEntryList{ ptr: raw, len: out_len };
+}

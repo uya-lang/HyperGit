@@ -1,0 +1,56 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use libc.system;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.commit_id_from_object;
+use core.ids.object_id_from_hash;
+use object.types.ByteList;
+use workspace.state.WorkspaceState;
+use workspace.state.workspace_state_with_counts;
+use workspace.state_file.workspace_state_file_write;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_commit_id(seed: byte) CommitId {
+    return commit_id_from_object(object_id_from_hash(make_hash(seed)));
+}
+
+fn test_workspace_state_file_write_persists_expected_json() !void {
+    try expect(system("rm -rf build/workspace-state-test && mkdir -p build/workspace-state-test") == 0);
+
+    var repo_root: [byte: 9] = ['/' as byte, 't' as byte, 'm' as byte, 'p' as byte, '/' as byte, 'r' as byte, 'e' as byte, 'p' as byte, 'o' as byte];
+    var state: WorkspaceState = workspace_state_with_counts(
+        ByteList{ ptr: repo_root[0: 9].ptr, len: 9 as usize },
+        make_commit_id(7 as byte),
+        5u64,
+        2u64,
+        9u64,
+    );
+    state.view_id.hash = make_hash(20 as byte);
+    state.sparse_profile_id = make_hash(40 as byte);
+
+    try workspace_state_file_write("build/workspace-state-test/state.json", &state);
+    try expect(system("grep -F '\"repo_root\":\"/tmp/repo\"' build/workspace-state-test/state.json >/dev/null") == 0);
+    try expect(system("grep -F '\"materialized_count\":5' build/workspace-state-test/state.json >/dev/null") == 0);
+    try expect(system("grep -F '\"dirty_count\":2' build/workspace-state-test/state.json >/dev/null") == 0);
+    try expect(system("grep -F '\"watcher_seq\":9' build/workspace-state-test/state.json >/dev/null") == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Workspace State File Tests");
+    run_test("workspace state file write persists expected json", test_workspace_state_file_write_persists_expected_json);
+    return test_suite_end();
+}

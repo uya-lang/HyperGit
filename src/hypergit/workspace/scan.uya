@@ -21,6 +21,10 @@ const WORKSPACE_SCAN_STAT_S_IFMT: u32 = 61440u32;
 const WORKSPACE_SCAN_STAT_S_IFDIR: u32 = 16384u32;
 const WORKSPACE_SCAN_STAT_S_IFREG: u32 = 32768u32;
 const WORKSPACE_SCAN_STAT_S_IFLNK: u32 = 40960u32;
+const WORKSPACE_SCAN_STAT_EXEC_BITS: u32 = 73u32;
+const WORKSPACE_SCAN_MODE_FILE: u32 = 0o100644u32;
+const WORKSPACE_SCAN_MODE_EXECUTABLE: u32 = 0o100755u32;
+const WORKSPACE_SCAN_MODE_SYMLINK: u32 = 0o120000u32;
 
 error WorkspaceScanAlloc;
 error WorkspaceScanRootInvalid;
@@ -41,7 +45,9 @@ export struct WorkspaceFileEntry {
     path: ByteList,
     kind: WorkspaceFileKind,
     file_mode: u32,
-    logical_size: u64
+    logical_size: u64,
+    inode: u64,
+    mtime_ns: i64
 }
 
 export struct WorkspaceFileList {
@@ -175,11 +181,33 @@ fn workspace_scan_kind_from_mode(mode: u32) !WorkspaceFileKind {
     return error.WorkspaceScanUnsupportedFileType;
 }
 
+fn workspace_scan_canonical_mode(mode: u32) u32 {
+    const kind: u32 = workspace_scan_mode_type(mode);
+    if kind == WORKSPACE_SCAN_STAT_S_IFLNK {
+        return WORKSPACE_SCAN_MODE_SYMLINK;
+    }
+    if (mode & WORKSPACE_SCAN_STAT_EXEC_BITS) != 0u32 {
+        return WORKSPACE_SCAN_MODE_EXECUTABLE;
+    }
+    return WORKSPACE_SCAN_MODE_FILE;
+}
+
 fn workspace_scan_logical_size(st: &Stat) u64 {
     if st.st_size < 0 {
         return 0u64;
     }
     return st.st_size as u64;
+}
+
+fn workspace_scan_inode(st: &Stat) u64 {
+    if st.st_ino < 0 {
+        return 0u64;
+    }
+    return st.st_ino as u64;
+}
+
+fn workspace_scan_mtime_ns(st: &Stat) i64 {
+    return (st.st_mtime * 1000000000i64) + st.st_mtime_nsec;
 }
 
 fn workspace_scan_count_files(root: &WorkspaceScanPath, relative: &WorkspaceScanPath) !usize {
@@ -273,8 +301,10 @@ fn workspace_scan_collect_files(arena: &Arena, root: &WorkspaceScanPath, relativ
         entries[*next_index] = WorkspaceFileEntry{
             path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
             kind: try workspace_scan_kind_from_mode(st.st_mode as u32),
-            file_mode: st.st_mode as u32,
+            file_mode: workspace_scan_canonical_mode(st.st_mode as u32),
             logical_size: workspace_scan_logical_size(&st),
+            inode: workspace_scan_inode(&st),
+            mtime_ns: workspace_scan_mtime_ns(&st),
         };
         *next_index = *next_index + 1 as usize;
     }

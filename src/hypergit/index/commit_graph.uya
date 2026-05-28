@@ -1,0 +1,796 @@
+use std.crypto.blake3.blake3_digest;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.fwrite;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use libc.Stat;
+use libc.free;
+use libc.malloc;
+use libc.stat;
+use core.codec.ByteSpan;
+use core.codec.codec_decode_bytes;
+use core.codec.codec_decode_hash32;
+use core.codec.codec_decode_i64;
+use core.codec.codec_decode_u16;
+use core.codec.codec_decode_u32;
+use core.codec.codec_decode_u64;
+use core.codec.codec_decode_varuint;
+use core.codec.codec_encode_bytes;
+use core.codec.codec_encode_hash32;
+use core.codec.codec_encode_i64;
+use core.codec.codec_encode_u16;
+use core.codec.codec_encode_u32;
+use core.codec.codec_encode_u64;
+use core.codec.codec_encode_varuint;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
+use core.ids.commit_id_compare;
+use core.ids.commit_id_from_object;
+use core.ids.object_id_from_hash;
+use object.codec.decode_commit_object;
+use object.types.BloomFilter;
+use object.types.ByteList;
+use object.types.CommitIdList;
+use object.types.CommitPayload;
+use object.types.ModuleBitmap;
+use object.types.commit_id_list_from_slice;
+use store.loose_store.LooseObjectStore;
+use store.object_store.ObjectBytes;
+
+export const COMMIT_GRAPH_MAGIC: u32 = 0x31474348u32;
+export const COMMIT_GRAPH_VERSION: u16 = 1u16;
+const COMMIT_GRAPH_FLAGS: u16 = 0u16;
+const COMMIT_GRAPH_HEADER_BYTES: usize = 16 as usize;
+const COMMIT_GRAPH_MAX_BYTES: usize = 8388608 as usize;
+export const COMMIT_GRAPH_BLOOM_BYTES: usize = 32 as usize;
+const COMMIT_GRAPH_BLOOM_PROBES: usize = 3 as usize;
+
+error CommitGraphAlloc;
+error CommitGraphCorrupt;
+error CommitGraphInvalid;
+error CommitGraphNotFound;
+error CommitGraphReadFailed;
+error CommitGraphWriteFailed;
+error CommitGraphEntryNotFound;
+error CommitGraphNoMergeBase;
+error CommitGraphTooLarge;
+
+export struct CommitGraphEntry {
+    commit_id: CommitId,
+    generation: u64,
+    parents: CommitIdList,
+    timestamp_ms: i64,
+    changed_path_bloom: BloomFilter,
+    module_bitmap: ModuleBitmap
+}
+
+export struct CommitGraphEntryList {
+    ptr: &CommitGraphEntry,
+    len: usize
+}
+
+export struct CommitGraphPathList {
+    ptr: &ByteList,
+    len: usize
+}
+
+struct CommitIdBuffer {
+    ptr: &CommitId,
+    len: usize,
+    cap: usize
+}
+
+struct CommitGraphEntryBuffer {
+    ptr: &CommitGraphEntry,
+    len: usize,
+    cap: usize
+}
+
+fn commit_graph_varuint_encoded_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1;
+    while temp >= 128u64 {
+        temp = temp >> 7;
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn commit_graph_byte_list_encoded_len(value: &ByteList) usize {
+    return commit_graph_varuint_encoded_len(value.len as u64) + value.len;
+}
+
+fn commit_graph_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.CommitGraphAlloc;
+    }
+    return raw[0: len];
+}
+
+fn commit_graph_copy_byte_list(arena: &Arena, value: &ByteList) !ByteList {
+    if value.len == 0 {
+        return ByteList{ ptr: null, len: 0 };
+    }
+    if value.ptr == null {
+        return error.CommitGraphInvalid;
+    }
+    const out: &[byte] = try commit_graph_arena_bytes(arena, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn commit_graph_copy_commit_ids(arena: &Arena, value: CommitIdList) !CommitIdList {
+    if value.len == 0 {
+        return CommitIdList{ ptr: null, len: 0 };
+    }
+    if value.ptr == null {
+        return error.CommitGraphInvalid;
+    }
+    const raw: &CommitId = arena_alloc(arena, @size_of(CommitId) as usize * value.len) as &CommitId;
+    if raw == null {
+        return error.CommitGraphAlloc;
+    }
+    var i: usize = 0;
+    while i < value.len {
+        raw[i] = value.ptr[i];
+        i = i + 1 as usize;
+    }
+    return CommitIdList{ ptr: raw, len: value.len };
+}
+
+fn commit_graph_id_buffer_init() CommitIdBuffer {
+    return CommitIdBuffer{ ptr: null, len: 0, cap: 0 };
+}
+
+fn commit_graph_entry_buffer_init() CommitGraphEntryBuffer {
+    return CommitGraphEntryBuffer{ ptr: null, len: 0, cap: 0 };
+}
+
+fn commit_graph_commit_id_buffer_contains(buffer: &CommitIdBuffer, target: &CommitId) bool {
+    var i: usize = 0;
+    while i < buffer.len {
+        if commit_id_compare(&buffer.ptr[i], target) == 0 {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn commit_graph_entry_buffer_contains(buffer: &CommitGraphEntryBuffer, target: &CommitId) bool {
+    var i: usize = 0;
+    while i < buffer.len {
+        if commit_id_compare(&buffer.ptr[i].commit_id, target) == 0 {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn commit_graph_commit_id_buffer_append(arena: &Arena, buffer: &CommitIdBuffer, value: &CommitId) !void {
+    if buffer.len == buffer.cap {
+        var next_cap: usize = 4 as usize;
+        if buffer.cap > 0 {
+            next_cap = buffer.cap * 2 as usize;
+        }
+        const raw: &CommitId = arena_alloc(arena, @size_of(CommitId) as usize * next_cap) as &CommitId;
+        if raw == null {
+            return error.CommitGraphAlloc;
+        }
+        var copy_index: usize = 0;
+        while copy_index < buffer.len {
+            raw[copy_index] = buffer.ptr[copy_index];
+            copy_index = copy_index + 1 as usize;
+        }
+        buffer.ptr = raw;
+        buffer.cap = next_cap;
+    }
+    buffer.ptr[buffer.len] = *value;
+    buffer.len = buffer.len + 1 as usize;
+}
+
+fn commit_graph_entry_buffer_append(arena: &Arena, buffer: &CommitGraphEntryBuffer, value: &CommitGraphEntry) !void {
+    if buffer.len == buffer.cap {
+        var next_cap: usize = 4 as usize;
+        if buffer.cap > 0 {
+            next_cap = buffer.cap * 2 as usize;
+        }
+        const raw: &CommitGraphEntry = arena_alloc(arena, @size_of(CommitGraphEntry) as usize * next_cap) as &CommitGraphEntry;
+        if raw == null {
+            return error.CommitGraphAlloc;
+        }
+        var copy_index: usize = 0;
+        while copy_index < buffer.len {
+            raw[copy_index] = buffer.ptr[copy_index];
+            copy_index = copy_index + 1 as usize;
+        }
+        buffer.ptr = raw;
+        buffer.cap = next_cap;
+    }
+    buffer.ptr[buffer.len] = *value;
+    buffer.len = buffer.len + 1 as usize;
+}
+
+fn commit_graph_entry_buffer_as_list(buffer: &CommitGraphEntryBuffer) CommitGraphEntryList {
+    return CommitGraphEntryList{ ptr: buffer.ptr, len: buffer.len };
+}
+
+fn commit_graph_collect_ancestors(arena: &Arena, entries: &CommitGraphEntryList, start: &CommitId) !CommitIdList {
+    _ = try commit_graph_find_entry_index(entries, start);
+
+    var stack: CommitIdBuffer = commit_graph_id_buffer_init();
+    var visited: CommitIdBuffer = commit_graph_id_buffer_init();
+    try commit_graph_commit_id_buffer_append(arena, &stack, start);
+
+    while stack.len > 0 {
+        stack.len = stack.len - 1 as usize;
+        const current: CommitId = stack.ptr[stack.len];
+        if commit_graph_commit_id_buffer_contains(&visited, &current) {
+            continue;
+        }
+        try commit_graph_commit_id_buffer_append(arena, &visited, &current);
+
+        const entry_index: usize = try commit_graph_find_entry_index(entries, &current);
+        const entry: &CommitGraphEntry = &entries.ptr[entry_index];
+        var parent_index: usize = 0;
+        while parent_index < entry.parents.len {
+            try commit_graph_commit_id_buffer_append(arena, &stack, &entry.parents.ptr[parent_index]);
+            parent_index = parent_index + 1 as usize;
+        }
+    }
+
+    return commit_id_list_from_slice(visited.ptr[0: visited.len]);
+}
+
+fn commit_graph_is_ancestor(arena: &Arena, entries: &CommitGraphEntryList, ancestor: &CommitId, descendant: &CommitId) !bool {
+    const ancestors: CommitIdList = try commit_graph_collect_ancestors(arena, entries, descendant);
+    var i: usize = 0;
+    while i < ancestors.len {
+        if commit_id_compare(&ancestors.ptr[i], ancestor) == 0 {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn commit_graph_bloom_probe_index(digest: &Hash32, probe: usize, bit_count: usize) usize {
+    const base: usize = probe * 2 as usize;
+    const value: usize = ((digest.bytes[base] as usize) << 8) | digest.bytes[base + 1 as usize] as usize;
+    return value % bit_count;
+}
+
+fn commit_graph_bloom_set_bit(output: &[byte], bit_index: usize) void {
+    const byte_index: usize = bit_index / 8 as usize;
+    const bit_offset: i32 = (bit_index % 8 as usize) as i32;
+    const mask: byte = (1 as byte) << bit_offset;
+    output.ptr[byte_index] = output.ptr[byte_index] | mask;
+}
+
+fn commit_graph_bloom_test_bit(value: &ByteList, bit_index: usize) bool {
+    const byte_index: usize = bit_index / 8 as usize;
+    const bit_offset: i32 = (bit_index % 8 as usize) as i32;
+    const mask: byte = (1 as byte) << bit_offset;
+    return (value.ptr[byte_index] & mask) != 0 as byte;
+}
+
+fn commit_graph_encode_commit_id(output: &[byte], offset: &usize, value: &CommitId) !void {
+    return codec_encode_hash32(output, offset, &value.id.hash);
+}
+
+fn commit_graph_decode_commit_id(input: &[byte], offset: &usize) !CommitId {
+    return commit_id_from_object(object_id_from_hash(try codec_decode_hash32(input, offset)));
+}
+
+fn commit_graph_entry_encoded_len(entry: &CommitGraphEntry) !usize {
+    if entry.parents.len > 0 && entry.parents.ptr == null {
+        return error.CommitGraphInvalid;
+    }
+    return HASH32_BYTES +
+        8 as usize +
+        8 as usize +
+        commit_graph_varuint_encoded_len(entry.parents.len as u64) +
+        (HASH32_BYTES * entry.parents.len) +
+        commit_graph_byte_list_encoded_len(&entry.changed_path_bloom.bytes) +
+        commit_graph_byte_list_encoded_len(&entry.module_bitmap.bytes);
+}
+
+fn commit_graph_encoded_len(entries: &CommitGraphEntryList) !usize {
+    var total: usize = COMMIT_GRAPH_HEADER_BYTES;
+    var i: usize = 0;
+    while i < entries.len {
+        total = total + try commit_graph_entry_encoded_len(&entries.ptr[i]);
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn commit_graph_encode_entry(output: &[byte], offset: &usize, entry: &CommitGraphEntry) !void {
+    try commit_graph_encode_commit_id(output, offset, &entry.commit_id);
+    try codec_encode_u64(output, offset, entry.generation);
+    try codec_encode_i64(output, offset, entry.timestamp_ms);
+    try codec_encode_varuint(output, offset, entry.parents.len as u64);
+
+    var i: usize = 0;
+    while i < entry.parents.len {
+        try commit_graph_encode_commit_id(output, offset, &entry.parents.ptr[i]);
+        i = i + 1 as usize;
+    }
+
+    var bloom_empty: [byte: 1] = [];
+    var bloom_slice: &[byte] = bloom_empty[0: 0];
+    if entry.changed_path_bloom.bytes.len > 0 {
+        if entry.changed_path_bloom.bytes.ptr == null {
+            return error.CommitGraphInvalid;
+        }
+        bloom_slice = entry.changed_path_bloom.bytes.ptr[0: entry.changed_path_bloom.bytes.len];
+    }
+    try codec_encode_bytes(output, offset, bloom_slice);
+
+    var module_empty: [byte: 1] = [];
+    var module_slice: &[byte] = module_empty[0: 0];
+    if entry.module_bitmap.bytes.len > 0 {
+        if entry.module_bitmap.bytes.ptr == null {
+            return error.CommitGraphInvalid;
+        }
+        module_slice = entry.module_bitmap.bytes.ptr[0: entry.module_bitmap.bytes.len];
+    }
+    try codec_encode_bytes(output, offset, module_slice);
+}
+
+fn commit_graph_decode_entry(arena: &Arena, input: &[byte], offset: &usize) !CommitGraphEntry {
+    const commit_id: CommitId = try commit_graph_decode_commit_id(input, offset);
+    const generation: u64 = try codec_decode_u64(input, offset);
+    const timestamp_ms: i64 = try codec_decode_i64(input, offset);
+    const parent_count_u64: u64 = try codec_decode_varuint(input, offset);
+    if parent_count_u64 > 65535u64 {
+        return error.CommitGraphTooLarge;
+    }
+    const parent_count: usize = parent_count_u64 as usize;
+
+    var parents: CommitIdList = CommitIdList{ ptr: null, len: 0 };
+    if parent_count > 0 {
+        const raw_parents: &CommitId = arena_alloc(arena, @size_of(CommitId) as usize * parent_count) as &CommitId;
+        if raw_parents == null {
+            return error.CommitGraphAlloc;
+        }
+        var parent_index: usize = 0;
+        while parent_index < parent_count {
+            raw_parents[parent_index] = try commit_graph_decode_commit_id(input, offset);
+            parent_index = parent_index + 1 as usize;
+        }
+        parents = CommitIdList{ ptr: raw_parents, len: parent_count };
+    }
+
+    const bloom_span: ByteSpan = try codec_decode_bytes(input, offset);
+    const module_span: ByteSpan = try codec_decode_bytes(input, offset);
+    return CommitGraphEntry{
+        commit_id: commit_id,
+        generation: generation,
+        parents: parents,
+        timestamp_ms: timestamp_ms,
+        changed_path_bloom: BloomFilter{
+            bytes: ByteList{ ptr: bloom_span.ptr, len: bloom_span.len },
+        },
+        module_bitmap: ModuleBitmap{
+            bytes: ByteList{ ptr: module_span.ptr, len: module_span.len },
+        },
+    };
+}
+
+fn commit_graph_clone_existing_entries(arena: &Arena, entries: &CommitGraphEntryList) !CommitGraphEntryBuffer {
+    var buffer: CommitGraphEntryBuffer = commit_graph_entry_buffer_init();
+    var i: usize = 0;
+    while i < entries.len {
+        try commit_graph_entry_buffer_append(arena, &buffer, &entries.ptr[i]);
+        i = i + 1 as usize;
+    }
+    return buffer;
+}
+
+fn commit_graph_collect_entry(arena: &Arena, store: &LooseObjectStore, buffer: &CommitGraphEntryBuffer, commit_id: &CommitId) !void {
+    if commit_graph_entry_buffer_contains(buffer, commit_id) {
+        return;
+    }
+
+    var entry: CommitGraphEntry = try commit_graph_read_entry(arena, store, commit_id);
+    var parent_index: usize = 0;
+    while parent_index < entry.parents.len {
+        try commit_graph_collect_entry(arena, store, buffer, &entry.parents.ptr[parent_index]);
+        parent_index = parent_index + 1 as usize;
+    }
+
+    if entry.generation == 0u64 {
+        const buffer_entries: CommitGraphEntryList = commit_graph_entry_buffer_as_list(buffer);
+        entry.generation = try commit_graph_generation_from_parents(&buffer_entries, entry.parents);
+    }
+    try commit_graph_entry_buffer_append(arena, buffer, &entry);
+}
+
+export fn commit_graph_entry_list_from_slice(slice: &[CommitGraphEntry]) CommitGraphEntryList {
+    return CommitGraphEntryList{ ptr: slice.ptr, len: slice.len };
+}
+
+export fn commit_graph_path_list_from_slice(slice: &[ByteList]) CommitGraphPathList {
+    return CommitGraphPathList{ ptr: slice.ptr, len: slice.len };
+}
+
+export fn commit_graph_entry_from_payload(arena: &Arena, commit_id: &CommitId, payload: &CommitPayload) !CommitGraphEntry {
+    const parents: CommitIdList = try commit_graph_copy_commit_ids(arena, payload.parents);
+    const bloom_bytes: ByteList = try commit_graph_copy_byte_list(arena, &payload.changed_path_bloom.bytes);
+    const module_bytes: ByteList = try commit_graph_copy_byte_list(arena, &payload.module_bitmap.bytes);
+    return CommitGraphEntry{
+        commit_id: *commit_id,
+        generation: payload.generation,
+        parents: parents,
+        timestamp_ms: payload.timestamp_ms,
+        changed_path_bloom: BloomFilter{ bytes: bloom_bytes },
+        module_bitmap: ModuleBitmap{ bytes: module_bytes },
+    };
+}
+
+export fn commit_graph_read_entry(arena: &Arena, store: &LooseObjectStore, commit_id: &CommitId) !CommitGraphEntry {
+    const object_bytes: ObjectBytes = store.get(commit_id.id, arena) catch {
+        return error.CommitGraphEntryNotFound;
+    };
+    var offset: usize = 0;
+    const payload: CommitPayload = decode_commit_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.CommitGraphCorrupt;
+    };
+    if offset != object_bytes.bytes.len {
+        return error.CommitGraphCorrupt;
+    }
+    return try commit_graph_entry_from_payload(arena, commit_id, &payload);
+}
+
+export fn commit_graph_find_entry_index(entries: &CommitGraphEntryList, commit_id: &CommitId) !usize {
+    var i: usize = 0;
+    while i < entries.len {
+        if commit_id_compare(&entries.ptr[i].commit_id, commit_id) == 0 {
+            return i;
+        }
+        i = i + 1 as usize;
+    }
+    return error.CommitGraphEntryNotFound;
+}
+
+export fn commit_graph_generation_from_parents(entries: &CommitGraphEntryList, parents: CommitIdList) !u64 {
+    if parents.len == 0 {
+        return 1u64;
+    }
+    if parents.ptr == null {
+        return error.CommitGraphInvalid;
+    }
+
+    var max_generation: u64 = 0u64;
+    var i: usize = 0;
+    while i < parents.len {
+        const parent_index: usize = try commit_graph_find_entry_index(entries, &parents.ptr[i]);
+        if entries.ptr[parent_index].generation > max_generation {
+            max_generation = entries.ptr[parent_index].generation;
+        }
+        i = i + 1 as usize;
+    }
+    return max_generation + 1u64;
+}
+
+export fn commit_graph_parent_lookup(arena: &Arena, entries: &CommitGraphEntryList, commit_id: &CommitId) !CommitGraphEntryList {
+    const entry_index: usize = try commit_graph_find_entry_index(entries, commit_id);
+    const entry: &CommitGraphEntry = &entries.ptr[entry_index];
+    if entry.parents.len == 0 {
+        return CommitGraphEntryList{ ptr: null, len: 0 };
+    }
+
+    const raw: &CommitGraphEntry = arena_alloc(arena, @size_of(CommitGraphEntry) as usize * entry.parents.len) as &CommitGraphEntry;
+    if raw == null {
+        return error.CommitGraphAlloc;
+    }
+    var i: usize = 0;
+    while i < entry.parents.len {
+        const parent_index: usize = try commit_graph_find_entry_index(entries, &entry.parents.ptr[i]);
+        raw[i] = entries.ptr[parent_index];
+        i = i + 1 as usize;
+    }
+    return CommitGraphEntryList{ ptr: raw, len: entry.parents.len };
+}
+
+export fn commit_graph_ref_head_frontier(arena: &Arena, entries: &CommitGraphEntryList, heads: CommitIdList) !CommitIdList {
+    if heads.len == 0 {
+        return CommitIdList{ ptr: null, len: 0 };
+    }
+
+    var seen: CommitIdBuffer = commit_graph_id_buffer_init();
+    var frontier: CommitIdBuffer = commit_graph_id_buffer_init();
+    var i: usize = 0;
+    while i < heads.len {
+        const head: CommitId = heads.ptr[i];
+        if commit_graph_commit_id_buffer_contains(&seen, &head) {
+            i = i + 1 as usize;
+            continue;
+        }
+        try commit_graph_commit_id_buffer_append(arena, &seen, &head);
+
+        var covered: bool = false;
+        var j: usize = 0;
+        while j < heads.len {
+            if i != j && commit_id_compare(&head, &heads.ptr[j]) != 0 {
+                if try commit_graph_is_ancestor(arena, entries, &head, &heads.ptr[j]) {
+                    covered = true;
+                    break;
+                }
+            }
+            j = j + 1 as usize;
+        }
+
+        if !covered {
+            try commit_graph_commit_id_buffer_append(arena, &frontier, &head);
+        }
+        i = i + 1 as usize;
+    }
+
+    return commit_id_list_from_slice(frontier.ptr[0: frontier.len]);
+}
+
+export fn commit_graph_changed_path_bloom_build(arena: &Arena, paths: CommitGraphPathList) !BloomFilter {
+    if paths.len == 0 {
+        return BloomFilter{ bytes: ByteList{ ptr: null, len: 0 } };
+    }
+
+    const bytes: &[byte] = try commit_graph_arena_bytes(arena, COMMIT_GRAPH_BLOOM_BYTES);
+    var clear_index: usize = 0;
+    while clear_index < COMMIT_GRAPH_BLOOM_BYTES {
+        bytes.ptr[clear_index] = 0 as byte;
+        clear_index = clear_index + 1 as usize;
+    }
+
+    const bit_count: usize = COMMIT_GRAPH_BLOOM_BYTES * 8 as usize;
+    var path_index: usize = 0;
+    while path_index < paths.len {
+        const path: &ByteList = &paths.ptr[path_index];
+        if path.len > 0 && path.ptr == null {
+            return error.CommitGraphInvalid;
+        }
+
+        var digest: Hash32 = Hash32{ bytes: [] };
+        var empty: [byte: 1] = [];
+        var path_slice: &[byte] = empty[0: 0];
+        if path.len > 0 {
+            path_slice = path.ptr[0: path.len];
+        }
+        blake3_digest(path_slice, digest.bytes[0: HASH32_BYTES]);
+
+        var probe_index: usize = 0;
+        while probe_index < COMMIT_GRAPH_BLOOM_PROBES {
+            const bit_index: usize = commit_graph_bloom_probe_index(&digest, probe_index, bit_count);
+            commit_graph_bloom_set_bit(bytes, bit_index);
+            probe_index = probe_index + 1 as usize;
+        }
+        path_index = path_index + 1 as usize;
+    }
+
+    return BloomFilter{
+        bytes: ByteList{ ptr: bytes.ptr, len: COMMIT_GRAPH_BLOOM_BYTES },
+    };
+}
+
+export fn commit_graph_changed_path_bloom_may_contain(filter: &BloomFilter, path: &ByteList) bool {
+    if filter.bytes.len == 0 || filter.bytes.ptr == null {
+        return false;
+    }
+
+    var digest: Hash32 = Hash32{ bytes: [] };
+    var empty: [byte: 1] = [];
+    var path_slice: &[byte] = empty[0: 0];
+    if path.len > 0 {
+        if path.ptr == null {
+            return false;
+        }
+        path_slice = path.ptr[0: path.len];
+    }
+    blake3_digest(path_slice, digest.bytes[0: HASH32_BYTES]);
+
+    const bit_count: usize = filter.bytes.len * 8 as usize;
+    var probe_index: usize = 0;
+    while probe_index < COMMIT_GRAPH_BLOOM_PROBES {
+        const bit_index: usize = commit_graph_bloom_probe_index(&digest, probe_index, bit_count);
+        if !commit_graph_bloom_test_bit(&filter.bytes, bit_index) {
+            return false;
+        }
+        probe_index = probe_index + 1 as usize;
+    }
+    return true;
+}
+
+export fn commit_graph_file_write(path: &const byte, entries: &CommitGraphEntryList) !void {
+    if path == null {
+        return error.CommitGraphWriteFailed;
+    }
+
+    const total_len: usize = try commit_graph_encoded_len(entries);
+    const stream: &FILE = fopen(path, "w");
+    if stream == null {
+        return error.CommitGraphWriteFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    const payload: &byte = malloc(total_len) as &byte;
+    if payload == null {
+        return error.CommitGraphAlloc;
+    }
+    defer {
+        free(payload as &void);
+    }
+
+    const output: &[byte] = payload[0: total_len];
+    var offset: usize = 0;
+    try codec_encode_u32(output, &offset, COMMIT_GRAPH_MAGIC);
+    try codec_encode_u16(output, &offset, COMMIT_GRAPH_VERSION);
+    try codec_encode_u16(output, &offset, COMMIT_GRAPH_FLAGS);
+    try codec_encode_u64(output, &offset, entries.len as u64);
+
+    var i: usize = 0;
+    while i < entries.len {
+        try commit_graph_encode_entry(output, &offset, &entries.ptr[i]);
+        i = i + 1 as usize;
+    }
+
+    if fwrite(payload as &const byte, 1 as usize, offset, stream) != offset {
+        return error.CommitGraphWriteFailed;
+    }
+}
+
+export fn commit_graph_file_read(path: &const byte, arena: &Arena) !CommitGraphEntryList {
+    if path == null {
+        return error.CommitGraphNotFound;
+    }
+
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return error.CommitGraphNotFound;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var st: Stat = Stat{};
+    if stat(path, &st) != 0 {
+        return error.CommitGraphReadFailed;
+    }
+    const size: usize = st.st_size as usize;
+    if size == 0 {
+        return error.CommitGraphReadFailed;
+    }
+    if size > COMMIT_GRAPH_MAX_BYTES {
+        return error.CommitGraphTooLarge;
+    }
+    const input: &[byte] = try commit_graph_arena_bytes(arena, size);
+    const count: usize = fread(input.ptr, 1 as usize, size, stream);
+    if count != size {
+        return error.CommitGraphReadFailed;
+    }
+
+    var offset: usize = 0;
+    if try codec_decode_u32(input, &offset) != COMMIT_GRAPH_MAGIC {
+        return error.CommitGraphInvalid;
+    }
+    if try codec_decode_u16(input, &offset) != COMMIT_GRAPH_VERSION {
+        return error.CommitGraphInvalid;
+    }
+    if try codec_decode_u16(input, &offset) != COMMIT_GRAPH_FLAGS {
+        return error.CommitGraphInvalid;
+    }
+
+    const entry_count_u64: u64 = try codec_decode_u64(input, &offset);
+    if entry_count_u64 > 65535u64 {
+        return error.CommitGraphTooLarge;
+    }
+    const entry_count: usize = entry_count_u64 as usize;
+    if entry_count == 0 {
+        if offset != input.len {
+            return error.CommitGraphInvalid;
+        }
+        return CommitGraphEntryList{ ptr: null, len: 0 };
+    }
+
+    const raw_entries: &CommitGraphEntry = arena_alloc(arena, @size_of(CommitGraphEntry) as usize * entry_count) as &CommitGraphEntry;
+    if raw_entries == null {
+        return error.CommitGraphAlloc;
+    }
+    var entry_index: usize = 0;
+    while entry_index < entry_count {
+        raw_entries[entry_index] = try commit_graph_decode_entry(arena, input, &offset);
+        entry_index = entry_index + 1 as usize;
+    }
+    if offset != input.len {
+        return error.CommitGraphInvalid;
+    }
+    return CommitGraphEntryList{ ptr: raw_entries, len: entry_count };
+}
+
+fn commit_graph_file_exists(path: &const byte) bool {
+    if path == null {
+        return false;
+    }
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return false;
+    }
+    _ = fclose(stream);
+    return true;
+}
+
+export fn commit_graph_load_incremental(
+    arena: &Arena,
+    path: &const byte,
+    store: &LooseObjectStore,
+    heads: CommitIdList,
+) !CommitGraphEntryList {
+    var existing: CommitGraphEntryList = CommitGraphEntryList{ ptr: null, len: 0 };
+    if commit_graph_file_exists(path) {
+        existing = try commit_graph_file_read(path, arena);
+    }
+
+    var buffer: CommitGraphEntryBuffer = try commit_graph_clone_existing_entries(arena, &existing);
+    var head_index: usize = 0;
+    while head_index < heads.len {
+        try commit_graph_collect_entry(arena, store, &buffer, &heads.ptr[head_index]);
+        head_index = head_index + 1 as usize;
+    }
+    return commit_graph_entry_buffer_as_list(&buffer);
+}
+
+export fn commit_graph_merge_base(
+    arena: &Arena,
+    entries: &CommitGraphEntryList,
+    left: &CommitId,
+    right: &CommitId,
+) !CommitId {
+    const left_ancestors: CommitIdList = try commit_graph_collect_ancestors(arena, entries, left);
+    const right_ancestors: CommitIdList = try commit_graph_collect_ancestors(arena, entries, right);
+
+    var found: bool = false;
+    var best: CommitId = *left;
+    var best_generation: u64 = 0u64;
+
+    var right_index: usize = 0;
+    while right_index < right_ancestors.len {
+        const candidate: &CommitId = &right_ancestors.ptr[right_index];
+        var left_index: usize = 0;
+        while left_index < left_ancestors.len {
+            if commit_id_compare(candidate, &left_ancestors.ptr[left_index]) == 0 {
+                const entry_index: usize = try commit_graph_find_entry_index(entries, candidate);
+                const generation: u64 = entries.ptr[entry_index].generation;
+                if !found || generation > best_generation {
+                    best = *candidate;
+                    best_generation = generation;
+                    found = true;
+                }
+                break;
+            }
+            left_index = left_index + 1 as usize;
+        }
+        right_index = right_index + 1 as usize;
+    }
+
+    if !found {
+        return error.CommitGraphNoMergeBase;
+    }
+    return best;
+}

@@ -1,0 +1,120 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use libc.system;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use workspace.file_hash.workspace_file_object_id;
+use workspace.reconcile.workspace_reconcile_scan;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_dirty_count;
+use workspace.state.local_change_materialized_count;
+
+fn count_status(changes: &LocalChangeList, status: ChangeStatus) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    while i < changes.len {
+        if changes.ptr[i].status == status {
+            total = total + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn test_workspace_reconcile_scan_tracks_materialized_dirty_missing_and_added() !void {
+    try expect(system("rm -rf build/workspace-reconcile-test && mkdir -p build/workspace-reconcile-test/repo") == 0);
+    try expect(system("cd build/workspace-reconcile-test/repo && printf clean >a.txt && printf before >b.txt && printf gone >d.txt") == 0);
+
+    var a_path: [byte: 5] = ['a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var b_path: [byte: 5] = ['b' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var d_path: [byte: 5] = ['d' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var c_path: [byte: 5] = ['c' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+
+    const root: &const byte = "build/workspace-reconcile-test/repo";
+    const a_id: ObjectId = try workspace_file_object_id(root, &ByteList{ ptr: a_path[0: 5].ptr, len: 5 as usize }, 5u64);
+    const b_id: ObjectId = try workspace_file_object_id(root, &ByteList{ ptr: b_path[0: 5].ptr, len: 5 as usize }, 6u64);
+    const d_id: ObjectId = try workspace_file_object_id(root, &ByteList{ ptr: d_path[0: 5].ptr, len: 5 as usize }, 4u64);
+
+    try expect(system("cd build/workspace-reconcile-test/repo && printf after >b.txt && rm d.txt && printf extra >c.txt") == 0);
+
+    var inputs: [ManifestLeafInputEntry: 3] = [
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: a_path[0: 5].ptr, len: 5 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: a_id,
+            logical_size: 5u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(11 as byte))),
+        },
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: b_path[0: 5].ptr, len: 5 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: b_id,
+            logical_size: 6u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(12 as byte))),
+        },
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: d_path[0: 5].ptr, len: 5 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: d_id,
+            logical_size: 4u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(13 as byte))),
+        },
+    ];
+
+    var arena_buf: [byte: 65536] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 65536 as usize);
+    const base_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(inputs[0: 3]);
+    const changes: LocalChangeList = try workspace_reconcile_scan(
+        &arena,
+        root,
+        &base_inputs,
+        4u64,
+        5u64,
+    );
+
+    try expect(changes.len == 4 as usize);
+    try expect(count_status(&changes, ChangeStatus.Materialized) == 1 as usize);
+    try expect(count_status(&changes, ChangeStatus.Modified) == 1 as usize);
+    try expect(count_status(&changes, ChangeStatus.Added) == 1 as usize);
+    try expect(count_status(&changes, ChangeStatus.Deleted) == 1 as usize);
+    try expect(local_change_materialized_count(&changes) == 1u64);
+    try expect(local_change_dirty_count(&changes) == 3u64);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Workspace Reconcile Tests");
+    run_test("workspace reconcile scan tracks materialized dirty missing and added", test_workspace_reconcile_scan_tracks_materialized_dirty_missing_and_added);
+    return test_suite_end();
+}

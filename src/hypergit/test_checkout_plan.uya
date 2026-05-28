@@ -1,0 +1,140 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.ids.Hash32;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use workspace.checkout_plan.CheckoutActionKind;
+use workspace.checkout_plan.CheckoutPlan;
+use workspace.checkout_plan.checkout_plan_build;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_list_from_slice;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_input(path: &ByteList, seed: byte) ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: ByteList{ ptr: path.ptr, len: path.len },
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: object_id_from_hash(make_hash(seed)),
+        logical_size: seed as u64,
+        content_type: ContentType.Unknown,
+        policy_id: policy_id_from_object(object_id_from_hash(make_hash(seed + 40 as byte))),
+    };
+}
+
+fn test_checkout_plan_blocks_dirty_paths() !void {
+    var path: [byte: 5] = ['a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var dirty: [LocalChange: 1] = [
+        LocalChange{
+            path: ByteList{ ptr: path[0: 5].ptr, len: 5 as usize },
+            base_object: object_id_from_hash(make_hash(1 as byte)),
+            working_hash: make_hash(2 as byte),
+            status: ChangeStatus.Modified,
+            last_seen_inode: 1u64,
+            last_seen_mtime_ns: 2i64,
+            watcher_seq: 3u64,
+            reconcile_epoch: 4u64,
+        },
+    ];
+
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+    var empty_inputs: [ManifestLeafInputEntry: 1] = [make_input(&ByteList{ ptr: path[0: 5].ptr, len: 5 as usize }, 9 as byte)];
+    const empty_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(empty_inputs[0: 0]);
+    const dirty_list: LocalChangeList = local_change_list_from_slice(dirty[0: 1]);
+
+    const plan: CheckoutPlan = try checkout_plan_build(
+        &arena,
+        &empty_list,
+        &empty_list,
+        &dirty_list,
+    );
+    try expect(plan.actions.len == 0 as usize);
+    try expect(plan.blocked_paths.len == 1 as usize);
+}
+
+fn test_checkout_plan_builds_write_and_delete_actions() !void {
+    var a_path: [byte: 5] = ['a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var b_path: [byte: 5] = ['b' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var c_path: [byte: 5] = ['c' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var current: [ManifestLeafInputEntry: 2] = [
+        make_input(&ByteList{ ptr: a_path[0: 5].ptr, len: 5 as usize }, 1 as byte),
+        make_input(&ByteList{ ptr: b_path[0: 5].ptr, len: 5 as usize }, 2 as byte),
+    ];
+    var target: [ManifestLeafInputEntry: 2] = [
+        make_input(&ByteList{ ptr: a_path[0: 5].ptr, len: 5 as usize }, 3 as byte),
+        make_input(&ByteList{ ptr: c_path[0: 5].ptr, len: 5 as usize }, 4 as byte),
+    ];
+    var clean: [LocalChange: 2] = [
+        LocalChange{
+            path: ByteList{ ptr: a_path[0: 5].ptr, len: 5 as usize },
+            base_object: current[0].object_id,
+            working_hash: current[0].object_id.hash,
+            status: ChangeStatus.Materialized,
+            last_seen_inode: 0u64,
+            last_seen_mtime_ns: 0i64,
+            watcher_seq: 0u64,
+            reconcile_epoch: 0u64,
+        },
+        LocalChange{
+            path: ByteList{ ptr: b_path[0: 5].ptr, len: 5 as usize },
+            base_object: current[1].object_id,
+            working_hash: current[1].object_id.hash,
+            status: ChangeStatus.Materialized,
+            last_seen_inode: 0u64,
+            last_seen_mtime_ns: 0i64,
+            watcher_seq: 0u64,
+            reconcile_epoch: 0u64,
+        },
+    ];
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+    const current_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(current[0: 2]);
+    const target_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(target[0: 2]);
+    const clean_list: LocalChangeList = local_change_list_from_slice(clean[0: 2]);
+    const plan: CheckoutPlan = try checkout_plan_build(
+        &arena,
+        &current_list,
+        &target_list,
+        &clean_list,
+    );
+
+    try expect(plan.blocked_paths.len == 0 as usize);
+    try expect(plan.actions.len == 3 as usize);
+    try expect(plan.actions.ptr[0].kind == CheckoutActionKind.WriteFile);
+    try expect(plan.actions.ptr[1].kind == CheckoutActionKind.DeleteFile);
+    try expect(plan.actions.ptr[2].kind == CheckoutActionKind.WriteFile);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Checkout Plan Tests");
+    run_test("checkout plan blocks dirty paths", test_checkout_plan_blocks_dirty_paths);
+    run_test("checkout plan builds write and delete actions", test_checkout_plan_builds_write_and_delete_actions);
+    return test_suite_end();
+}

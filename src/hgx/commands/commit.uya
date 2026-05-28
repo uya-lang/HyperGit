@@ -25,6 +25,12 @@ use core.ids.commit_id_compare;
 use core.ids.manifest_id_from_object;
 use core.ids.object_id_from_hash;
 use core.ids.policy_id_from_object;
+use index.commit_graph.CommitGraphEntryList;
+use index.commit_graph.CommitGraphPathList;
+use index.commit_graph.commit_graph_changed_path_bloom_build;
+use index.commit_graph.commit_graph_file_write;
+use index.commit_graph.commit_graph_load_incremental;
+use index.commit_graph.commit_graph_path_list_from_slice;
 use manifest.load.manifest_load_flatten;
 use manifest.root.manifest_root_build_and_store;
 use manifest.trie.ManifestLeafInputEntry;
@@ -47,7 +53,10 @@ use store.head_ref.repo_write_head_commit;
 use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
 use store.object_store.ObjectBytes;
+use store.repo_layout.HGIT_INDEXES_COMMIT_GRAPH_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
+use store.repo_layout.HGIT_WORKSPACE_STATE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
 use store.repo_layout.RepoConfig;
 use store.repo_layout.RepoPath;
@@ -55,6 +64,14 @@ use store.repo_layout.repo_find_root_from_cwd;
 use store.repo_layout.repo_path_cstr;
 use store.repo_layout.repo_path_join_literal;
 use store.repo_layout.repo_read_config;
+use workspace.local_change_file.local_change_file_write;
+use workspace.reconcile.workspace_reconcile_scan;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_dirty_count;
+use workspace.state.local_change_materialized_count;
+use workspace.state.WorkspaceState;
+use workspace.state.workspace_state_with_counts;
+use workspace.state_file.workspace_state_file_write;
 use workspace.stage.StageEntry;
 use workspace.stage.StageEntryList;
 use workspace.stage.StageSnapshot;
@@ -103,12 +120,12 @@ fn commit_zero_manifest_id() ManifestId {
     return manifest_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
 }
 
-fn commit_empty_bloom() BloomFilter {
-    return BloomFilter{ bytes: ByteList{ ptr: null, len: 0 } };
-}
-
 fn commit_empty_module_bitmap() ModuleBitmap {
     return ModuleBitmap{ bytes: ByteList{ ptr: null, len: 0 } };
+}
+
+fn commit_repo_root_bytes(root: &RepoPath) ByteList {
+    return ByteList{ ptr: &root.bytes[0], len: root.len };
 }
 
 fn commit_clone_byte_list(value: &ByteList) ByteList {
@@ -233,10 +250,58 @@ fn commit_manifest_inputs_from_stage(arena: &Arena, store: &LooseObjectStore, sn
     return manifest_leaf_input_list_from_slice(raw_inputs[0: out_index]);
 }
 
+fn commit_changed_paths_from_stage(arena: &Arena, snapshot: &StageSnapshot) !CommitGraphPathList {
+    if snapshot.entries.len == 0 {
+        return CommitGraphPathList{ ptr: null, len: 0 };
+    }
+
+    const raw_paths: &ByteList = arena_alloc(arena, @size_of(ByteList) as usize * snapshot.entries.len) as &ByteList;
+    if raw_paths == null {
+        return error.CommitAlloc;
+    }
+
+    var i: usize = 0;
+    while i < snapshot.entries.len {
+        raw_paths[i] = ByteList{
+            ptr: snapshot.entries.ptr[i].path.ptr,
+            len: snapshot.entries.ptr[i].path.len,
+        };
+        i = i + 1 as usize;
+    }
+    return commit_graph_path_list_from_slice(raw_paths[0: snapshot.entries.len]);
+}
+
 fn commit_write_empty_stage(stage_path: &RepoPath, base_commit: CommitId, timestamp_ms: i64) !void {
     const state: StageState = stage_state_with_entry_count(base_commit, 0u64, timestamp_ms);
     const snapshot: StageSnapshot = stage_snapshot_init(state, StageEntryList{ ptr: null, len: 0 });
     return stage_file_write(repo_path_cstr(stage_path) as &const byte, &snapshot);
+}
+
+fn commit_sync_workspace_state(
+    arena: &Arena,
+    root: &RepoPath,
+    commit_id: &CommitId,
+    manifest_inputs: &ManifestLeafInputList,
+) !void {
+    const local_changes: LocalChangeList = try workspace_reconcile_scan(
+        arena,
+        repo_path_cstr(root) as &const byte,
+        manifest_inputs,
+        0u64,
+        1u64,
+    );
+    const state: WorkspaceState = workspace_state_with_counts(
+        commit_repo_root_bytes(root),
+        commit_id[0],
+        local_change_materialized_count(&local_changes),
+        local_change_dirty_count(&local_changes),
+        0u64,
+    );
+    const state_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STATE_REL);
+    try workspace_state_file_write(repo_path_cstr(&state_path) as &const byte, &state);
+
+    const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
+    try local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &local_changes);
 }
 
 fn commit_parent_payload(arena: &Arena, store: &LooseObjectStore, parent: &CommitId) !CommitPayload {
@@ -427,7 +492,11 @@ export fn run_commit() i32 {
         };
     }
 
-    const manifest_root: ManifestId = manifest_root_build_and_store(&arena, &store, manifest_inputs) catch |err| {
+    const manifest_root: ManifestId = manifest_root_build_and_store(
+        &arena,
+        &store,
+        ManifestLeafInputList{ ptr: manifest_inputs.ptr, len: manifest_inputs.len },
+    ) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
             fprintf(stderr, "%s" as *byte, COMMIT_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;
@@ -460,6 +529,14 @@ export fn run_commit() i32 {
         parents = one_parent[0: 1];
         generation = parent_generation + 1u64;
     }
+    const changed_paths: CommitGraphPathList = commit_changed_paths_from_stage(&arena, &snapshot) catch {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const changed_path_bloom: BloomFilter = commit_graph_changed_path_bloom_build(&arena, changed_paths) catch {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
     const payload: CommitPayload = CommitPayload{
         parents: commit_id_list_from_slice(parents),
         author: author,
@@ -467,13 +544,42 @@ export fn run_commit() i32 {
         message: message,
         timestamp_ms: timestamp_ms as i64,
         manifest_root: manifest_root,
-        changed_path_bloom: commit_empty_bloom(),
+        changed_path_bloom: changed_path_bloom,
         module_bitmap: commit_empty_module_bitmap(),
         generation: generation,
     };
 
     const commit_id: CommitId = commit_object_build_and_store(&arena, &store, &payload) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            fprintf(stderr, "%s" as *byte, COMMIT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const graph_path: RepoPath = repo_path_join_literal(&root, HGIT_INDEXES_COMMIT_GRAPH_REL) catch {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    var graph_heads: [CommitId: 1] = [commit_id];
+    const graph_entries: CommitGraphEntryList = commit_graph_load_incremental(
+        &arena,
+        repo_path_cstr(&graph_path) as &const byte,
+        &store,
+        commit_id_list_from_slice(graph_heads[0: 1]),
+    ) catch {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    commit_graph_file_write(repo_path_cstr(&graph_path) as &const byte, &graph_entries) catch {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    commit_sync_workspace_state(&arena, &root, &commit_id, &manifest_inputs) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) ||
+            @error_id(err) == @error_id(error.StorePermissionDenied) {
             fprintf(stderr, "%s" as *byte, COMMIT_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;
         }

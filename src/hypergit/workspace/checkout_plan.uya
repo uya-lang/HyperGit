@@ -1,0 +1,143 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.ids.ObjectId;
+use manifest.flat_diff.ManifestFlatDiffEntry;
+use manifest.flat_diff.ManifestFlatDiffEntryKind;
+use manifest.flat_diff.ManifestFlatDiffEntryList;
+use manifest.flat_diff.manifest_flat_diff;
+use manifest.query.ManifestPathspecList;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use object.types.ByteList;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_is_dirty;
+
+error CheckoutPlanAlloc;
+
+export enum CheckoutActionKind {
+    WriteFile,
+    DeleteFile
+}
+
+export struct CheckoutAction {
+    kind: CheckoutActionKind,
+    path: ByteList,
+    object_id: ObjectId,
+    file_mode: u32
+}
+
+export struct CheckoutActionList {
+    ptr: &CheckoutAction,
+    len: usize
+}
+
+export struct CheckoutPathList {
+    ptr: &ByteList,
+    len: usize
+}
+
+export struct CheckoutPlan {
+    actions: CheckoutActionList,
+    blocked_paths: CheckoutPathList
+}
+
+fn checkout_empty_pathspecs() ManifestPathspecList {
+    return ManifestPathspecList{ ptr: null, len: 0 };
+}
+
+fn checkout_blocked_paths(arena: &Arena, local_changes: &LocalChangeList) !CheckoutPathList {
+    var dirty_count: usize = 0;
+    var i: usize = 0;
+    while i < local_changes.len {
+        if local_change_is_dirty(&local_changes.ptr[i]) {
+            dirty_count = dirty_count + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    if dirty_count == 0 {
+        return CheckoutPathList{ ptr: null, len: 0 };
+    }
+
+    const raw_paths: &ByteList = arena_alloc(arena, @size_of(ByteList) as usize * dirty_count) as &ByteList;
+    if raw_paths == null {
+        return error.CheckoutPlanAlloc;
+    }
+
+    var out_index: usize = 0;
+    i = 0;
+    while i < local_changes.len {
+        if local_change_is_dirty(&local_changes.ptr[i]) {
+            raw_paths[out_index] = ByteList{
+                ptr: local_changes.ptr[i].path.ptr,
+                len: local_changes.ptr[i].path.len,
+            };
+            out_index = out_index + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return CheckoutPathList{ ptr: raw_paths, len: dirty_count };
+}
+
+export fn checkout_plan_build(
+    arena: &Arena,
+    current_inputs: &ManifestLeafInputList,
+    target_inputs: &ManifestLeafInputList,
+    local_changes: &LocalChangeList,
+) !CheckoutPlan {
+    const blocked_paths: CheckoutPathList = try checkout_blocked_paths(arena, local_changes);
+    if blocked_paths.len > 0 {
+        return CheckoutPlan{
+            actions: CheckoutActionList{ ptr: null, len: 0 },
+            blocked_paths: blocked_paths,
+        };
+    }
+
+    const raw_diff: ManifestFlatDiffEntryList = try manifest_flat_diff(
+        arena,
+        current_inputs,
+        target_inputs,
+        checkout_empty_pathspecs(),
+    );
+    if raw_diff.len == 0 {
+        return CheckoutPlan{
+            actions: CheckoutActionList{ ptr: null, len: 0 },
+            blocked_paths: CheckoutPathList{ ptr: null, len: 0 },
+        };
+    }
+
+    const raw_actions: &CheckoutAction = arena_alloc(arena, @size_of(CheckoutAction) as usize * raw_diff.len) as &CheckoutAction;
+    if raw_actions == null {
+        return error.CheckoutPlanAlloc;
+    }
+
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while i < raw_diff.len {
+        const diff_entry: &ManifestFlatDiffEntry = &raw_diff.ptr[i];
+        if diff_entry.kind == ManifestFlatDiffEntryKind.Removed {
+            const base_entry: &ManifestLeafInputEntry = &current_inputs.ptr[diff_entry.left_index];
+            raw_actions[out_len] = CheckoutAction{
+                kind: CheckoutActionKind.DeleteFile,
+                path: ByteList{ ptr: base_entry.path.ptr, len: base_entry.path.len },
+                object_id: base_entry.object_id,
+                file_mode: base_entry.mode,
+            };
+        } else {
+            const target_entry: &ManifestLeafInputEntry = &target_inputs.ptr[diff_entry.right_index];
+            raw_actions[out_len] = CheckoutAction{
+                kind: CheckoutActionKind.WriteFile,
+                path: ByteList{ ptr: target_entry.path.ptr, len: target_entry.path.len },
+                object_id: target_entry.object_id,
+                file_mode: target_entry.mode,
+            };
+        }
+        out_len = out_len + 1 as usize;
+        i = i + 1 as usize;
+    }
+
+    return CheckoutPlan{
+        actions: CheckoutActionList{ ptr: raw_actions, len: out_len },
+        blocked_paths: CheckoutPathList{ ptr: null, len: 0 },
+    };
+}

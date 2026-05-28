@@ -1,0 +1,331 @@
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.fwrite;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.json.encoder.json_expect_i64;
+use std.json.encoder.json_expect_str;
+use std.json.encoder.json_object_find_index;
+use std.json.parser.parse;
+use std.json.value.JsonObject;
+use std.json.value.JsonStrView;
+use std.json.value.JsonValue;
+use std.string.strlen;
+
+use libc.free;
+use libc.fprintf;
+use libc.malloc;
+use libc.rename;
+use libc.stderr;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.PublishedViewId;
+use core.ids.commit_id_decode_hex;
+use core.ids.commit_id_encode_hex;
+use core.ids.hash32_decode_hex;
+use core.ids.hash32_encode_hex;
+use core.ids.published_view_id_decode_hex;
+use core.ids.published_view_id_encode_hex;
+use object.types.ByteList;
+use workspace.state.WorkspaceState;
+use workspace.state.workspace_state_init;
+use workspace.state.workspace_state_zero_commit;
+use workspace.state.workspace_state_zero_view_id;
+
+const WORKSPACE_STATE_BYTES_MAX: usize = 16384 as usize;
+const WORKSPACE_STATE_PATH_MAX: usize = 4096 as usize;
+
+error WorkspaceStateFileAlloc;
+error WorkspaceStateFileOpenFailed;
+error WorkspaceStateFileReadFailed;
+error WorkspaceStateFileWriteFailed;
+error WorkspaceStateFileInvalid;
+error WorkspaceStateFileNotFound;
+error WorkspaceStatePathTooLong;
+
+struct WorkspaceStatePath {
+    bytes: [byte: 4096] = [],
+    len: usize = 0
+}
+
+fn workspace_state_path_from_cstr(text: &const byte) !WorkspaceStatePath {
+    if text == null {
+        return error.WorkspaceStatePathTooLong;
+    }
+    const len: usize = strlen(text);
+    if len >= WORKSPACE_STATE_PATH_MAX {
+        return error.WorkspaceStatePathTooLong;
+    }
+    var out: WorkspaceStatePath = WorkspaceStatePath{ bytes: [], len: len };
+    var i: usize = 0;
+    while i < len {
+        out.bytes[i] = text[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[len] = 0 as byte;
+    return out;
+}
+
+fn workspace_state_temp_path(path: &WorkspaceStatePath) !WorkspaceStatePath {
+    const suffix: &const byte = ".tmp";
+    const suffix_len: usize = 4 as usize;
+    if path.len + suffix_len >= WORKSPACE_STATE_PATH_MAX {
+        return error.WorkspaceStatePathTooLong;
+    }
+    var out: WorkspaceStatePath = *path;
+    var i: usize = 0;
+    while i < suffix_len {
+        out.bytes[path.len + i] = suffix[i];
+        i = i + 1 as usize;
+    }
+    out.len = path.len + suffix_len;
+    out.bytes[out.len] = 0 as byte;
+    return out;
+}
+
+fn workspace_state_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.WorkspaceStateFileAlloc;
+    }
+    return raw[0: len];
+}
+
+fn workspace_state_copy_root(arena: &Arena, value: JsonStrView) !ByteList {
+    const out: &[byte] = try workspace_state_arena_bytes(arena, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn workspace_state_write_json_prefix(buf: &[byte], offset: &usize, text: &const byte) !void {
+    const len: usize = strlen(text);
+    if *offset + len > buf.len {
+        return error.WorkspaceStateFileWriteFailed;
+    }
+    var i: usize = 0;
+    while i < len {
+        buf.ptr[*offset + i] = text[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + len;
+}
+
+fn workspace_state_encode_root(buf: &[byte], offset: &usize, root: &ByteList) !void {
+    if *offset + root.len > buf.len {
+        return error.WorkspaceStateFileWriteFailed;
+    }
+    var i: usize = 0;
+    while i < root.len {
+        buf.ptr[*offset + i] = root.ptr[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + root.len;
+}
+
+fn workspace_state_encode_u64_decimal(buf: &[byte], offset: &usize, value: u64) !void {
+    var digits: [byte: 32] = [];
+    var count: usize = 0;
+    var temp: u64 = value;
+    if temp == 0u64 {
+        digits[0] = '0' as byte;
+        count = 1 as usize;
+    } else {
+        while temp > 0u64 {
+            digits[count] = ('0' as byte) + (temp % 10u64) as byte;
+            temp = temp / 10u64;
+            count = count + 1 as usize;
+        }
+    }
+    if *offset + count > buf.len {
+        return error.WorkspaceStateFileWriteFailed;
+    }
+    while count > 0 {
+        count = count - 1 as usize;
+        buf.ptr[*offset] = digits[count];
+        *offset = *offset + 1 as usize;
+    }
+}
+
+fn workspace_state_find_literal(input: &[byte], literal: &const byte) !usize {
+    const literal_len: usize = strlen(literal);
+    if literal_len == 0 {
+        return 0 as usize;
+    }
+    var i: usize = 0;
+    while i + literal_len <= input.len {
+        var matched: bool = true;
+        var j: usize = 0;
+        while j < literal_len {
+            if input.ptr[i + j] != literal[j] {
+                matched = false;
+                break;
+            }
+            j = j + 1 as usize;
+        }
+        if matched {
+            return i + literal_len;
+        }
+        i = i + 1 as usize;
+    }
+    return error.WorkspaceStateFileInvalid;
+}
+
+fn workspace_state_parse_string_value(input: &[byte], key: &const byte) !ByteList {
+    const start: usize = try workspace_state_find_literal(input, key);
+    var end: usize = start;
+    while end < input.len {
+        if input.ptr[end] == '"' as byte {
+            return ByteList{ ptr: &input.ptr[start], len: end - start };
+        }
+        end = end + 1 as usize;
+    }
+    return error.WorkspaceStateFileInvalid;
+}
+
+fn workspace_state_parse_u64_value(input: &[byte], key: &const byte) !u64 {
+    const start: usize = try workspace_state_find_literal(input, key);
+    var end: usize = start;
+    while end < input.len {
+        const value: byte = input.ptr[end];
+        if value < 48 as byte || value > 57 as byte {
+            break;
+        }
+        end = end + 1 as usize;
+    }
+    if end == start {
+        return error.WorkspaceStateFileInvalid;
+    }
+
+    var parsed: u64 = 0u64;
+    var i: usize = start;
+    while i < end {
+        parsed = (parsed * 10u64) + (input.ptr[i] - (48 as byte)) as u64;
+        i = i + 1 as usize;
+    }
+    return parsed;
+}
+
+export fn workspace_state_file_write(path: &const byte, state: &WorkspaceState) !void {
+    const final_path: WorkspaceStatePath = try workspace_state_path_from_cstr(path);
+    const temp_path: WorkspaceStatePath = try workspace_state_temp_path(&final_path);
+    const stream: &FILE = fopen(&temp_path.bytes[0] as &const byte, "w");
+    if stream == null {
+        return error.WorkspaceStateFileOpenFailed;
+    }
+
+    const payload: &byte = malloc(WORKSPACE_STATE_BYTES_MAX) as &byte;
+    if payload == null {
+        _ = fclose(stream);
+        return error.WorkspaceStateFileAlloc;
+    }
+    defer {
+        free(payload as &void);
+    }
+    const output: &[byte] = payload[0: WORKSPACE_STATE_BYTES_MAX];
+    var offset: usize = 0;
+
+    var base_hex: [byte: HASH32_HEX_BYTES] = [];
+    _ = try commit_id_encode_hex(&state.base_commit, base_hex[0: HASH32_HEX_BYTES]);
+    var view_hex: [byte: HASH32_HEX_BYTES] = [];
+    _ = try published_view_id_encode_hex(&state.view_id, view_hex[0: HASH32_HEX_BYTES]);
+    var sparse_hex: [byte: HASH32_HEX_BYTES] = [];
+    _ = try hash32_encode_hex(&state.sparse_profile_id, sparse_hex[0: HASH32_HEX_BYTES]);
+
+    try workspace_state_write_json_prefix(output, &offset, "{\"repo_root\":\"");
+    try workspace_state_encode_root(output, &offset, &state.repo_root);
+    try workspace_state_write_json_prefix(output, &offset, "\",\"base_commit\":\"");
+    try workspace_state_encode_root(output, &offset, &ByteList{ ptr: base_hex[0: HASH32_HEX_BYTES].ptr, len: HASH32_HEX_BYTES });
+    try workspace_state_write_json_prefix(output, &offset, "\",\"view_id\":\"");
+    try workspace_state_encode_root(output, &offset, &ByteList{ ptr: view_hex[0: HASH32_HEX_BYTES].ptr, len: HASH32_HEX_BYTES });
+    try workspace_state_write_json_prefix(output, &offset, "\",\"sparse_profile_id\":\"");
+    try workspace_state_encode_root(output, &offset, &ByteList{ ptr: sparse_hex[0: HASH32_HEX_BYTES].ptr, len: HASH32_HEX_BYTES });
+    try workspace_state_write_json_prefix(output, &offset, "\",\"materialized_count\":");
+    try workspace_state_encode_u64_decimal(output, &offset, state.materialized_count);
+    try workspace_state_write_json_prefix(output, &offset, ",\"dirty_count\":");
+    try workspace_state_encode_u64_decimal(output, &offset, state.dirty_count);
+    try workspace_state_write_json_prefix(output, &offset, ",\"watcher_seq\":");
+    try workspace_state_encode_u64_decimal(output, &offset, state.watcher_seq);
+    try workspace_state_write_json_prefix(output, &offset, "}\n");
+
+    if fwrite(payload as &const byte, 1 as usize, offset, stream) != offset {
+        _ = fclose(stream);
+        return error.WorkspaceStateFileWriteFailed;
+    }
+    if fclose(stream) != 0 {
+        return error.WorkspaceStateFileWriteFailed;
+    }
+    if rename(&temp_path.bytes[0] as &const byte, &final_path.bytes[0] as &const byte) != 0 {
+        return error.WorkspaceStateFileWriteFailed;
+    }
+}
+
+export fn workspace_state_file_read(arena: &Arena, path: &const byte) !WorkspaceState {
+    if path == null {
+        return error.WorkspaceStateFileNotFound;
+    }
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return error.WorkspaceStateFileNotFound;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    const raw_input: &[byte] = try workspace_state_arena_bytes(arena, WORKSPACE_STATE_BYTES_MAX);
+    const count: usize = fread(raw_input.ptr, 1 as usize, WORKSPACE_STATE_BYTES_MAX - 1 as usize, stream);
+    if count == 0 {
+        return error.WorkspaceStateFileReadFailed;
+    }
+    raw_input.ptr[count] = 0 as byte;
+
+    const input: &[byte] = raw_input.ptr[0: count];
+    const root: ByteList = try workspace_state_parse_string_value(input, "\"repo_root\":\"");
+    const base_hex: ByteList = try workspace_state_parse_string_value(input, "\"base_commit\":\"");
+    const view_hex: ByteList = try workspace_state_parse_string_value(input, "\"view_id\":\"");
+    const sparse_hex: ByteList = try workspace_state_parse_string_value(input, "\"sparse_profile_id\":\"");
+    const materialized_count: u64 = try workspace_state_parse_u64_value(input, "\"materialized_count\":");
+    const dirty_count: u64 = try workspace_state_parse_u64_value(input, "\"dirty_count\":");
+    const watcher_seq: u64 = try workspace_state_parse_u64_value(input, "\"watcher_seq\":");
+    fprintf(stderr, "state-parse root=%zu base=%zu view=%zu sparse=%zu mat=%llu dirty=%llu watcher=%llu\n" as *byte, root.len, base_hex.len, view_hex.len, sparse_hex.len, materialized_count, dirty_count, watcher_seq);
+
+    if base_hex.len != HASH32_HEX_BYTES || view_hex.len != HASH32_HEX_BYTES || sparse_hex.len != HASH32_HEX_BYTES {
+        return error.WorkspaceStateFileInvalid;
+    }
+
+    var state: WorkspaceState = workspace_state_init(try workspace_state_copy_root(arena, JsonStrView{ ptr: root.ptr, len: root.len }), workspace_state_zero_commit());
+    state.base_commit = try commit_id_decode_hex(base_hex.ptr[0: HASH32_HEX_BYTES]);
+    state.view_id = try published_view_id_decode_hex(view_hex.ptr[0: HASH32_HEX_BYTES]);
+    state.sparse_profile_id = try hash32_decode_hex(sparse_hex.ptr[0: HASH32_HEX_BYTES]);
+    state.materialized_count = materialized_count;
+    state.dirty_count = dirty_count;
+    state.watcher_seq = watcher_seq;
+    return state;
+}
+
+export fn workspace_state_file_default(arena: &Arena, repo_root: ByteList) !WorkspaceState {
+    _ = arena;
+    return workspace_state_init(repo_root, workspace_state_zero_commit());
+}
+
+export fn workspace_state_zero_state() WorkspaceState {
+    return WorkspaceState{
+        repo_root: ByteList{ ptr: null, len: 0 },
+        base_commit: workspace_state_zero_commit(),
+        view_id: workspace_state_zero_view_id(),
+        sparse_profile_id: Hash32{ bytes: [] },
+        materialized_count: 0u64,
+        dirty_count: 0u64,
+        watcher_seq: 0u64,
+    };
+}

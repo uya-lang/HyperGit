@@ -1,18 +1,57 @@
 use libc.stdout;
 use libc.stderr;
 use libc.fprintf;
+use libc.stat;
+use libc.Stat;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
 
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
+use object.types.ByteList;
 use store.repo_layout.RepoInitResult;
+use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
+use store.repo_layout.HGIT_WORKSPACE_STATE_REL;
+use store.repo_layout.RepoPath;
 use store.repo_layout.repo_init_current_dir;
+use store.repo_layout.repo_path_join_literal;
 use store.repo_layout.repo_path_cstr;
+use workspace.local_change_file.local_change_file_read;
+use workspace.local_change_file.local_change_file_write;
+use workspace.state.LocalChangeList;
+use workspace.state.WorkspaceState;
+use workspace.state.workspace_state_init;
+use workspace.state.workspace_state_zero_commit;
+use workspace.state_file.workspace_state_file_read;
+use workspace.state_file.workspace_state_file_write;
 
 export const INIT_CREATED_TEXT: &const byte = "initialized HyperGit repository in %s/.hgit\n";
 export const INIT_REINITIALIZED_TEXT: &const byte = "reinitialized HyperGit repository in %s/.hgit\n";
 export const INIT_NON_EMPTY_TEXT: &const byte = "error: refusing to initialize in a non-empty directory\n";
 export const INIT_PERMISSION_TEXT: &const byte = "error: permission denied while initializing repository\n";
 export const INIT_FAILURE_TEXT: &const byte = "error: failed to initialize repository\n";
+
+fn init_repo_root_bytes(root: &RepoPath) ByteList {
+    return ByteList{ ptr: &root.bytes[0], len: root.len };
+}
+
+fn init_ensure_workspace_state(root: &RepoPath) !void {
+    const state_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STATE_REL);
+    var st: Stat = Stat{};
+    if stat(repo_path_cstr(&state_path) as &const byte, &st) != 0 {
+        const state: WorkspaceState = workspace_state_init(init_repo_root_bytes(root), workspace_state_zero_commit());
+        try workspace_state_file_write(repo_path_cstr(&state_path) as &const byte, &state);
+    }
+}
+
+fn init_ensure_local_change_file(root: &RepoPath) !void {
+    const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
+    var st: Stat = Stat{};
+    if stat(repo_path_cstr(&local_change_path) as &const byte, &st) != 0 {
+        const empty: LocalChangeList = LocalChangeList{ ptr: null, len: 0 };
+        try local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &empty);
+    }
+}
 
 export fn run_init() i32 {
     const result: RepoInitResult = repo_init_current_dir() catch |err| {
@@ -24,6 +63,15 @@ export fn run_init() i32 {
             fprintf(stderr, "%s" as *byte, INIT_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;
         }
+        fprintf(stderr, "%s" as *byte, INIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    init_ensure_workspace_state(&result.repo_root) catch {
+        fprintf(stderr, "%s" as *byte, INIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    init_ensure_local_change_file(&result.repo_root) catch {
         fprintf(stderr, "%s" as *byte, INIT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };

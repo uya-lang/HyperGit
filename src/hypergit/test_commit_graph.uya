@@ -1,0 +1,279 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.system;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.commit_id_compare;
+use core.ids.commit_id_from_object;
+use core.ids.manifest_id_from_object;
+use core.ids.object_id_from_hash;
+use index.commit_graph.CommitGraphEntry;
+use index.commit_graph.CommitGraphEntryList;
+use index.commit_graph.commit_graph_changed_path_bloom_build;
+use index.commit_graph.commit_graph_changed_path_bloom_may_contain;
+use index.commit_graph.commit_graph_file_read;
+use index.commit_graph.commit_graph_file_write;
+use index.commit_graph.commit_graph_find_entry_index;
+use index.commit_graph.commit_graph_generation_from_parents;
+use index.commit_graph.commit_graph_load_incremental;
+use index.commit_graph.commit_graph_merge_base;
+use index.commit_graph.commit_graph_parent_lookup;
+use index.commit_graph.commit_graph_path_list_from_slice;
+use index.commit_graph.commit_graph_read_entry;
+use index.commit_graph.commit_graph_ref_head_frontier;
+use object.commit_build.commit_object_build_and_store;
+use object.types.BloomFilter;
+use object.types.ByteList;
+use object.types.CommitIdList;
+use object.types.CommitPayload;
+use object.types.Identity;
+use object.types.ModuleBitmap;
+use object.types.commit_id_list_from_slice;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+
+error TestAlloc;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_manifest_id(seed: byte) ManifestId {
+    return manifest_id_from_object(object_id_from_hash(make_hash(seed)));
+}
+
+fn copy_text(arena: &Arena, text: &const byte) !ByteList {
+    const len: usize = strlen(text);
+    if len == 0 {
+        return ByteList{ ptr: null, len: 0 };
+    }
+
+    const raw: &byte = arena_alloc(arena, len);
+    if raw == null {
+        return error.TestAlloc;
+    }
+    const out: &[byte] = raw[0: len];
+    var i: usize = 0;
+    while i < len {
+        out.ptr[i] = text[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn make_identity(arena: &Arena) !Identity {
+    const name: ByteList = try copy_text(arena, "alice");
+    const email: ByteList = try copy_text(arena, "alice@example.com");
+    return Identity{
+        name: ByteList{ ptr: name.ptr, len: name.len },
+        email: ByteList{ ptr: email.ptr, len: email.len },
+    };
+}
+
+fn empty_module_bitmap() ModuleBitmap {
+    return ModuleBitmap{ bytes: ByteList{ ptr: null, len: 0 } };
+}
+
+fn store_commit(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    parents: &[CommitId],
+    generation: u64,
+    timestamp_ms: i64,
+    message_text: &const byte,
+    changed_path_text: &const byte,
+    seed: byte,
+) !CommitId {
+    const author: Identity = try make_identity(arena);
+    const committer: Identity = Identity{
+        name: ByteList{ ptr: author.name.ptr, len: author.name.len },
+        email: ByteList{ ptr: author.email.ptr, len: author.email.len },
+    };
+    const message: ByteList = try copy_text(arena, message_text);
+    const changed_path: ByteList = try copy_text(arena, changed_path_text);
+    var changed_paths: [ByteList: 1] = [changed_path];
+    const bloom: BloomFilter = try commit_graph_changed_path_bloom_build(
+        arena,
+        commit_graph_path_list_from_slice(changed_paths[0: 1]),
+    );
+
+    const payload: CommitPayload = CommitPayload{
+        parents: commit_id_list_from_slice(parents),
+        author: author,
+        committer: committer,
+        message: message,
+        timestamp_ms: timestamp_ms,
+        manifest_root: make_manifest_id(seed),
+        changed_path_bloom: bloom,
+        module_bitmap: empty_module_bitmap(),
+        generation: generation,
+    };
+    return try commit_object_build_and_store(arena, store, &payload);
+}
+
+fn expect_bloom_matches_path(arena: &Arena, filter: &BloomFilter, path_text: &const byte) !void {
+    const path: ByteList = try copy_text(arena, path_text);
+    try expect(commit_graph_changed_path_bloom_may_contain(filter, &path));
+}
+
+fn test_commit_graph_linear_history() !void {
+    try expect(system("rm -rf build/commit-graph-linear && mkdir -p build/commit-graph-linear/objects/loose") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/commit-graph-linear/objects/loose");
+    var arena_buf: [byte: 262144] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 262144 as usize);
+
+    var empty_parents: [CommitId: 1] = [commit_id_from_object(object_id_from_hash(make_hash(0 as byte)))];
+    const root: CommitId = try store_commit(&arena, &store, empty_parents[0: 0], 1u64, 1000i64, "root", "README.md", 10 as byte);
+    var root_parents: [CommitId: 1] = [root];
+    const second: CommitId = try store_commit(&arena, &store, root_parents[0: 1], 2u64, 2000i64, "second", "src/main.uya", 20 as byte);
+    var second_parents: [CommitId: 1] = [second];
+    const third: CommitId = try store_commit(&arena, &store, second_parents[0: 1], 3u64, 3000i64, "third", "src/lib.uya", 30 as byte);
+
+    const second_entry: CommitGraphEntry = try commit_graph_read_entry(&arena, &store, &second);
+    try expect(second_entry.timestamp_ms == 2000i64);
+    try expect(second_entry.generation == 2u64);
+    try expect(second_entry.parents.len == 1 as usize);
+    try expect(commit_id_compare(&second_entry.parents.ptr[0], &root) == 0);
+    try expect_bloom_matches_path(&arena, &second_entry.changed_path_bloom, "src/main.uya");
+
+    var heads: [CommitId: 1] = [third];
+    const graph: CommitGraphEntryList = try commit_graph_load_incremental(
+        &arena,
+        "build/commit-graph-linear/commit-graph.hgi",
+        &store,
+        commit_id_list_from_slice(heads[0: 1]),
+    );
+    try expect(graph.len == 3 as usize);
+
+    const third_index: usize = try commit_graph_find_entry_index(&graph, &third);
+    try expect(try commit_graph_generation_from_parents(&graph, graph.ptr[third_index].parents) == 3u64);
+
+    const parent_entries: CommitGraphEntryList = try commit_graph_parent_lookup(&arena, &graph, &third);
+    try expect(parent_entries.len == 1 as usize);
+    try expect(commit_id_compare(&parent_entries.ptr[0].commit_id, &second) == 0);
+
+    try commit_graph_file_write("build/commit-graph-linear/commit-graph.hgi", &graph);
+
+    var read_buf: [byte: 262144] = [];
+    var read_arena: Arena = Arena{ buffer: &read_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_buf[0], 262144 as usize);
+    const reloaded: CommitGraphEntryList = try commit_graph_file_read("build/commit-graph-linear/commit-graph.hgi", &read_arena);
+    try expect(reloaded.len == 3 as usize);
+
+    var frontier_heads: [CommitId: 3] = [third, second, root];
+    const frontier: CommitIdList = try commit_graph_ref_head_frontier(
+        &read_arena,
+        &reloaded,
+        commit_id_list_from_slice(frontier_heads[0: 3]),
+    );
+    try expect(frontier.len == 1 as usize);
+    try expect(commit_id_compare(&frontier.ptr[0], &third) == 0);
+}
+
+fn test_commit_graph_branching_history() !void {
+    try expect(system("rm -rf build/commit-graph-branch && mkdir -p build/commit-graph-branch/objects/loose") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/commit-graph-branch/objects/loose");
+    var arena_buf: [byte: 262144] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 262144 as usize);
+
+    var empty_parents: [CommitId: 1] = [commit_id_from_object(object_id_from_hash(make_hash(1 as byte)))];
+    const root: CommitId = try store_commit(&arena, &store, empty_parents[0: 0], 1u64, 1000i64, "root", "README.md", 40 as byte);
+    var root_parents: [CommitId: 1] = [root];
+    const left: CommitId = try store_commit(&arena, &store, root_parents[0: 1], 2u64, 2000i64, "left", "src/left.uya", 41 as byte);
+    const right: CommitId = try store_commit(&arena, &store, root_parents[0: 1], 2u64, 2100i64, "right", "src/right.uya", 42 as byte);
+
+    var first_heads: [CommitId: 1] = [left];
+    const first_graph: CommitGraphEntryList = try commit_graph_load_incremental(
+        &arena,
+        "build/commit-graph-branch/commit-graph.hgi",
+        &store,
+        commit_id_list_from_slice(first_heads[0: 1]),
+    );
+    try commit_graph_file_write("build/commit-graph-branch/commit-graph.hgi", &first_graph);
+
+    var second_heads: [CommitId: 3] = [left, right, left];
+    const second_graph: CommitGraphEntryList = try commit_graph_load_incremental(
+        &arena,
+        "build/commit-graph-branch/commit-graph.hgi",
+        &store,
+        commit_id_list_from_slice(second_heads[0: 3]),
+    );
+    try expect(second_graph.len == 3 as usize);
+
+    var frontier_heads: [CommitId: 3] = [root, left, right];
+    const frontier: CommitIdList = try commit_graph_ref_head_frontier(
+        &arena,
+        &second_graph,
+        commit_id_list_from_slice(frontier_heads[0: 3]),
+    );
+    try expect(frontier.len == 2 as usize);
+    try expect(commit_id_compare(&frontier.ptr[0], &left) == 0);
+    try expect(commit_id_compare(&frontier.ptr[1], &right) == 0);
+
+    const base: CommitId = try commit_graph_merge_base(&arena, &second_graph, &left, &right);
+    try expect(commit_id_compare(&base, &root) == 0);
+}
+
+fn test_commit_graph_multi_parent_merge_commit() !void {
+    try expect(system("rm -rf build/commit-graph-merge && mkdir -p build/commit-graph-merge/objects/loose") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/commit-graph-merge/objects/loose");
+    var arena_buf: [byte: 262144] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 262144 as usize);
+
+    var empty_parents: [CommitId: 1] = [commit_id_from_object(object_id_from_hash(make_hash(2 as byte)))];
+    const root: CommitId = try store_commit(&arena, &store, empty_parents[0: 0], 1u64, 1000i64, "root", "README.md", 50 as byte);
+    var root_parents: [CommitId: 1] = [root];
+    const left: CommitId = try store_commit(&arena, &store, root_parents[0: 1], 2u64, 2000i64, "left", "src/left.uya", 51 as byte);
+    const right: CommitId = try store_commit(&arena, &store, root_parents[0: 1], 2u64, 2100i64, "right", "src/right.uya", 52 as byte);
+    var merge_parents: [CommitId: 2] = [left, right];
+    const merge: CommitId = try store_commit(&arena, &store, merge_parents[0: 2], 3u64, 3000i64, "merge", "src/merge.uya", 53 as byte);
+
+    var heads: [CommitId: 1] = [merge];
+    const graph: CommitGraphEntryList = try commit_graph_load_incremental(
+        &arena,
+        "build/commit-graph-merge/commit-graph.hgi",
+        &store,
+        commit_id_list_from_slice(heads[0: 1]),
+    );
+    try expect(graph.len == 4 as usize);
+
+    const parent_entries: CommitGraphEntryList = try commit_graph_parent_lookup(&arena, &graph, &merge);
+    try expect(parent_entries.len == 2 as usize);
+    try expect(commit_id_compare(&parent_entries.ptr[0].commit_id, &left) == 0);
+    try expect(commit_id_compare(&parent_entries.ptr[1].commit_id, &right) == 0);
+
+    const direct_base: CommitId = try commit_graph_merge_base(&arena, &graph, &merge, &right);
+    try expect(commit_id_compare(&direct_base, &right) == 0);
+
+    const branch_base: CommitId = try commit_graph_merge_base(&arena, &graph, &left, &right);
+    try expect(commit_id_compare(&branch_base, &root) == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Commit Graph Tests");
+    run_test("linear history", test_commit_graph_linear_history);
+    run_test("branching history", test_commit_graph_branching_history);
+    run_test("multi parent merge commit", test_commit_graph_multi_parent_merge_commit);
+    return test_suite_end();
+}

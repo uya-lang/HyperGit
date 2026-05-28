@@ -167,6 +167,13 @@ fn validate_utf8(input: &[byte]) !void {
     }
 }
 
+export fn manifest_bytes_is_utf8(input: &[byte]) bool {
+    validate_utf8(input) catch {
+        return false;
+    };
+    return true;
+}
+
 fn is_absolute_prefix(input: &[byte]) bool {
     if input.len == 0 {
         return false;
