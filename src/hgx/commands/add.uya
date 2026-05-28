@@ -23,9 +23,19 @@ use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.ObjectId;
 use core.ids.commit_id_compare;
+use core.ids.hash32_compare;
 use core.ids.object_id_compare;
 use core.ids.object_id_from_hash;
 use large.config.large_file_uses_small_blob;
+use large.chunk_store.ChunkStore;
+use large.chunk_store.ChunkStorePutResult;
+use large.chunk_store.chunk_store_open;
+use large.chunk_store.chunk_store_put;
+use large.chunker.LargeChunk;
+use large.prepare.LargePreparedChunkedBlob;
+use large.prepare.large_prepare_recommended_arena_bytes;
+use large.prepare.prepare_chunked_blob_object_id_default;
+use large.prepare.prepare_chunked_blob_repository_default;
 use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_path_compare;
 use manifest.path.manifest_path_normalize;
@@ -34,6 +44,7 @@ use manifest.query.manifest_pathspec_list_from_slice;
 use manifest.query.manifest_pathspec_matches_any;
 use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
+use object.codec.chunked_blob_payload_to_canonical;
 use object.codec.encode_small_blob_payload;
 use object.codec.decode_commit_object;
 use object.codec.small_blob_payload_encoded_len;
@@ -41,11 +52,13 @@ use object.hash.hash_object_payload_bytes;
 use object.small_blob.small_blob_content_hash;
 use object.types.ByteList;
 use object.types.CommitPayload;
+use object.types.FileType;
 use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
 use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
 use store.object_store.ObjectBytes;
+use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
 use store.repo_layout.RepoPath;
@@ -230,15 +243,25 @@ fn add_hash_small_blob_encoded(encoded: &[byte]) !ObjectId {
 }
 
 export fn add_worktree_small_blob_id(root: &RepoPath, path: &ByteList, logical_size: u64) !ObjectId {
-    if !large_file_uses_small_blob(logical_size) {
-        return error.AddLargeFileNotImplemented;
-    }
-
     const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
     const fs_path: AddFsPath = try add_fs_path_join(&root_fs_path, path.ptr[0: path.len]);
     const file_bytes: AddOwnedBytes = try add_read_file_bytes(&fs_path, logical_size as usize);
     defer {
         add_owned_bytes_free(&file_bytes);
+    }
+
+    if !large_file_uses_small_blob(logical_size) {
+        const scratch_len: usize = try large_prepare_recommended_arena_bytes(logical_size);
+        const scratch: &byte = malloc(scratch_len) as &byte;
+        if scratch == null {
+            return error.AddAlloc;
+        }
+        defer {
+            free(scratch as &void);
+        }
+        var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+        arena_init(&arena, scratch, scratch_len);
+        return try prepare_chunked_blob_object_id_default(&arena, add_owned_bytes_slice(&file_bytes), FileType.Binary);
     }
 
     const payload: SmallBlobPayload = SmallBlobPayload{
@@ -402,6 +425,8 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
 
     const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
     const store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
+    const chunk_store_root: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_CHUNKS_REL);
+    const chunk_store: ChunkStore = try chunk_store_open(repo_path_cstr(&chunk_store_root));
     const base_inputs: ManifestLeafInputList = try add_load_base_inputs(&arena, &store, &existing_snapshot.state.base_commit);
 
     var delete_match_count: usize = 0;
@@ -437,29 +462,56 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         if file_entry.kind == WorkspaceFileKind.Symlink {
             return error.AddSymlinkNotImplemented;
         }
-        if !large_file_uses_small_blob(file_entry.logical_size) {
-            return error.AddLargeFileNotImplemented;
-        }
 
         const fs_path: AddFsPath = try add_fs_path_join(&root_fs_path, file_entry.path.ptr[0: file_entry.path.len]);
         const file_bytes: AddOwnedBytes = try add_read_file_bytes(&fs_path, file_entry.logical_size as usize);
         defer {
             add_owned_bytes_free(&file_bytes);
         }
+        var stored_id: ObjectId = add_zero_object_id();
+        if large_file_uses_small_blob(file_entry.logical_size) {
+            const payload: SmallBlobPayload = SmallBlobPayload{
+                logical_size: file_entry.logical_size,
+                content_hash: small_blob_content_hash(add_owned_bytes_slice(&file_bytes)),
+                payload: ByteList{ ptr: file_bytes.raw, len: file_bytes.len },
+            };
+            const encoded: AddOwnedBytes = try add_encode_small_blob_payload(&payload);
+            defer {
+                add_owned_bytes_free(&encoded);
+            }
+            stored_id = store.put(ObjectKind.SmallBlob, add_owned_bytes_slice(&encoded)) catch {
+                return error.AddStoreFailed;
+            };
+        } else {
+            const scratch_len: usize = try large_prepare_recommended_arena_bytes(file_entry.logical_size);
+            const scratch: &byte = malloc(scratch_len) as &byte;
+            if scratch == null {
+                return error.AddAlloc;
+            }
+            defer {
+                free(scratch as &void);
+            }
+            var large_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+            arena_init(&large_arena, scratch, scratch_len);
 
-        const payload: SmallBlobPayload = SmallBlobPayload{
-            logical_size: file_entry.logical_size,
-            content_hash: small_blob_content_hash(add_owned_bytes_slice(&file_bytes)),
-            payload: ByteList{ ptr: file_bytes.raw, len: file_bytes.len },
-        };
-        const encoded: AddOwnedBytes = try add_encode_small_blob_payload(&payload);
-        defer {
-            add_owned_bytes_free(&encoded);
+            const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_default(&large_arena, add_owned_bytes_slice(&file_bytes), FileType.Binary);
+            var part_index: usize = 0 as usize;
+            while part_index < prepared.parts.len {
+                const chunk: &LargeChunk = &prepared.chunks.ptr[part_index];
+                const stored: ChunkStorePutResult = try chunk_store_put(&chunk_store, chunk.bytes.ptr[0: chunk.bytes.len]);
+                if hash32_compare(&stored.storage_id, &prepared.parts.ptr[part_index].storage_id) != 0 ||
+                    hash32_compare(&stored.stored_checksum, &prepared.parts.ptr[part_index].checksum) != 0 ||
+                    stored.stored_size != prepared.parts.ptr[part_index].stored_size {
+                    return error.AddStoreFailed;
+                }
+                part_index = part_index + 1 as usize;
+            }
+
+            const encoded_payload: ByteList = try chunked_blob_payload_to_canonical(&large_arena, &prepared.payload);
+            stored_id = store.put(ObjectKind.ChunkedBlob, encoded_payload.ptr[0: encoded_payload.len]) catch {
+                return error.AddStoreFailed;
+            };
         }
-
-        const stored_id: ObjectId = store.put(ObjectKind.SmallBlob, add_owned_bytes_slice(&encoded)) catch {
-            return error.AddStoreFailed;
-        };
         const base_entry_index: isize = add_find_base_entry(ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len }, &file_entry.path);
         if base_entry_index >= 0 as isize {
             const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_entry_index as usize];

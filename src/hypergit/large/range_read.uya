@@ -1,0 +1,81 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use large.chunk_store.ChunkStore;
+use large.chunk_store.ChunkStoreBytes;
+use large.chunk_store.chunk_store_get;
+use object.types.ByteList;
+use object.types.ChunkRef;
+use object.types.ChunkedBlobPayload;
+
+error LargeRangeAlloc;
+error LargeRangeInvalidRange;
+error LargeRangeCorruptChunk;
+
+fn large_range_alloc_bytes(arena: &Arena, len: usize) !&[byte] {
+    const raw: &byte = arena_alloc(arena, len);
+    if raw == null {
+        return error.LargeRangeAlloc;
+    }
+    return raw[0: len];
+}
+
+export fn chunked_blob_read_range(
+    arena: &Arena,
+    chunk_store: &ChunkStore,
+    payload: &ChunkedBlobPayload,
+    offset: u64,
+    length: u64,
+) !ByteList {
+    if offset > payload.logical_size || length > payload.logical_size - offset {
+        return error.LargeRangeInvalidRange;
+    }
+    if length == 0u64 {
+        return ByteList{ ptr: null, len: 0 };
+    }
+
+    const output: &[byte] = try large_range_alloc_bytes(arena, length as usize);
+    const range_end: u64 = offset + length;
+    var written: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < payload.chunks.len {
+        const chunk: &ChunkRef = &payload.chunks.ptr[i];
+        const chunk_start: u64 = chunk.offset;
+        const chunk_end: u64 = chunk.offset + chunk.logical_size as u64;
+        if chunk_end <= offset || chunk_start >= range_end {
+            i = i + 1 as usize;
+            continue;
+        }
+
+        const stored: ChunkStoreBytes = try chunk_store_get(chunk_store, &chunk.storage_id, arena);
+        if stored.bytes.len < chunk.logical_size as usize {
+            return error.LargeRangeCorruptChunk;
+        }
+
+        var source_start: usize = 0 as usize;
+        if offset > chunk_start {
+            source_start = (offset - chunk_start) as usize;
+        }
+        var source_end: usize = chunk.logical_size as usize;
+        if range_end < chunk_end {
+            source_end = (range_end - chunk_start) as usize;
+        }
+        if source_end < source_start || source_end > stored.bytes.len {
+            return error.LargeRangeCorruptChunk;
+        }
+
+        const copy_len: usize = source_end - source_start;
+        var j: usize = 0 as usize;
+        while j < copy_len {
+            output.ptr[written + j] = stored.bytes.ptr[source_start + j];
+            j = j + 1 as usize;
+        }
+        written = written + copy_len;
+        i = i + 1 as usize;
+    }
+
+    if written != length as usize {
+        return error.LargeRangeCorruptChunk;
+    }
+    return ByteList{ ptr: output.ptr, len: output.len };
+}

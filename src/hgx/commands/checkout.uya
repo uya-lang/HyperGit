@@ -31,18 +31,26 @@ use cli.EXIT_USAGE_ERROR;
 use core.ids.CommitId;
 use core.ids.HASH32_HEX_BYTES;
 use core.ids.commit_id_decode_hex;
+use large.chunk_store.ChunkStore;
+use large.chunk_store.chunk_store_open;
+use large.range_read.chunked_blob_read_range;
 use manifest.load.manifest_load_flatten;
 use manifest.trie.ManifestLeafInputList;
+use object.codec.decode_chunked_blob_object;
 use object.codec.decode_commit_object;
+use object.codec.decode_object_kind;
 use object.codec.decode_small_blob_object;
 use object.types.ByteList;
+use object.types.ChunkedBlobPayload;
 use object.types.CommitPayload;
+use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
 use store.head_ref.repo_head_ref_exists;
 use store.head_ref.repo_read_head_commit;
 use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
 use store.object_store.ObjectBytes;
+use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
 use store.repo_layout.HGIT_WORKSPACE_SPARSE_REL;
@@ -270,7 +278,7 @@ fn checkout_ensure_parent_dirs(path: &CheckoutFsPath) !void {
     }
 }
 
-fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, path: &CheckoutFsPath, action: &CheckoutAction) !void {
+fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, chunk_store: &ChunkStore, path: &CheckoutFsPath, action: &CheckoutAction) !void {
     const object_bytes: ObjectBytes = store.get(action.object_id, arena) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
             return error.CheckoutPermissionDenied;
@@ -278,10 +286,28 @@ fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, path: &C
         return error.CheckoutFailure;
     };
     var offset: usize = 0;
-    const payload: SmallBlobPayload = decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+    const kind: ObjectKind = decode_object_kind(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
         return error.CheckoutFailure;
     };
-    if offset != object_bytes.bytes.len {
+    offset = 0 as usize;
+    var output: ByteList = ByteList{ ptr: null, len: 0 };
+    if kind == ObjectKind.SmallBlob {
+        const payload: SmallBlobPayload = decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+            return error.CheckoutFailure;
+        };
+        if offset != object_bytes.bytes.len {
+            return error.CheckoutFailure;
+        }
+        output = ByteList{ ptr: payload.payload.ptr, len: payload.payload.len };
+    } else if kind == ObjectKind.ChunkedBlob {
+        const payload: ChunkedBlobPayload = decode_chunked_blob_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+            return error.CheckoutFailure;
+        };
+        if offset != object_bytes.bytes.len {
+            return error.CheckoutFailure;
+        }
+        output = try chunked_blob_read_range(arena, chunk_store, &payload, 0u64, payload.logical_size);
+    } else {
         return error.CheckoutFailure;
     }
     try checkout_ensure_parent_dirs(path);
@@ -295,16 +321,23 @@ fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, path: &C
     defer {
         file_close(&file) catch {};
     }
-    const written: usize = file_write(&file, payload.payload.ptr as &const byte, payload.payload.len) catch {
+    const written: usize = file_write(&file, output.ptr as &const byte, output.len) catch {
         return error.CheckoutWriteFailed;
     };
-    if written != payload.payload.len {
+    if written != output.len {
         return error.CheckoutWriteFailed;
     }
 }
 
 export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &RepoPath, plan: &CheckoutPlan) !void {
     const root_path: CheckoutFsPath = checkout_fs_path_from_repo_path(root);
+    const chunk_store_root: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_CHUNKS_REL);
+    const chunk_store: ChunkStore = chunk_store_open(repo_path_cstr(&chunk_store_root)) catch |err| {
+        if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
+            return error.CheckoutPermissionDenied;
+        }
+        return error.CheckoutFailure;
+    };
     var i: usize = 0;
     while i < plan.actions.len {
         const action: &CheckoutAction = &plan.actions.ptr[i];
@@ -312,7 +345,7 @@ export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &Re
         if action.kind == CheckoutActionKind.DeleteFile {
             _ = remove(&fs_path.bytes[0] as &const byte);
         } else {
-            try checkout_write_blob_to_path(arena, store, &fs_path, action);
+            try checkout_write_blob_to_path(arena, store, &chunk_store, &fs_path, action);
         }
         i = i + 1 as usize;
     }

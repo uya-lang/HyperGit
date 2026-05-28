@@ -36,15 +36,19 @@ use manifest.root.manifest_root_build_and_store;
 use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
 use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.codec.decode_chunked_blob_object;
+use object.codec.decode_object_kind;
 use object.codec.decode_small_blob_object;
 use object.commit_build.commit_object_build_and_store;
 use object.types.ByteList;
 use object.types.BloomFilter;
+use object.types.ChunkedBlobPayload;
 use object.types.CommitPayload;
 use object.types.ContentType;
 use object.types.EntryKind;
 use object.types.Identity;
 use object.types.ModuleBitmap;
+use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
 use object.types.commit_id_list_from_slice;
 use store.head_ref.repo_head_ref_exists;
@@ -236,16 +240,31 @@ fn commit_manifest_inputs_from_stage(arena: &Arena, store: &LooseObjectStore, sn
         const object_bytes: ObjectBytes = store.get(entry.staged_object, arena) catch {
             return error.CommitStoreFailed;
         };
-        const blob: SmallBlobPayload = decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &object_offset) catch {
+        const kind: ObjectKind = decode_object_kind(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &object_offset) catch {
             return error.CommitUnsupportedStageEntry;
         };
+        object_offset = 0 as usize;
+        var logical_size: u64 = 0u64;
+        if kind == ObjectKind.SmallBlob {
+            const blob: SmallBlobPayload = decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &object_offset) catch {
+                return error.CommitUnsupportedStageEntry;
+            };
+            logical_size = blob.logical_size;
+        } else if kind == ObjectKind.ChunkedBlob {
+            const blob: ChunkedBlobPayload = decode_chunked_blob_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &object_offset) catch {
+                return error.CommitUnsupportedStageEntry;
+            };
+            logical_size = blob.logical_size;
+        } else {
+            return error.CommitUnsupportedStageEntry;
+        }
 
         raw_inputs[out_index] = ManifestLeafInputEntry{
             path: commit_clone_byte_list(&entry.path),
             kind: commit_stage_entry_kind(entry),
             mode: entry.file_mode,
             object_id: ObjectId{ hash: entry.staged_object.hash },
-            logical_size: blob.logical_size,
+            logical_size: logical_size,
             content_type: ContentType.Unknown,
             policy_id: commit_zero_policy_id(),
         };

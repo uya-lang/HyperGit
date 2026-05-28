@@ -26,6 +26,7 @@ test:
 	$(UYA) test src/hypergit/test_large_chunk_store.uya
 	$(UYA) test src/hypergit/test_large_chunk_manifest.uya
 	$(UYA) test src/hypergit/test_large_config.uya
+	$(UYA) test src/hypergit/test_large_range_read.uya
 	$(UYA) test src/hypergit/test_manifest_path.uya
 	$(UYA) test src/hypergit/test_manifest_trie.uya
 	$(UYA) test src/hypergit/test_manifest_shard.uya
@@ -54,6 +55,7 @@ test:
 	./tests/test_cli_golden.sh
 	./tests/test_add_stage.sh
 	./tests/test_add_delete.sh
+	./tests/test_add_large_file.sh
 	./tests/test_commit_first.sh
 	./tests/test_commit_second_parent.sh
 	./tests/test_log_first.sh

@@ -262,8 +262,8 @@
 - [x] 实现 chunk store。
 - [x] 实现 chunked blob meta。
 - [x] 实现 large file threshold 配置。
-- [ ] 实现 large file add。
-- [ ] 实现 range read。
+- [x] 实现 large file add。
+- [x] 实现 range read。
 - [ ] 实现 large file hydrate。
 - [ ] 实现 large file diff summary。
 - [ ] 测试 10MB 文件 chunk roundtrip。

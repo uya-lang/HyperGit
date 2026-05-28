@@ -1,0 +1,91 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.ids.ObjectId;
+use large.chunk_hash.ChunkHashes;
+use large.chunk_hash.chunk_hash_plain;
+use large.chunk_manifest.ChunkedBlobPart;
+use large.chunk_manifest.ChunkedBlobPartList;
+use large.chunk_manifest.chunked_blob_part_list_from_slice;
+use large.chunk_manifest.chunked_blob_payload_repository_default;
+use large.chunker.CDC_CHUNK_BYTES_MIN;
+use large.chunker.LargeChunk;
+use large.chunker.LargeChunkList;
+use large.chunker.cdc_chunk_bytes_default;
+use large.chunker.fixed_chunk_count;
+use object.hash.hash_chunked_blob_payload;
+use object.types.ChunkedBlobPayload;
+use object.types.ChunkingStrategy;
+use object.types.FileType;
+use object.types.StorageTier;
+
+error LargePrepareAlloc;
+
+export struct LargePreparedChunkedBlob {
+    payload: ChunkedBlobPayload,
+    parts: ChunkedBlobPartList,
+    chunks: LargeChunkList
+}
+
+export fn large_prepare_recommended_arena_bytes(logical_size: u64) !usize {
+    const max_chunks: usize = try fixed_chunk_count(logical_size, CDC_CHUNK_BYTES_MIN);
+    return logical_size as usize + 65536 as usize + max_chunks * 512 as usize;
+}
+
+fn large_prepare_alloc_parts(arena: &Arena, count: usize) !&[ChunkedBlobPart] {
+    if count == 0 as usize {
+        return error.LargePrepareAlloc;
+    }
+    const raw: &ChunkedBlobPart = arena_alloc(arena, @size_of(ChunkedBlobPart) as usize * count) as &ChunkedBlobPart;
+    if raw == null {
+        return error.LargePrepareAlloc;
+    }
+    return raw[0: count];
+}
+
+export fn prepare_chunked_blob_repository_default(
+    arena: &Arena,
+    logical_bytes: &[byte],
+    file_type: FileType,
+) !LargePreparedChunkedBlob {
+    const chunks: LargeChunkList = try cdc_chunk_bytes_default(arena, logical_bytes);
+    const raw_parts: &[ChunkedBlobPart] = try large_prepare_alloc_parts(arena, chunks.len);
+
+    var i: usize = 0 as usize;
+    while i < chunks.len {
+        const chunk: &LargeChunk = &chunks.ptr[i];
+        const hashes: ChunkHashes = try chunk_hash_plain(arena, chunk.bytes.ptr[0: chunk.bytes.len]);
+        raw_parts.ptr[i] = ChunkedBlobPart{
+            logical_chunk_id: hashes.logical_chunk_id,
+            storage_id: hashes.stored_checksum,
+            offset: chunk.logical_offset,
+            logical_size: chunk.logical_size,
+            stored_size: chunk.logical_size,
+            checksum: hashes.stored_checksum,
+            storage_tier: StorageTier.Hot,
+        };
+        i = i + 1 as usize;
+    }
+
+    const parts: ChunkedBlobPartList = chunked_blob_part_list_from_slice(raw_parts);
+    const payload: ChunkedBlobPayload = try chunked_blob_payload_repository_default(
+        arena,
+        logical_bytes,
+        file_type,
+        ChunkingStrategy.ContentDefined,
+        parts);
+    return LargePreparedChunkedBlob{
+        payload: payload,
+        parts: parts,
+        chunks: chunks,
+    };
+}
+
+export fn prepare_chunked_blob_object_id_default(
+    arena: &Arena,
+    logical_bytes: &[byte],
+    file_type: FileType,
+) !ObjectId {
+    const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_default(arena, logical_bytes, file_type);
+    return (try hash_chunked_blob_payload(arena, &prepared.payload)).id;
+}

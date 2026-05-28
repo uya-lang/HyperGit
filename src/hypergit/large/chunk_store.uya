@@ -171,7 +171,7 @@ fn chunk_store_hash_clone(src: &Hash32) Hash32 {
     return out;
 }
 
-fn append_decimal_i32(path: &ChunkStorePath, value: i32) !void {
+fn chunk_store_append_decimal_i32(path: &ChunkStorePath, value: i32) !void {
     var buf: [byte: 16] = [];
     var temp: i32 = value;
     if temp < 0 {
@@ -236,7 +236,7 @@ fn chunk_store_build_paths(
     try chunk_store_path_append_literal(&temp, "tmp-" as &const byte);
     try chunk_store_path_append_bytes(&temp, &hex[2], HASH32_HEX_BYTES - 2 as usize);
     try chunk_store_path_append_byte(&temp, '.' as byte);
-    try append_decimal_i32(&temp, getpid());
+    try chunk_store_append_decimal_i32(&temp, getpid());
     temp_path[0] = temp;
 }
 

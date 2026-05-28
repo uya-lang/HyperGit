@@ -48,6 +48,9 @@ export const HGIT_WORKSPACE_STATE_REL: &const byte = ".hgit/workspace/state.json
 export const HGIT_WORKSPACE_SPARSE_REL: &const byte = ".hgit/workspace/sparse.json";
 export const HGIT_WORKSPACE_STAGE_REL: &const byte = ".hgit/workspace/stage.hgi";
 export const HGIT_WORKSPACE_LOCAL_CHANGE_REL: &const byte = ".hgit/workspace/local-change.hgi";
+export const HGIT_CACHE_REL: &const byte = ".hgit/cache";
+export const HGIT_CACHE_CHUNKS_REL: &const byte = ".hgit/cache/chunks";
+export const HGIT_CACHE_MANIFESTS_REL: &const byte = ".hgit/cache/manifests";
 
 error RepoPathTooLong;
 error RepoCurrentDirUnavailable;
@@ -431,6 +434,9 @@ fn ensure_repo_structure(root: &RepoPath) !void {
     const objects_packs_dir: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_PACKS_REL);
     const indexes_dir: RepoPath = try repo_path_join_literal(root, HGIT_INDEXES_REL);
     const workspace_dir: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_REL);
+    const cache_dir: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_REL);
+    const cache_chunks_dir: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_CHUNKS_REL);
+    const cache_manifests_dir: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_MANIFESTS_REL);
     try ensure_dir(&hgit_dir);
     try ensure_dir(&refs_dir);
     try ensure_dir(&refs_heads_dir);
@@ -439,6 +445,9 @@ fn ensure_repo_structure(root: &RepoPath) !void {
     try ensure_dir(&objects_packs_dir);
     try ensure_dir(&indexes_dir);
     try ensure_dir(&workspace_dir);
+    try ensure_dir(&cache_dir);
+    try ensure_dir(&cache_chunks_dir);
+    try ensure_dir(&cache_manifests_dir);
 }
 
 export fn repo_init_at(root: &RepoPath) !RepoInitResult {
