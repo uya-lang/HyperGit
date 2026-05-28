@@ -1,0 +1,62 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.ids.hash32_compare;
+use large.chunk_hash.ChunkHashes;
+use large.chunk_hash.chunk_hash_pair;
+use large.chunk_hash.chunk_hash_plain;
+use large.chunk_hash.chunk_logical_id;
+use large.chunk_hash.chunk_stored_checksum;
+
+fn test_chunk_hash_plain_is_deterministic() !void {
+    var payload: [byte: 5] = ['h' as byte, 'e' as byte, 'l' as byte, 'l' as byte, 'o' as byte];
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const hashes_a: ChunkHashes = try chunk_hash_plain(&arena, payload[0: 5]);
+    const hashes_b: ChunkHashes = try chunk_hash_plain(&arena, payload[0: 5]);
+    try expect(hash32_compare(&hashes_a.logical_chunk_id, &hashes_b.logical_chunk_id) == 0);
+    try expect(hash32_compare(&hashes_a.stored_checksum, &hashes_b.stored_checksum) == 0);
+    try expect(hash32_compare(&hashes_a.logical_chunk_id, &hashes_a.stored_checksum) != 0);
+}
+
+fn test_chunk_hash_pair_separates_logical_and_stored_inputs() !void {
+    var logical: [byte: 5] = ['h' as byte, 'e' as byte, 'l' as byte, 'l' as byte, 'o' as byte];
+    var stored_a: [byte: 5] = ['h' as byte, 'e' as byte, 'l' as byte, 'l' as byte, 'o' as byte];
+    var stored_b: [byte: 5] = ['H' as byte, 'E' as byte, 'L' as byte, 'L' as byte, 'O' as byte];
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const hashes_a: ChunkHashes = try chunk_hash_pair(&arena, logical[0: 5], stored_a[0: 5]);
+    const hashes_b: ChunkHashes = try chunk_hash_pair(&arena, logical[0: 5], stored_b[0: 5]);
+    try expect(hash32_compare(&hashes_a.logical_chunk_id, &hashes_b.logical_chunk_id) == 0);
+    try expect(hash32_compare(&hashes_a.stored_checksum, &hashes_b.stored_checksum) != 0);
+}
+
+fn test_chunk_hash_empty_payload_roundtrip() !void {
+    var empty: [byte: 1] = [];
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const hashes: ChunkHashes = try chunk_hash_plain(&arena, empty[0: 0]);
+    const logical: Hash32 = try chunk_logical_id(&arena, empty[0: 0]);
+    const checksum: Hash32 = chunk_stored_checksum(empty[0: 0]);
+    try expect(hash32_compare(&hashes.logical_chunk_id, &logical) == 0);
+    try expect(hash32_compare(&hashes.stored_checksum, &checksum) == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Large Chunk Hash Tests");
+    run_test("chunk hash plain is deterministic", test_chunk_hash_plain_is_deterministic);
+    run_test("chunk hash pair separates logical and stored inputs", test_chunk_hash_pair_separates_logical_and_stored_inputs);
+    run_test("chunk hash empty payload roundtrip", test_chunk_hash_empty_payload_roundtrip);
+    return test_suite_end();
+}

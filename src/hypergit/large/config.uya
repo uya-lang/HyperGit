@@ -1,0 +1,27 @@
+export const LARGE_FILE_SMALL_BLOB_MAX_BYTES: u64 = 8388608u64;
+export const LARGE_FILE_CHUNKED_BLOB_LARGE_THRESHOLD_BYTES: u64 = 134217728u64;
+export const LARGE_FILE_EXPLICIT_HYDRATE_THRESHOLD_BYTES: u64 = 1073741824u64;
+
+export enum LargeFileStorageClass {
+    SmallBlob,
+    ChunkedBlob,
+    LargeChunkedBlob,
+    ExplicitHydrateChunkedBlob
+}
+
+export fn large_file_uses_small_blob(logical_size: u64) bool {
+    return logical_size <= LARGE_FILE_SMALL_BLOB_MAX_BYTES;
+}
+
+export fn large_file_storage_class(logical_size: u64) LargeFileStorageClass {
+    if logical_size <= LARGE_FILE_SMALL_BLOB_MAX_BYTES {
+        return LargeFileStorageClass.SmallBlob;
+    }
+    if logical_size <= LARGE_FILE_CHUNKED_BLOB_LARGE_THRESHOLD_BYTES {
+        return LargeFileStorageClass.ChunkedBlob;
+    }
+    if logical_size <= LARGE_FILE_EXPLICIT_HYDRATE_THRESHOLD_BYTES {
+        return LargeFileStorageClass.LargeChunkedBlob;
+    }
+    return LargeFileStorageClass.ExplicitHydrateChunkedBlob;
+}

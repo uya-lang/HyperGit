@@ -25,6 +25,7 @@ use core.ids.ObjectId;
 use core.ids.commit_id_compare;
 use core.ids.object_id_compare;
 use core.ids.object_id_from_hash;
+use large.config.large_file_uses_small_blob;
 use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_path_compare;
 use manifest.path.manifest_path_normalize;
@@ -68,7 +69,6 @@ use workspace.stage_file.stage_file_read;
 use workspace.stage_file.stage_file_write;
 
 const ADD_ARENA_BYTES: usize = 33554432 as usize;
-const ADD_SMALL_BLOB_MAX_BYTES: u64 = 8388608u64;
 const ADD_PATH_MAX: usize = 4096;
 
 error AddAlloc;
@@ -230,7 +230,7 @@ fn add_hash_small_blob_encoded(encoded: &[byte]) !ObjectId {
 }
 
 export fn add_worktree_small_blob_id(root: &RepoPath, path: &ByteList, logical_size: u64) !ObjectId {
-    if logical_size > ADD_SMALL_BLOB_MAX_BYTES {
+    if !large_file_uses_small_blob(logical_size) {
         return error.AddLargeFileNotImplemented;
     }
 
@@ -437,7 +437,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         if file_entry.kind == WorkspaceFileKind.Symlink {
             return error.AddSymlinkNotImplemented;
         }
-        if file_entry.logical_size > ADD_SMALL_BLOB_MAX_BYTES {
+        if !large_file_uses_small_blob(file_entry.logical_size) {
             return error.AddLargeFileNotImplemented;
         }
 

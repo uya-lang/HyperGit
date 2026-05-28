@@ -1,0 +1,209 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use large.chunker.CdcChunkerConfig;
+use large.chunker.CDC_CHUNK_BYTES_AVG;
+use large.chunker.CDC_CHUNK_BYTES_MAX;
+use large.chunker.CDC_CHUNK_BYTES_MIN;
+use large.chunker.FIXED_CHUNK_BYTES_DEFAULT;
+use large.chunker.LargeChunk;
+use large.chunker.LargeChunkList;
+use large.chunker.cdc_chunk_bytes;
+use large.chunker.cdc_chunker_default_config;
+use large.chunker.fixed_chunk_bytes;
+use large.chunker.fixed_chunk_bytes_default;
+use large.chunker.fixed_chunk_count;
+
+fn large_chunk_expect_bytes(chunk: &LargeChunk, expected: &[byte]) !void {
+    try expect(chunk.bytes.len == expected.len);
+    var i: usize = 0 as usize;
+    while i < expected.len {
+        try expect(chunk.bytes.ptr[i] == expected.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn test_fixed_chunk_count_rounds_up_tail() !void {
+    try expect((try fixed_chunk_count(0u64, FIXED_CHUNK_BYTES_DEFAULT)) == 0 as usize);
+    try expect((try fixed_chunk_count(FIXED_CHUNK_BYTES_DEFAULT as u64, FIXED_CHUNK_BYTES_DEFAULT)) == 1 as usize);
+    try expect((try fixed_chunk_count(FIXED_CHUNK_BYTES_DEFAULT as u64 + 17u64, FIXED_CHUNK_BYTES_DEFAULT)) == 2 as usize);
+}
+
+fn test_fixed_chunk_bytes_split_payload() !void {
+    var input: [byte: 10] = [
+        'a' as byte,
+        'b' as byte,
+        'c' as byte,
+        'd' as byte,
+        'e' as byte,
+        'f' as byte,
+        'g' as byte,
+        'h' as byte,
+        'i' as byte,
+        'j' as byte,
+    ];
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const chunks: LargeChunkList = try fixed_chunk_bytes(&arena, input[0: 10], 4u32);
+    try expect(chunks.len == 3 as usize);
+
+    try expect(chunks.ptr[0].logical_offset == 0u64);
+    try expect(chunks.ptr[0].logical_size == 4u32);
+    try large_chunk_expect_bytes(&chunks.ptr[0], input[0: 4]);
+
+    try expect(chunks.ptr[1].logical_offset == 4u64);
+    try expect(chunks.ptr[1].logical_size == 4u32);
+    try large_chunk_expect_bytes(&chunks.ptr[1], input[4: 4]);
+
+    try expect(chunks.ptr[2].logical_offset == 8u64);
+    try expect(chunks.ptr[2].logical_size == 2u32);
+    try large_chunk_expect_bytes(&chunks.ptr[2], input[8: 2]);
+}
+
+fn test_fixed_chunk_bytes_handles_empty_payload() !void {
+    var empty: [byte: 1] = [];
+    var arena_buf: [byte: 1024] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1024 as usize);
+
+    const chunks: LargeChunkList = try fixed_chunk_bytes_default(&arena, empty[0: 0]);
+    try expect(chunks.len == 0 as usize);
+    try expect(chunks.ptr == null);
+}
+
+fn test_fixed_chunk_bytes_rejects_zero_chunk_size() !void {
+    var input: [byte: 1] = ['x' as byte];
+    var arena_buf: [byte: 1024] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1024 as usize);
+
+    const chunks: LargeChunkList = fixed_chunk_bytes(&arena, input[0: 1], 0u32) catch |err| {
+        try expect(@error_id(err) == @error_id(error.LargeChunkerInvalidChunkSize));
+        return;
+    };
+    _ = chunks;
+    return error.AssertionFailed;
+}
+
+fn test_cdc_chunker_default_config_matches_design() !void {
+    const config: CdcChunkerConfig = cdc_chunker_default_config();
+    try expect(config.avg_chunk_bytes == CDC_CHUNK_BYTES_AVG);
+    try expect(config.min_chunk_bytes == CDC_CHUNK_BYTES_MIN);
+    try expect(config.max_chunk_bytes == CDC_CHUNK_BYTES_MAX);
+}
+
+fn test_cdc_chunk_bytes_prototype_cuts_at_min_with_eager_match() !void {
+    var input: [byte: 10] = ['a' as byte, 'b' as byte, 'c' as byte, 'd' as byte, 'e' as byte, 'f' as byte, 'g' as byte, 'h' as byte, 'i' as byte, 'j' as byte];
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const config: CdcChunkerConfig = CdcChunkerConfig{
+        avg_chunk_bytes: 1u32,
+        min_chunk_bytes: 3u32,
+        max_chunk_bytes: 6u32,
+    };
+    const chunks: LargeChunkList = try cdc_chunk_bytes(&arena, input[0: 10], config);
+    try expect(chunks.len == 4 as usize);
+    try expect(chunks.ptr[0].logical_size == 3u32);
+    try expect(chunks.ptr[1].logical_size == 3u32);
+    try expect(chunks.ptr[2].logical_size == 3u32);
+    try expect(chunks.ptr[3].logical_size == 1u32);
+    try large_chunk_expect_bytes(&chunks.ptr[0], input[0: 3]);
+    try large_chunk_expect_bytes(&chunks.ptr[1], input[3: 3]);
+    try large_chunk_expect_bytes(&chunks.ptr[2], input[6: 3]);
+    try large_chunk_expect_bytes(&chunks.ptr[3], input[9: 1]);
+}
+
+fn test_cdc_chunk_bytes_respects_max_fallback() !void {
+    var input: [byte: 11] = ['z' as byte, 'y' as byte, 'x' as byte, 'w' as byte, 'v' as byte, 'u' as byte, 't' as byte, 's' as byte, 'r' as byte, 'q' as byte, 'p' as byte];
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    const config: CdcChunkerConfig = CdcChunkerConfig{
+        avg_chunk_bytes: 7u32,
+        min_chunk_bytes: 5u32,
+        max_chunk_bytes: 5u32,
+    };
+    const chunks: LargeChunkList = try cdc_chunk_bytes(&arena, input[0: 11], config);
+    try expect(chunks.len == 3 as usize);
+    try expect(chunks.ptr[0].logical_offset == 0u64);
+    try expect(chunks.ptr[0].logical_size == 5u32);
+    try expect(chunks.ptr[1].logical_offset == 5u64);
+    try expect(chunks.ptr[1].logical_size == 5u32);
+    try expect(chunks.ptr[2].logical_offset == 10u64);
+    try expect(chunks.ptr[2].logical_size == 1u32);
+}
+
+fn test_cdc_chunk_bytes_is_deterministic() !void {
+    var input: [byte: 12] = [1 as byte, 2 as byte, 3 as byte, 4 as byte, 5 as byte, 6 as byte, 7 as byte, 8 as byte, 9 as byte, 10 as byte, 11 as byte, 12 as byte];
+    var arena_a_buf: [byte: 4096] = [];
+    var arena_b_buf: [byte: 4096] = [];
+    var arena_a: Arena = Arena{ buffer: &arena_a_buf[0], size: 0, used: 0 };
+    var arena_b: Arena = Arena{ buffer: &arena_b_buf[0], size: 0, used: 0 };
+    arena_init(&arena_a, &arena_a_buf[0], 4096 as usize);
+    arena_init(&arena_b, &arena_b_buf[0], 4096 as usize);
+
+    const config: CdcChunkerConfig = CdcChunkerConfig{
+        avg_chunk_bytes: 9u32,
+        min_chunk_bytes: 4u32,
+        max_chunk_bytes: 7u32,
+    };
+    const config_copy: CdcChunkerConfig = CdcChunkerConfig{
+        avg_chunk_bytes: 9u32,
+        min_chunk_bytes: 4u32,
+        max_chunk_bytes: 7u32,
+    };
+    const chunks_a: LargeChunkList = try cdc_chunk_bytes(&arena_a, input[0: 12], config);
+    const chunks_b: LargeChunkList = try cdc_chunk_bytes(&arena_b, input[0: 12], config_copy);
+    try expect(chunks_a.len == chunks_b.len);
+
+    var i: usize = 0 as usize;
+    while i < chunks_a.len {
+        try expect(chunks_a.ptr[i].logical_offset == chunks_b.ptr[i].logical_offset);
+        try expect(chunks_a.ptr[i].logical_size == chunks_b.ptr[i].logical_size);
+        try large_chunk_expect_bytes(&chunks_a.ptr[i], chunks_b.ptr[i].bytes.ptr[0: chunks_b.ptr[i].bytes.len]);
+        i = i + 1 as usize;
+    }
+}
+
+fn test_cdc_chunk_bytes_rejects_invalid_config() !void {
+    var input: [byte: 1] = ['x' as byte];
+    var arena_buf: [byte: 1024] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1024 as usize);
+
+    const config: CdcChunkerConfig = CdcChunkerConfig{
+        avg_chunk_bytes: 1u32,
+        min_chunk_bytes: 4u32,
+        max_chunk_bytes: 3u32,
+    };
+    const chunks: LargeChunkList = cdc_chunk_bytes(&arena, input[0: 1], config) catch |err| {
+        try expect(@error_id(err) == @error_id(error.LargeChunkerInvalidCdcConfig));
+        return;
+    };
+    _ = chunks;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Large Chunker Tests");
+    run_test("fixed chunk count rounds up tail", test_fixed_chunk_count_rounds_up_tail);
+    run_test("fixed chunk bytes split payload", test_fixed_chunk_bytes_split_payload);
+    run_test("fixed chunk bytes handles empty payload", test_fixed_chunk_bytes_handles_empty_payload);
+    run_test("fixed chunk bytes rejects zero chunk size", test_fixed_chunk_bytes_rejects_zero_chunk_size);
+    run_test("cdc chunker default config matches design", test_cdc_chunker_default_config_matches_design);
+    run_test("cdc chunk bytes prototype cuts at min with eager match", test_cdc_chunk_bytes_prototype_cuts_at_min_with_eager_match);
+    run_test("cdc chunk bytes respects max fallback", test_cdc_chunk_bytes_respects_max_fallback);
+    run_test("cdc chunk bytes is deterministic", test_cdc_chunk_bytes_is_deterministic);
+    run_test("cdc chunk bytes rejects invalid config", test_cdc_chunk_bytes_rejects_invalid_config);
+    return test_suite_end();
+}

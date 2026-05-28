@@ -1,0 +1,31 @@
+use std.mem.arena.Arena;
+
+use core.codec.codec_hash_payload;
+use core.ids.Hash32;
+use core.ids.hash_domain_payload;
+
+export const HASH_DOMAIN_CHUNK: &const byte = "hypergit.chunk.v1";
+
+export struct ChunkHashes {
+    logical_chunk_id: Hash32,
+    stored_checksum: Hash32
+}
+
+export fn chunk_stored_checksum(stored_bytes: &[byte]) Hash32 {
+    return codec_hash_payload(stored_bytes);
+}
+
+export fn chunk_logical_id(arena: &Arena, logical_bytes: &[byte]) !Hash32 {
+    return try hash_domain_payload(arena, HASH_DOMAIN_CHUNK, logical_bytes);
+}
+
+export fn chunk_hash_pair(arena: &Arena, logical_bytes: &[byte], stored_bytes: &[byte]) !ChunkHashes {
+    return ChunkHashes{
+        logical_chunk_id: try chunk_logical_id(arena, logical_bytes),
+        stored_checksum: chunk_stored_checksum(stored_bytes),
+    };
+}
+
+export fn chunk_hash_plain(arena: &Arena, payload: &[byte]) !ChunkHashes {
+    return try chunk_hash_pair(arena, payload, payload);
+}

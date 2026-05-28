@@ -21,6 +21,11 @@ c99:
 test:
 	$(UYA) test src/hypergit/test_object_model.uya
 	$(UYA) test src/hypergit/test_object_codec.uya
+	$(UYA) test src/hypergit/test_large_chunker.uya
+	$(UYA) test src/hypergit/test_large_chunk_hash.uya
+	$(UYA) test src/hypergit/test_large_chunk_store.uya
+	$(UYA) test src/hypergit/test_large_chunk_manifest.uya
+	$(UYA) test src/hypergit/test_large_config.uya
 	$(UYA) test src/hypergit/test_manifest_path.uya
 	$(UYA) test src/hypergit/test_manifest_trie.uya
 	$(UYA) test src/hypergit/test_manifest_shard.uya

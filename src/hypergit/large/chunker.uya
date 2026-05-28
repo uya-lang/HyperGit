@@ -1,0 +1,227 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use object.types.ByteList;
+use object.types.byte_list_from_slice;
+
+error LargeChunkerAlloc;
+error LargeChunkerInvalidChunkSize;
+error LargeChunkerInvalidCdcConfig;
+
+export const FIXED_CHUNK_BYTES_DEFAULT: u32 = 4194304u32;
+export const CDC_CHUNK_BYTES_AVG: u32 = 4194304u32;
+export const CDC_CHUNK_BYTES_MIN: u32 = 524288u32;
+export const CDC_CHUNK_BYTES_MAX: u32 = 16777216u32;
+
+const CDC_ROLLING_WINDOW_BYTES: usize = 64 as usize;
+const CDC_ROLLING_SUM_FACTOR: u64 = 65537u64;
+const CDC_ROLLING_WEIGHT_FACTOR: u64 = 1315423911u64;
+
+export struct LargeChunk {
+    logical_offset: u64,
+    logical_size: u32,
+    bytes: ByteList
+}
+
+export struct LargeChunkList {
+    ptr: &LargeChunk,
+    len: usize
+}
+
+export struct CdcChunkerConfig {
+    avg_chunk_bytes: u32,
+    min_chunk_bytes: u32,
+    max_chunk_bytes: u32
+}
+
+struct CdcRollingState {
+    window: &u32,
+    len: usize = 0,
+    head: usize = 0,
+    sum: u64 = 0u64,
+    weighted: u64 = 0u64
+}
+
+export fn large_chunk_list_from_slice(slice: &[LargeChunk]) LargeChunkList {
+    return LargeChunkList{ ptr: slice.ptr, len: slice.len };
+}
+
+export fn cdc_chunker_default_config() CdcChunkerConfig {
+    return CdcChunkerConfig{
+        avg_chunk_bytes: CDC_CHUNK_BYTES_AVG,
+        min_chunk_bytes: CDC_CHUNK_BYTES_MIN,
+        max_chunk_bytes: CDC_CHUNK_BYTES_MAX,
+    };
+}
+
+fn large_chunker_alloc_chunks(arena: &Arena, count: usize) !&[LargeChunk] {
+    var want: usize = count;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw: &LargeChunk = arena_alloc(arena, @size_of(LargeChunk) as usize * want) as &LargeChunk;
+    if raw == null {
+        return error.LargeChunkerAlloc;
+    }
+    return raw[0: count];
+}
+
+fn cdc_chunker_config_is_valid(config: &CdcChunkerConfig) bool {
+    if config.avg_chunk_bytes == 0u32 || config.min_chunk_bytes == 0u32 || config.max_chunk_bytes == 0u32 {
+        return false;
+    }
+    return config.max_chunk_bytes >= config.min_chunk_bytes;
+}
+
+fn cdc_rolling_reset(state: &CdcRollingState) void {
+    var i: usize = 0 as usize;
+    while i < CDC_ROLLING_WINDOW_BYTES {
+        state.window[i] = 0u32;
+        i = i + 1 as usize;
+    }
+    state.len = 0 as usize;
+    state.head = 0 as usize;
+    state.sum = 0u64;
+    state.weighted = 0u64;
+}
+
+fn cdc_rolling_push(state: &CdcRollingState, value: byte) void {
+    const promoted: u64 = value as u64;
+    if state.len < CDC_ROLLING_WINDOW_BYTES {
+        const slot: usize = (state.head + state.len) % CDC_ROLLING_WINDOW_BYTES;
+        if slot >= CDC_ROLLING_WINDOW_BYTES {
+            return;
+        }
+        state.window[slot] = value as u32;
+        state.len = state.len + 1 as usize;
+        state.sum = state.sum + promoted;
+        state.weighted = state.weighted + promoted * state.len as u64;
+        return;
+    }
+
+    const head: usize = state.head % CDC_ROLLING_WINDOW_BYTES;
+    if head >= CDC_ROLLING_WINDOW_BYTES {
+        return;
+    }
+    const old: u64 = state.window[head] as u64;
+    state.weighted = state.weighted - state.sum;
+    state.sum = state.sum - old;
+    state.window[head] = value as u32;
+    state.head = (head + 1 as usize) % CDC_ROLLING_WINDOW_BYTES;
+    state.sum = state.sum + promoted;
+    state.weighted = state.weighted + promoted * CDC_ROLLING_WINDOW_BYTES as u64;
+}
+
+fn cdc_rolling_fingerprint(state: &CdcRollingState) u64 {
+    return state.sum * CDC_ROLLING_SUM_FACTOR + state.weighted * CDC_ROLLING_WEIGHT_FACTOR;
+}
+
+fn cdc_chunker_should_cut(state: &CdcRollingState, chunk_len: usize, config: &CdcChunkerConfig) bool {
+    if chunk_len < config.min_chunk_bytes as usize {
+        return false;
+    }
+    if chunk_len >= config.max_chunk_bytes as usize {
+        return true;
+    }
+    return cdc_rolling_fingerprint(state) % config.avg_chunk_bytes as u64 == 0u64;
+}
+
+export fn fixed_chunk_count(logical_size: u64, chunk_bytes: u32) !usize {
+    if chunk_bytes == 0u32 {
+        return error.LargeChunkerInvalidChunkSize;
+    }
+    if logical_size == 0u64 {
+        return 0 as usize;
+    }
+    const unit: u64 = chunk_bytes as u64;
+    var count: u64 = logical_size / unit;
+    if logical_size % unit != 0u64 {
+        count = count + 1u64;
+    }
+    return count as usize;
+}
+
+export fn fixed_chunk_bytes(arena: &Arena, payload: &[byte], chunk_bytes: u32) !LargeChunkList {
+    const count: usize = try fixed_chunk_count(payload.len as u64, chunk_bytes);
+    if count == 0 as usize {
+        return LargeChunkList{ ptr: null, len: 0 };
+    }
+
+    const out: &[LargeChunk] = try large_chunker_alloc_chunks(arena, count);
+    const max_chunk: usize = chunk_bytes as usize;
+    var offset: usize = 0 as usize;
+    var index: usize = 0 as usize;
+    while offset < payload.len {
+        var logical_size: usize = max_chunk;
+        const remaining: usize = payload.len - offset;
+        if logical_size > remaining {
+            logical_size = remaining;
+        }
+        out.ptr[index] = LargeChunk{
+            logical_offset: offset as u64,
+            logical_size: logical_size as u32,
+            bytes: byte_list_from_slice(payload.ptr[offset: logical_size]),
+        };
+        offset = offset + logical_size;
+        index = index + 1 as usize;
+    }
+    return large_chunk_list_from_slice(out);
+}
+
+export fn fixed_chunk_bytes_default(arena: &Arena, payload: &[byte]) !LargeChunkList {
+    return try fixed_chunk_bytes(arena, payload, FIXED_CHUNK_BYTES_DEFAULT);
+}
+
+export fn cdc_chunk_bytes(arena: &Arena, payload: &[byte], config: CdcChunkerConfig) !LargeChunkList {
+    if !cdc_chunker_config_is_valid(&config) {
+        return error.LargeChunkerInvalidCdcConfig;
+    }
+    if payload.len == 0 as usize {
+        return LargeChunkList{ ptr: null, len: 0 };
+    }
+
+    const max_count: usize = try fixed_chunk_count(payload.len as u64, config.min_chunk_bytes);
+    const out: &[LargeChunk] = try large_chunker_alloc_chunks(arena, max_count);
+    var rolling_window: [u32: 64] = [];
+    var state: CdcRollingState = CdcRollingState{
+        window: &rolling_window[0],
+        len: 0 as usize,
+        head: 0 as usize,
+        sum: 0u64,
+        weighted: 0u64,
+    };
+    cdc_rolling_reset(&state);
+    var chunk_start: usize = 0 as usize;
+    var cursor: usize = 0 as usize;
+    var out_len: usize = 0 as usize;
+    while cursor < payload.len {
+        cdc_rolling_push(&state, payload.ptr[cursor]);
+        const chunk_len: usize = cursor - chunk_start + 1 as usize;
+        if cdc_chunker_should_cut(&state, chunk_len, &config) {
+            out.ptr[out_len] = LargeChunk{
+                logical_offset: chunk_start as u64,
+                logical_size: chunk_len as u32,
+                bytes: byte_list_from_slice(payload.ptr[chunk_start: chunk_len]),
+            };
+            out_len = out_len + 1 as usize;
+            chunk_start = cursor + 1 as usize;
+            cdc_rolling_reset(&state);
+        }
+        cursor = cursor + 1 as usize;
+    }
+
+    if chunk_start < payload.len {
+        const chunk_len: usize = payload.len - chunk_start;
+        out.ptr[out_len] = LargeChunk{
+            logical_offset: chunk_start as u64,
+            logical_size: chunk_len as u32,
+            bytes: byte_list_from_slice(payload.ptr[chunk_start: chunk_len]),
+        };
+        out_len = out_len + 1 as usize;
+    }
+    return large_chunk_list_from_slice(out[0: out_len]);
+}
+
+export fn cdc_chunk_bytes_default(arena: &Arena, payload: &[byte]) !LargeChunkList {
+    return try cdc_chunk_bytes(arena, payload, cdc_chunker_default_config());
+}

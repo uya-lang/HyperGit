@@ -1,0 +1,95 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use libc.system;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fwrite;
+use core.ids.hash32_compare;
+use large.chunk_store.ChunkStore;
+use large.chunk_store.ChunkStoreBytes;
+use large.chunk_store.ChunkStorePutResult;
+use large.chunk_store.chunk_store_get;
+use large.chunk_store.chunk_store_has;
+use large.chunk_store.chunk_store_open;
+use large.chunk_store.chunk_store_put;
+use large.chunk_store.chunk_store_storage_path;
+
+fn large_chunk_store_expect_bytes(actual: ChunkStoreBytes, expected: &[byte]) !void {
+    try expect(actual.bytes.len == expected.len);
+    var i: usize = 0 as usize;
+    while i < expected.len {
+        try expect(actual.bytes.ptr[i] == expected.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn test_chunk_store_put_get_roundtrip() !void {
+    try expect(system("rm -rf build/chunk-store-roundtrip && mkdir -p build/chunk-store-roundtrip") == 0);
+    const store: ChunkStore = try chunk_store_open("build/chunk-store-roundtrip/chunks");
+
+    var payload: [byte: 6] = ['c' as byte, 'h' as byte, 'u' as byte, 'n' as byte, 'k' as byte, '\n' as byte];
+    const stored: ChunkStorePutResult = try chunk_store_put(&store, payload[0: 6]);
+    try expect(stored.stored_size == 6u32);
+    try expect(hash32_compare(&stored.storage_id, &stored.stored_checksum) == 0);
+    try expect(try chunk_store_has(&store, &stored.storage_id));
+
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+    const loaded: ChunkStoreBytes = try chunk_store_get(&store, &stored.storage_id, &arena);
+    try large_chunk_store_expect_bytes(loaded, payload[0: 6]);
+}
+
+fn test_chunk_store_dedupes_same_payload() !void {
+    try expect(system("rm -rf build/chunk-store-dedupe && mkdir -p build/chunk-store-dedupe") == 0);
+    const store: ChunkStore = try chunk_store_open("build/chunk-store-dedupe/chunks");
+
+    var payload: [byte: 4] = ['d' as byte, 'u' as byte, 'p' as byte, 'e' as byte];
+    const first: ChunkStorePutResult = try chunk_store_put(&store, payload[0: 4]);
+    const second: ChunkStorePutResult = try chunk_store_put(&store, payload[0: 4]);
+    try expect(hash32_compare(&first.storage_id, &second.storage_id) == 0);
+    try expect(first.stored_size == second.stored_size);
+}
+
+fn test_chunk_store_detects_corruption() !void {
+    try expect(system("rm -rf build/chunk-store-corrupt && mkdir -p build/chunk-store-corrupt") == 0);
+    const store: ChunkStore = try chunk_store_open("build/chunk-store-corrupt/chunks");
+
+    var payload: [byte: 5] = ['v' as byte, 'a' as byte, 'l' as byte, 'u' as byte, 'e' as byte];
+    const stored: ChunkStorePutResult = try chunk_store_put(&store, payload[0: 5]);
+
+    var path_buf: [byte: 4096] = [];
+    const path_len: usize = try chunk_store_storage_path(&store, &stored.storage_id, path_buf[0: 4096]);
+    path_buf[path_len] = 0 as byte;
+
+    var bad_payload: [byte: 3] = ['b' as byte, 'a' as byte, 'd' as byte];
+    const stream: &FILE = fopen(&path_buf[0] as &const byte, "w");
+    try expect(stream != null);
+    try expect(fwrite(&bad_payload[0] as &const byte, 1 as usize, 3 as usize, stream) == 3 as usize);
+    try expect(fclose(stream) == 0);
+
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+    const loaded: ChunkStoreBytes = chunk_store_get(&store, &stored.storage_id, &arena) catch |err| {
+        try expect(@error_id(err) == @error_id(error.ChunkStoreHashMismatch));
+        return;
+    };
+    _ = loaded;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Large Chunk Store Tests");
+    run_test("chunk store put get roundtrip", test_chunk_store_put_get_roundtrip);
+    run_test("chunk store dedupes same payload", test_chunk_store_dedupes_same_payload);
+    run_test("chunk store detects corruption", test_chunk_store_detects_corruption);
+    return test_suite_end();
+}

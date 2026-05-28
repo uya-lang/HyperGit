@@ -1,0 +1,380 @@
+use std.io.file.File;
+use std.io.file.file_close;
+use std.io.file.file_open;
+use std.io.file.file_read;
+use std.io.file.file_write;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.string.strlen;
+
+use libc.Stat;
+use libc.errno;
+use libc.getpid;
+use libc.mkdir;
+use libc.rename;
+use libc.stat;
+use libc.unlink;
+use libc.EACCES;
+use libc.EEXIST;
+use libc.EPERM;
+use libc.O_CREAT;
+use libc.O_EXCL;
+use libc.O_RDONLY;
+use libc.O_WRONLY;
+use libc.S_IRWXU;
+use core.ids.Hash32;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.hash32_compare;
+use core.ids.hash32_encode_hex;
+use large.chunk_hash.chunk_stored_checksum;
+use object.types.ByteList;
+
+const CHUNK_STORE_PATH_MAX: usize = 4096;
+const CHUNK_STORE_STAT_S_IFMT: u32 = 61440u32;
+const CHUNK_STORE_STAT_S_IFDIR: u32 = 16384u32;
+
+error ChunkStorePathTooLong;
+error ChunkStoreAlloc;
+error ChunkStoreNotFound;
+error ChunkStoreOpenFailed;
+error ChunkStoreReadFailed;
+error ChunkStoreWriteFailed;
+error ChunkStoreHashMismatch;
+error ChunkStorePermissionDenied;
+error ChunkStorePublishFailed;
+error ChunkStoreMkdirFailed;
+
+struct ChunkStorePath {
+    bytes: [byte: 4096] = [],
+    len: usize = 0
+}
+
+export struct ChunkStore {
+    root: ChunkStorePath
+}
+
+export struct ChunkStoreBytes {
+    bytes: ByteList
+}
+
+export struct ChunkStorePutResult {
+    storage_id: Hash32,
+    stored_size: u32,
+    stored_checksum: Hash32
+}
+
+fn chunk_store_errno_is_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn chunk_store_path_empty() ChunkStorePath {
+    return ChunkStorePath{ bytes: [], len: 0 };
+}
+
+fn chunk_store_path_cstr(path: &ChunkStorePath) &byte {
+    return &path.bytes[0];
+}
+
+fn chunk_store_path_clone(src: &ChunkStorePath) ChunkStorePath {
+    var out: ChunkStorePath = chunk_store_path_empty();
+    var i: usize = 0 as usize;
+    while i < src.len {
+        out.bytes[i] = src.bytes[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[src.len] = 0 as byte;
+    out.len = src.len;
+    return out;
+}
+
+fn chunk_store_path_from_cstr(text: &byte) !ChunkStorePath {
+    if text == null {
+        return error.ChunkStorePathTooLong;
+    }
+    const len: usize = strlen(text as &const byte);
+    if len >= CHUNK_STORE_PATH_MAX {
+        return error.ChunkStorePathTooLong;
+    }
+    var out: ChunkStorePath = chunk_store_path_empty();
+    var i: usize = 0 as usize;
+    while i < len {
+        out.bytes[i] = text[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[len] = 0 as byte;
+    out.len = len;
+    return out;
+}
+
+fn chunk_store_path_append_byte(path: &ChunkStorePath, value: byte) !void {
+    if path.len + 1 as usize >= CHUNK_STORE_PATH_MAX {
+        return error.ChunkStorePathTooLong;
+    }
+    path.bytes[path.len] = value;
+    path.len = path.len + 1 as usize;
+    path.bytes[path.len] = 0 as byte;
+}
+
+fn chunk_store_path_append_bytes(path: &ChunkStorePath, src: &byte, count: usize) !void {
+    if path.len + count >= CHUNK_STORE_PATH_MAX {
+        return error.ChunkStorePathTooLong;
+    }
+    var i: usize = 0 as usize;
+    while i < count {
+        path.bytes[path.len + i] = src[i];
+        i = i + 1 as usize;
+    }
+    path.len = path.len + count;
+    path.bytes[path.len] = 0 as byte;
+}
+
+fn chunk_store_path_append_literal(path: &ChunkStorePath, literal: &const byte) !void {
+    return chunk_store_path_append_bytes(path, literal as &byte, strlen(literal));
+}
+
+fn chunk_store_path_exists(path: &ChunkStorePath) bool {
+    var st: Stat = Stat{};
+    return stat(chunk_store_path_cstr(path) as &const byte, &st) == 0;
+}
+
+fn chunk_store_path_is_dir(path: &ChunkStorePath) bool {
+    var st: Stat = Stat{};
+    if stat(chunk_store_path_cstr(path) as &const byte, &st) != 0 {
+        return false;
+    }
+    return (st.st_mode as u32 & CHUNK_STORE_STAT_S_IFMT) == CHUNK_STORE_STAT_S_IFDIR;
+}
+
+fn chunk_store_ensure_dir(path: &ChunkStorePath) !void {
+    if chunk_store_path_is_dir(path) {
+        return;
+    }
+    if mkdir(chunk_store_path_cstr(path) as &const byte, S_IRWXU as i32) == 0 {
+        return;
+    }
+    if errno == EEXIST && chunk_store_path_is_dir(path) {
+        return;
+    }
+    if chunk_store_errno_is_permission() {
+        return error.ChunkStorePermissionDenied;
+    }
+    return error.ChunkStoreMkdirFailed;
+}
+
+fn chunk_store_hash_clone(src: &Hash32) Hash32 {
+    var out: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        out.bytes[i] = src.bytes[i];
+        i = i + 1 as usize;
+    }
+    return out;
+}
+
+fn append_decimal_i32(path: &ChunkStorePath, value: i32) !void {
+    var buf: [byte: 16] = [];
+    var temp: i32 = value;
+    if temp < 0 {
+        temp = 0 - temp;
+    }
+    var count: usize = 0 as usize;
+    if temp == 0 {
+        buf[0] = '0' as byte;
+        count = 1 as usize;
+    } else {
+        while temp > 0 {
+            if count >= 16 as usize {
+                return error.ChunkStorePathTooLong;
+            }
+            const slot: usize = count;
+            if slot >= 16 as usize {
+                return error.ChunkStorePathTooLong;
+            }
+            buf[slot] = ('0' as byte) + (temp % 10) as byte;
+            temp = temp / 10;
+            count = count + 1 as usize;
+        }
+    }
+    while count > 0 as usize {
+        count = count - 1 as usize;
+        const slot: usize = count;
+        if slot >= 16 as usize {
+            return error.ChunkStorePathTooLong;
+        }
+        try chunk_store_path_append_byte(path, buf[slot]);
+    }
+}
+
+fn chunk_store_build_paths(
+    root: &ChunkStorePath,
+    storage_id: &Hash32,
+    dir_path: &ChunkStorePath,
+    file_path: &ChunkStorePath,
+    temp_path: &ChunkStorePath,
+) !void {
+    var hex: [byte: 64] = [];
+    _ = try hash32_encode_hex(storage_id, hex[0: HASH32_HEX_BYTES]);
+
+    var dir: ChunkStorePath = chunk_store_path_empty();
+    try chunk_store_path_append_bytes(&dir, &root.bytes[0], root.len);
+    if dir.len > 0 as usize {
+        const last_index: usize = dir.len - 1 as usize;
+        if last_index < CHUNK_STORE_PATH_MAX && dir.bytes[last_index] != '/' as byte {
+            try chunk_store_path_append_byte(&dir, '/' as byte);
+        }
+    }
+    try chunk_store_path_append_bytes(&dir, &hex[0], 2 as usize);
+    dir_path[0] = chunk_store_path_clone(&dir);
+
+    var file: ChunkStorePath = chunk_store_path_clone(&dir);
+    try chunk_store_path_append_byte(&file, '/' as byte);
+    try chunk_store_path_append_bytes(&file, &hex[2], HASH32_HEX_BYTES - 2 as usize);
+    file_path[0] = file;
+
+    var temp: ChunkStorePath = chunk_store_path_clone(&dir);
+    try chunk_store_path_append_byte(&temp, '/' as byte);
+    try chunk_store_path_append_literal(&temp, "tmp-" as &const byte);
+    try chunk_store_path_append_bytes(&temp, &hex[2], HASH32_HEX_BYTES - 2 as usize);
+    try chunk_store_path_append_byte(&temp, '.' as byte);
+    try append_decimal_i32(&temp, getpid());
+    temp_path[0] = temp;
+}
+
+fn chunk_store_load_file_bytes(arena: &Arena, path: &ChunkStorePath) !ByteList {
+    var st: Stat = Stat{};
+    if stat(chunk_store_path_cstr(path) as &const byte, &st) != 0 {
+        if chunk_store_errno_is_permission() {
+            return error.ChunkStorePermissionDenied;
+        }
+        return error.ChunkStoreNotFound;
+    }
+    const size: usize = st.st_size as usize;
+    var want: usize = size;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.ChunkStoreAlloc;
+    }
+    const output: &[byte] = raw[0: size];
+
+    const file: File = file_open(chunk_store_path_cstr(path) as &const byte, O_RDONLY as i32, 0u32) catch {
+        if chunk_store_errno_is_permission() {
+            return error.ChunkStorePermissionDenied;
+        }
+        return error.ChunkStoreOpenFailed;
+    };
+    defer {
+        _ = file_close(&file) catch {};
+    }
+
+    var read_total: usize = 0 as usize;
+    while read_total < size {
+        const chunk: isize = file_read(&file, &output.ptr[read_total], size - read_total);
+        if chunk <= 0 {
+            return error.ChunkStoreReadFailed;
+        }
+        read_total = read_total + chunk as usize;
+    }
+    return ByteList{ ptr: output.ptr, len: output.len };
+}
+
+fn chunk_store_verify(storage_id: &Hash32, data: ByteList) !void {
+    const checksum: Hash32 = chunk_stored_checksum(data.ptr[0: data.len]);
+    if hash32_compare(&checksum, storage_id) != 0 {
+        return error.ChunkStoreHashMismatch;
+    }
+}
+
+fn chunk_store_make_put_result(storage_id: &Hash32, stored_size: usize) ChunkStorePutResult {
+    return ChunkStorePutResult{
+        storage_id: chunk_store_hash_clone(storage_id),
+        stored_size: stored_size as u32,
+        stored_checksum: chunk_store_hash_clone(storage_id),
+    };
+}
+
+export fn chunk_store_open(root_path: &const byte) !ChunkStore {
+    const root: ChunkStorePath = try chunk_store_path_from_cstr(root_path as &byte);
+    try chunk_store_ensure_dir(&root);
+    return ChunkStore{ root: root };
+}
+
+export fn chunk_store_storage_path(self: &ChunkStore, storage_id: &Hash32, out: &[byte]) !usize {
+    var dir_path: ChunkStorePath = chunk_store_path_empty();
+    var file_path: ChunkStorePath = chunk_store_path_empty();
+    var temp_path: ChunkStorePath = chunk_store_path_empty();
+    try chunk_store_build_paths(&self.root, storage_id, &dir_path, &file_path, &temp_path);
+    if out.len < file_path.len {
+        return error.ChunkStorePathTooLong;
+    }
+    var i: usize = 0 as usize;
+    while i < file_path.len {
+        out.ptr[i] = file_path.bytes[i];
+        i = i + 1 as usize;
+    }
+    return file_path.len;
+}
+
+export fn chunk_store_has(self: &ChunkStore, storage_id: &Hash32) !bool {
+    var dir_path: ChunkStorePath = chunk_store_path_empty();
+    var file_path: ChunkStorePath = chunk_store_path_empty();
+    var temp_path: ChunkStorePath = chunk_store_path_empty();
+    try chunk_store_build_paths(&self.root, storage_id, &dir_path, &file_path, &temp_path);
+    return chunk_store_path_exists(&file_path);
+}
+
+export fn chunk_store_get(self: &ChunkStore, storage_id: &Hash32, arena: &Arena) !ChunkStoreBytes {
+    var dir_path: ChunkStorePath = chunk_store_path_empty();
+    var file_path: ChunkStorePath = chunk_store_path_empty();
+    var temp_path: ChunkStorePath = chunk_store_path_empty();
+    try chunk_store_build_paths(&self.root, storage_id, &dir_path, &file_path, &temp_path);
+    const data: ByteList = try chunk_store_load_file_bytes(arena, &file_path);
+    try chunk_store_verify(storage_id, data);
+    return ChunkStoreBytes{ bytes: data };
+}
+
+export fn chunk_store_put(self: &ChunkStore, stored_bytes: &[byte]) !ChunkStorePutResult {
+    const storage_id: Hash32 = chunk_stored_checksum(stored_bytes);
+    if try chunk_store_has(self, &storage_id) {
+        return chunk_store_make_put_result(&storage_id, stored_bytes.len);
+    }
+
+    var dir_path: ChunkStorePath = chunk_store_path_empty();
+    var file_path: ChunkStorePath = chunk_store_path_empty();
+    var temp_path: ChunkStorePath = chunk_store_path_empty();
+    try chunk_store_build_paths(&self.root, &storage_id, &dir_path, &file_path, &temp_path);
+    try chunk_store_ensure_dir(&dir_path);
+
+    const file: File = file_open(chunk_store_path_cstr(&temp_path) as &const byte, (O_WRONLY | O_CREAT | O_EXCL) as i32, S_IRWXU as u32) catch {
+        if chunk_store_errno_is_permission() {
+            return error.ChunkStorePermissionDenied;
+        }
+        return error.ChunkStoreWriteFailed;
+    };
+    defer {
+        _ = file_close(&file) catch {};
+    }
+
+    if (try file_write(&file, stored_bytes.ptr as &const byte, stored_bytes.len)) != stored_bytes.len {
+        _ = unlink(chunk_store_path_cstr(&temp_path) as &const byte);
+        return error.ChunkStoreWriteFailed;
+    }
+
+    _ = file_close(&file) catch {
+        _ = unlink(chunk_store_path_cstr(&temp_path) as &const byte);
+        return error.ChunkStoreWriteFailed;
+    };
+
+    if rename(chunk_store_path_cstr(&temp_path) as &const byte, chunk_store_path_cstr(&file_path) as &const byte) != 0 {
+        if try chunk_store_has(self, &storage_id) {
+            _ = unlink(chunk_store_path_cstr(&temp_path) as &const byte);
+            return chunk_store_make_put_result(&storage_id, stored_bytes.len);
+        }
+        _ = unlink(chunk_store_path_cstr(&temp_path) as &const byte);
+        return error.ChunkStorePublishFailed;
+    }
+
+    return chunk_store_make_put_result(&storage_id, stored_bytes.len);
+}

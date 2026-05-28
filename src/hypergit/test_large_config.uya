@@ -1,0 +1,34 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+
+use large.config.LARGE_FILE_CHUNKED_BLOB_LARGE_THRESHOLD_BYTES;
+use large.config.LARGE_FILE_EXPLICIT_HYDRATE_THRESHOLD_BYTES;
+use large.config.LARGE_FILE_SMALL_BLOB_MAX_BYTES;
+use large.config.LargeFileStorageClass;
+use large.config.large_file_storage_class;
+use large.config.large_file_uses_small_blob;
+
+fn test_large_file_small_blob_threshold() !void {
+    try expect(large_file_uses_small_blob(0u64));
+    try expect(large_file_uses_small_blob(LARGE_FILE_SMALL_BLOB_MAX_BYTES));
+    try expect(!large_file_uses_small_blob(LARGE_FILE_SMALL_BLOB_MAX_BYTES + 1u64));
+}
+
+fn test_large_file_storage_classes_follow_design_bands() !void {
+    try expect(large_file_storage_class(LARGE_FILE_SMALL_BLOB_MAX_BYTES) == LargeFileStorageClass.SmallBlob);
+    try expect(large_file_storage_class(LARGE_FILE_SMALL_BLOB_MAX_BYTES + 1u64) == LargeFileStorageClass.ChunkedBlob);
+    try expect(large_file_storage_class(LARGE_FILE_CHUNKED_BLOB_LARGE_THRESHOLD_BYTES) == LargeFileStorageClass.ChunkedBlob);
+    try expect(large_file_storage_class(LARGE_FILE_CHUNKED_BLOB_LARGE_THRESHOLD_BYTES + 1u64) == LargeFileStorageClass.LargeChunkedBlob);
+    try expect(large_file_storage_class(LARGE_FILE_EXPLICIT_HYDRATE_THRESHOLD_BYTES) == LargeFileStorageClass.LargeChunkedBlob);
+    try expect(large_file_storage_class(LARGE_FILE_EXPLICIT_HYDRATE_THRESHOLD_BYTES + 1u64) == LargeFileStorageClass.ExplicitHydrateChunkedBlob);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Large File Config Tests");
+    run_test("large file small blob threshold", test_large_file_small_blob_threshold);
+    run_test("large file storage classes follow design bands", test_large_file_storage_classes_follow_design_bands);
+    return test_suite_end();
+}

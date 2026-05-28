@@ -256,12 +256,12 @@
 
 ## 15. Large File
 
-- [ ] 实现固定分块 chunker。
-- [ ] 实现 CDC chunker 原型。
-- [ ] 实现 chunk hash。
-- [ ] 实现 chunk store。
-- [ ] 实现 chunked blob meta。
-- [ ] 实现 large file threshold 配置。
+- [x] 实现固定分块 chunker。
+- [x] 实现 CDC chunker 原型。
+- [x] 实现 chunk hash。
+- [x] 实现 chunk store。
+- [x] 实现 chunked blob meta。
+- [x] 实现 large file threshold 配置。
 - [ ] 实现 large file add。
 - [ ] 实现 range read。
 - [ ] 实现 large file hydrate。

@@ -1,0 +1,86 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use libc.system;
+use core.codec.codec_hash_payload;
+use core.ids.Hash32;
+use core.ids.hash32_compare;
+use large.chunk_hash.ChunkHashes;
+use large.chunk_hash.chunk_hash_plain;
+use large.chunk_manifest.ChunkedBlobPart;
+use large.chunk_manifest.ChunkedBlobPartList;
+use large.chunk_manifest.chunked_blob_part_from_chunk;
+use large.chunk_manifest.chunked_blob_part_list_from_slice;
+use large.chunk_manifest.chunked_blob_payload_repository_default;
+use large.chunk_store.ChunkStore;
+use large.chunk_store.ChunkStorePutResult;
+use large.chunk_store.chunk_store_open;
+use large.chunk_store.chunk_store_put;
+use large.chunker.LargeChunkList;
+use large.chunker.fixed_chunk_bytes;
+use object.types.ChunkedBlobPayload;
+use object.types.ChunkingStrategy;
+use object.types.DedupeScope;
+use object.types.FileType;
+use object.types.StorageTier;
+use object.validate.validate_chunked_blob_payload;
+
+fn test_chunked_blob_meta_builds_valid_payload() !void {
+    try expect(system("rm -rf build/chunk-manifest-test && mkdir -p build/chunk-manifest-test") == 0);
+    const store: ChunkStore = try chunk_store_open("build/chunk-manifest-test/chunks");
+
+    var logical: [byte: 9] = ['a' as byte, 'b' as byte, 'c' as byte, 'd' as byte, 'e' as byte, 'f' as byte, 'g' as byte, 'h' as byte, 'i' as byte];
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const chunks: LargeChunkList = try fixed_chunk_bytes(&arena, logical[0: 9], 4u32);
+    try expect(chunks.len == 3 as usize);
+
+    const hashes_a: ChunkHashes = try chunk_hash_plain(&arena, chunks.ptr[0].bytes.ptr[0: chunks.ptr[0].bytes.len]);
+    const hashes_b: ChunkHashes = try chunk_hash_plain(&arena, chunks.ptr[1].bytes.ptr[0: chunks.ptr[1].bytes.len]);
+    const hashes_c: ChunkHashes = try chunk_hash_plain(&arena, chunks.ptr[2].bytes.ptr[0: chunks.ptr[2].bytes.len]);
+    const stored_a: ChunkStorePutResult = try chunk_store_put(&store, chunks.ptr[0].bytes.ptr[0: chunks.ptr[0].bytes.len]);
+    const stored_b: ChunkStorePutResult = try chunk_store_put(&store, chunks.ptr[1].bytes.ptr[0: chunks.ptr[1].bytes.len]);
+    const stored_c: ChunkStorePutResult = try chunk_store_put(&store, chunks.ptr[2].bytes.ptr[0: chunks.ptr[2].bytes.len]);
+
+    var parts_raw: [ChunkedBlobPart: 3] = [
+        chunked_blob_part_from_chunk(&chunks.ptr[0], &hashes_a, &stored_a, StorageTier.Hot),
+        chunked_blob_part_from_chunk(&chunks.ptr[1], &hashes_b, &stored_b, StorageTier.Hot),
+        chunked_blob_part_from_chunk(&chunks.ptr[2], &hashes_c, &stored_c, StorageTier.Hot),
+    ];
+    const parts: ChunkedBlobPartList = chunked_blob_part_list_from_slice(parts_raw[0: 3]);
+
+    const payload: ChunkedBlobPayload = try chunked_blob_payload_repository_default(
+        &arena,
+        logical[0: 9],
+        FileType.Binary,
+        ChunkingStrategy.Fixed,
+        parts);
+    try validate_chunked_blob_payload(&payload);
+    try expect(payload.chunk_count == 3u32);
+    try expect(payload.logical_size == 9u64);
+    try expect(payload.file_type == FileType.Binary);
+    try expect(payload.chunking_strategy == ChunkingStrategy.Fixed);
+    try expect(payload.dedupe_scope == DedupeScope.Repository);
+    try expect(payload.chunks.len == 3 as usize);
+    try expect(payload.chunks.ptr[0].offset == 0u64);
+    try expect(payload.chunks.ptr[1].offset == 4u64);
+    try expect(payload.chunks.ptr[2].offset == 8u64);
+    try expect(payload.chunks.ptr[2].logical_size == 1u32);
+    try expect(hash32_compare(&payload.chunks.ptr[0].storage_id, &stored_a.storage_id) == 0);
+    try expect(hash32_compare(&payload.chunks.ptr[1].checksum, &stored_b.stored_checksum) == 0);
+    const expected_fingerprint: Hash32 = codec_hash_payload(logical[0: 9]);
+    try expect(hash32_compare(&payload.content_fingerprint, &expected_fingerprint) == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Large Chunk Manifest Tests");
+    run_test("chunked blob meta builds valid payload", test_chunked_blob_meta_builds_valid_payload);
+    return test_suite_end();
+}
