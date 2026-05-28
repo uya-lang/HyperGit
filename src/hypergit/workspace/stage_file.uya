@@ -5,9 +5,21 @@ use std.io.file.fread;
 use std.io.file.fwrite;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
+use std.string.strlen;
 
+use libc.errno;
 use libc.free;
 use libc.malloc;
+use libc.rename;
+use libc.sys_close;
+use libc.sys_open;
+use libc.unlink;
+use libc.O_CREAT;
+use libc.O_EXCL;
+use libc.O_WRONLY;
+use libc.S_IRWXU;
+use libc.TimeSpec;
+use libc.sys_nanosleep;
 use core.codec.ByteSpan;
 use core.codec.codec_decode_bytes;
 use core.codec.codec_decode_i64;
@@ -43,6 +55,7 @@ export const STAGE_FILE_VERSION: u16 = 1u16;
 const STAGE_FILE_FLAGS: u16 = 0u16;
 const STAGE_FILE_HEADER_BYTES: usize = 56 as usize;
 const STAGE_FILE_MAX_BYTES: usize = 1048576 as usize;
+const STAGE_FILE_PATH_MAX: usize = 4096 as usize;
 
 error StageFileOpenFailed;
 error StageFileReadFailed;
@@ -52,6 +65,18 @@ error StageFileInvalid;
 error StageFileEntryCountMismatch;
 error StageFileTooLarge;
 error StageFileNotFound;
+error StageFilePathTooLong;
+error StageFileLockFailed;
+
+struct StageFilePath {
+    bytes: [byte: 4096] = [],
+    len: usize
+}
+
+export struct StageFileLock {
+    path: StageFilePath,
+    held: bool
+}
 
 fn stage_varuint_encoded_len(value: u64) usize {
     var temp: u64 = value;
@@ -162,22 +187,102 @@ fn stage_file_arena_bytes(arena: &Arena, len: usize) !&[byte] {
     return raw[0: len];
 }
 
+fn stage_file_path_from_cstr(path: &const byte) !StageFilePath {
+    if path == null {
+        return error.StageFileOpenFailed;
+    }
+    const len: usize = strlen(path);
+    if len + 1 as usize >= STAGE_FILE_PATH_MAX {
+        return error.StageFilePathTooLong;
+    }
+
+    var out: StageFilePath = StageFilePath{ bytes: [], len: len };
+    var i: usize = 0;
+    while i < len {
+        out.bytes[i] = path[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[len] = 0 as byte;
+    return out;
+}
+
+fn stage_file_path_with_suffix(base: &StageFilePath, suffix: &const byte) !StageFilePath {
+    const suffix_len: usize = strlen(suffix);
+    if base.len + suffix_len + 1 as usize >= STAGE_FILE_PATH_MAX {
+        return error.StageFilePathTooLong;
+    }
+
+    var out: StageFilePath = StageFilePath{ bytes: [], len: base.len + suffix_len };
+    var i: usize = 0;
+    while i < base.len {
+        out.bytes[i] = base.bytes[i];
+        i = i + 1 as usize;
+    }
+    var j: usize = 0;
+    while j < suffix_len {
+        out.bytes[base.len + j] = suffix[j];
+        j = j + 1 as usize;
+    }
+    out.bytes[out.len] = 0 as byte;
+    return out;
+}
+
+export fn stage_file_lock_acquire(path: &const byte) !StageFileLock {
+    const final_path: StageFilePath = try stage_file_path_from_cstr(path);
+    const lock_path: StageFilePath = try stage_file_path_with_suffix(&final_path, ".lock");
+
+    var attempts: usize = 0;
+    while attempts < 10000 as usize {
+        const lock_fd: i32 = sys_open(
+            &lock_path.bytes[0] as *const byte,
+            (O_WRONLY | O_CREAT | O_EXCL) as i32,
+            S_IRWXU as i32,
+        ) catch |err| {
+            if @error_id(err) == EEXIST {
+                var pause: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 1000000 };
+                var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+                _ = sys_nanosleep(&pause, &rem) catch {};
+                attempts = attempts + 1 as usize;
+                continue;
+            }
+            return error.StageFileLockFailed;
+        };
+        _ = sys_close(lock_fd) catch {
+            _ = unlink(&lock_path.bytes[0] as &const byte);
+            return error.StageFileLockFailed;
+        };
+        return StageFileLock{
+            path: lock_path,
+            held: true,
+        };
+    }
+    return error.StageFileLockFailed;
+}
+
+export fn stage_file_lock_release(lock: &StageFileLock) void {
+    if !lock.held {
+        return;
+    }
+    _ = unlink(&lock.path.bytes[0] as &const byte);
+    lock.held = false;
+}
+
 export fn stage_file_write(path: &const byte, snapshot: &StageSnapshot) !void {
     if path == null {
         return error.StageFileOpenFailed;
     }
 
+    const final_path: StageFilePath = try stage_file_path_from_cstr(path);
+    const temp_path: StageFilePath = try stage_file_path_with_suffix(&final_path, ".tmp");
     const total_len: usize = try stage_snapshot_encoded_len(snapshot);
-    const stream: &FILE = fopen(path, "w");
+    const stream: &FILE = fopen(&temp_path.bytes[0] as &const byte, "w");
     if stream == null {
         return error.StageFileOpenFailed;
-    }
-    defer {
-        _ = fclose(stream);
     }
 
     const payload: &byte = malloc(total_len) as &byte;
     if payload == null {
+        _ = fclose(stream);
         return error.StageFileAlloc;
     }
     defer {
@@ -211,6 +316,13 @@ export fn stage_file_write(path: &const byte, snapshot: &StageSnapshot) !void {
     }
 
     if fwrite(payload as &const byte, 1 as usize, offset, stream) != offset {
+        return error.StageFileWriteFailed;
+    }
+    if fclose(stream) != 0 {
+        return error.StageFileWriteFailed;
+    }
+    if rename(&temp_path.bytes[0] as &const byte, &final_path.bytes[0] as &const byte) != 0 {
+        _ = unlink(&temp_path.bytes[0] as &const byte);
         return error.StageFileWriteFailed;
     }
 }

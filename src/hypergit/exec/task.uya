@@ -1,0 +1,86 @@
+error ExecInvalidTaskKind;
+
+export enum TaskKind {
+    ReadObject,
+    WriteObject,
+    DiffShard,
+    MaterializePath,
+    FetchSegment,
+    HashFileRange,
+    MergeShard
+}
+
+export fn task_kind_max_value() u16 {
+    return 6 as u16;
+}
+
+export fn task_kind_to_u16(kind: TaskKind) u16 {
+    if kind == TaskKind.ReadObject {
+        return 0 as u16;
+    }
+    if kind == TaskKind.WriteObject {
+        return 1 as u16;
+    }
+    if kind == TaskKind.DiffShard {
+        return 2 as u16;
+    }
+    if kind == TaskKind.MaterializePath {
+        return 3 as u16;
+    }
+    if kind == TaskKind.FetchSegment {
+        return 4 as u16;
+    }
+    if kind == TaskKind.HashFileRange {
+        return 5 as u16;
+    }
+    return 6 as u16;
+}
+
+export fn task_kind_from_u16(value: u16) !TaskKind {
+    if value == 0 as u16 {
+        return TaskKind.ReadObject;
+    }
+    if value == 1 as u16 {
+        return TaskKind.WriteObject;
+    }
+    if value == 2 as u16 {
+        return TaskKind.DiffShard;
+    }
+    if value == 3 as u16 {
+        return TaskKind.MaterializePath;
+    }
+    if value == 4 as u16 {
+        return TaskKind.FetchSegment;
+    }
+    if value == 5 as u16 {
+        return TaskKind.HashFileRange;
+    }
+    if value == 6 as u16 {
+        return TaskKind.MergeShard;
+    }
+    return error.ExecInvalidTaskKind;
+}
+
+export struct Task {
+    id: u64,
+    kind: TaskKind,
+    priority: u16,
+    input_offset: u64,
+    input_len: u64
+}
+
+export fn task_init(
+    id: u64,
+    kind: TaskKind,
+    priority: u16,
+    input_offset: u64,
+    input_len: u64,
+) Task {
+    return Task{
+        id: id,
+        kind: kind,
+        priority: priority,
+        input_offset: input_offset,
+        input_len: input_len,
+    };
+}

@@ -90,6 +90,9 @@ use workspace.stage.stage_entry_has_staged_content;
 use workspace.stage.stage_snapshot_init;
 use workspace.stage.stage_state_with_entry_count;
 use workspace.stage.stage_zero_commit_id;
+use workspace.stage_file.StageFileLock;
+use workspace.stage_file.stage_file_lock_acquire;
+use workspace.stage_file.stage_file_lock_release;
 use workspace.stage_file.stage_file_read;
 use workspace.stage_file.stage_file_write;
 
@@ -461,6 +464,13 @@ export fn run_commit() i32 {
         fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
+    const stage_lock: StageFileLock = stage_file_lock_acquire(repo_path_cstr(&stage_path) as &const byte) catch {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    defer {
+        stage_file_lock_release(&stage_lock);
+    }
     const snapshot: StageSnapshot = commit_load_stage_snapshot(&stage_path, &arena) catch {
         fprintf(stderr, "%s" as *byte, COMMIT_NOTHING_STAGED_TEXT);
         return EXIT_RUNTIME_ERROR;

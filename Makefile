@@ -27,7 +27,12 @@ test:
 	$(UYA) test src/hypergit/test_large_chunk_manifest.uya
 	$(UYA) test src/hypergit/test_large_config.uya
 	$(UYA) test src/hypergit/test_large_range_read.uya
+	$(UYA) test src/hypergit/test_exec_task.uya
+	$(UYA) test src/hypergit/test_exec_queue.uya
+	$(UYA) test src/hypergit/test_exec_worker_pool.uya
 	$(UYA) test src/hypergit/test_merge_planner.uya
+	$(UYA) test src/hypergit/test_merge_text_merge.uya
+	$(UYA) test src/hypergit/test_merge_result_manifest.uya
 	$(UYA) test src/hypergit/test_manifest_path.uya
 	$(UYA) test src/hypergit/test_manifest_trie.uya
 	$(UYA) test src/hypergit/test_manifest_shard.uya
@@ -55,6 +60,7 @@ test:
 	$(UYA) test src/hgx/test_cli_args.uya
 	./tests/test_cli_golden.sh
 	./tests/test_add_stage.sh
+	./tests/test_add_stage_concurrent.sh
 	./tests/test_add_delete.sh
 	./tests/test_add_large_file.sh
 	./tests/test_add_large_file_small_edit.sh

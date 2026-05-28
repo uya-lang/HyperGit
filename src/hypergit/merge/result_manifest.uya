@@ -1,0 +1,336 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.ids.object_id_compare;
+use core.ids.policy_id_compare;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use manifest.root.manifest_root_build_and_store;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use merge.planner.MergePlanner;
+use merge.planner.MergePlannerDecisionKind;
+use merge.planner.MergePlannerEntry;
+use merge.planner.merge_planner_build;
+use merge.text_merge.merge_text_file_file_with_markers;
+use object.codec.decode_small_blob_object;
+use object.codec.small_blob_payload_to_canonical;
+use object.small_blob.small_blob_payload_from_bytes;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ObjectKind;
+use object.types.SmallBlobPayload;
+use store.loose_store.LooseObjectStore;
+use store.object_store.ObjectBytes;
+
+error MergeResultAlloc;
+error MergeResultDirectoryRenameConflict;
+error MergeResultStoreFailed;
+error MergeResultUnsupportedConflict;
+error MergeResultUnsupportedBlob;
+error MergeResultEmpty;
+
+export struct MergeResultManifest {
+    entries: ManifestLeafInputList,
+    manifest_id: ManifestId
+}
+
+fn merge_result_entry_copy(src: &ManifestLeafInputEntry) ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: ByteList{ ptr: src.path.ptr, len: src.path.len },
+        kind: src.kind,
+        mode: src.mode,
+        object_id: src.object_id,
+        logical_size: src.logical_size,
+        content_type: src.content_type,
+        policy_id: src.policy_id,
+    };
+}
+
+fn merge_result_path_equal(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn merge_result_leaf_equal(left: &ManifestLeafInputEntry, right: &ManifestLeafInputEntry) bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.mode != right.mode {
+        return false;
+    }
+    if object_id_compare(&left.object_id, &right.object_id) != 0 {
+        return false;
+    }
+    if left.logical_size != right.logical_size {
+        return false;
+    }
+    if left.content_type != right.content_type {
+        return false;
+    }
+    return policy_id_compare(&left.policy_id, &right.policy_id) == 0;
+}
+
+fn merge_result_find_entry_by_path(list: &ManifestLeafInputList, path: &ByteList) usize {
+    var i: usize = 0;
+    while i < list.len {
+        if merge_result_path_equal(&list.ptr[i].path, path) {
+            return i;
+        }
+        i = i + 1 as usize;
+    }
+    return list.len;
+}
+
+fn merge_result_parent_dir(path: &ByteList) ByteList {
+    var i: usize = path.len;
+    while i > 0 as usize {
+        i = i - 1 as usize;
+        if path.ptr[i] == '/' as byte {
+            return ByteList{ ptr: path.ptr, len: i };
+        }
+    }
+    return ByteList{ ptr: null, len: 0 };
+}
+
+fn merge_result_path_is_child_of_dir(path: &ByteList, dir: &ByteList) bool {
+    if dir.len == 0 as usize || dir.len >= path.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < dir.len {
+        if path.ptr[i] != dir.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return path.ptr[dir.len] == '/' as byte;
+}
+
+fn merge_result_has_directory_rename_conflict(
+    base: &ManifestLeafInputList,
+    renamed_side: &ManifestLeafInputList,
+    other_side: &ManifestLeafInputList,
+) bool {
+    var i: usize = 0;
+    while i < base.len {
+        const base_entry: &ManifestLeafInputEntry = &base.ptr[i];
+        if merge_result_find_entry_by_path(renamed_side, &base_entry.path) != renamed_side.len {
+            i = i + 1 as usize;
+            continue;
+        }
+
+        var moved_index: usize = renamed_side.len;
+        var j: usize = 0;
+        while j < renamed_side.len {
+            if !merge_result_path_equal(&renamed_side.ptr[j].path, &base_entry.path) &&
+                merge_result_leaf_equal(base_entry, &renamed_side.ptr[j]) {
+                moved_index = j;
+                break;
+            }
+            j = j + 1 as usize;
+        }
+        if moved_index == renamed_side.len {
+            i = i + 1 as usize;
+            continue;
+        }
+
+        const old_dir: ByteList = merge_result_parent_dir(&base_entry.path);
+        const new_dir: ByteList = merge_result_parent_dir(&renamed_side.ptr[moved_index].path);
+        if merge_result_path_equal(&old_dir, &new_dir) {
+            i = i + 1 as usize;
+            continue;
+        }
+
+        j = 0;
+        while j < other_side.len {
+            const other_entry: &ManifestLeafInputEntry = &other_side.ptr[j];
+            if merge_result_path_equal(&other_entry.path, &base_entry.path) {
+                j = j + 1 as usize;
+                continue;
+            }
+            if merge_result_path_is_child_of_dir(&other_entry.path, &old_dir) {
+                const base_match_index: usize = merge_result_find_entry_by_path(base, &other_entry.path);
+                if base_match_index == base.len ||
+                    !merge_result_leaf_equal(&base.ptr[base_match_index], other_entry) {
+                    return true;
+                }
+            }
+            j = j + 1 as usize;
+        }
+
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn merge_result_load_small_blob(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    entry: &ManifestLeafInputEntry,
+) !ByteList {
+    const object_bytes: ObjectBytes = store.get(entry.object_id, arena) catch {
+        return error.MergeResultStoreFailed;
+    };
+    var offset: usize = 0;
+    const payload: SmallBlobPayload = decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.MergeResultUnsupportedBlob;
+    };
+    if offset != object_bytes.bytes.len {
+        return error.MergeResultUnsupportedBlob;
+    }
+    return payload.payload;
+}
+
+fn merge_result_store_small_blob(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    bytes: &ByteList,
+) !ObjectId {
+    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(arena, bytes.ptr[0: bytes.len]);
+    const encoded: ByteList = try small_blob_payload_to_canonical(arena, &payload);
+    return store.put(ObjectKind.SmallBlob, encoded.ptr[0: encoded.len]) catch {
+        return error.MergeResultStoreFailed;
+    };
+}
+
+fn merge_result_render_text_entry(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    plan: &MergePlanner,
+    base: &ManifestLeafInputList,
+    ours: &ManifestLeafInputList,
+    theirs: &ManifestLeafInputList,
+    index: usize,
+) !ManifestLeafInputEntry {
+    const entry: &MergePlannerEntry = &plan.entries.ptr[index];
+    var base_bytes: ByteList = ByteList{ ptr: null, len: 0 };
+    var ours_bytes: ByteList = ByteList{ ptr: null, len: 0 };
+    var theirs_bytes: ByteList = ByteList{ ptr: null, len: 0 };
+
+    if entry.has_base {
+        base_bytes = try merge_result_load_small_blob(arena, store, &base.ptr[entry.base_index]);
+    }
+    if entry.has_ours {
+        ours_bytes = try merge_result_load_small_blob(arena, store, &ours.ptr[entry.ours_index]);
+    }
+    if entry.has_theirs {
+        theirs_bytes = try merge_result_load_small_blob(arena, store, &theirs.ptr[entry.theirs_index]);
+    }
+
+    const rendered: ByteList = try merge_text_file_file_with_markers(
+        arena,
+        &base_bytes,
+        &ours_bytes,
+        &theirs_bytes,
+    );
+    const stored_id: ObjectId = try merge_result_store_small_blob(arena, store, &rendered);
+
+    var out: ManifestLeafInputEntry = ManifestLeafInputEntry{
+        path: ByteList{ ptr: null, len: 0 },
+        kind: EntryKind.File,
+        mode: 0u32,
+        object_id: ObjectId{ hash: Hash32{ bytes: [] } },
+        logical_size: 0u64,
+        content_type: ContentType.Unknown,
+        policy_id: PolicyId{ id: ObjectId{ hash: Hash32{ bytes: [] } } },
+    };
+    if entry.has_ours {
+        out = merge_result_entry_copy(&ours.ptr[entry.ours_index]);
+    } else if entry.has_theirs {
+        out = merge_result_entry_copy(&theirs.ptr[entry.theirs_index]);
+    } else {
+        out = merge_result_entry_copy(&base.ptr[entry.base_index]);
+    }
+    out.path = ByteList{ ptr: entry.path.ptr, len: entry.path.len };
+    out.object_id = stored_id;
+    out.logical_size = rendered.len as u64;
+    out.content_type = ContentType.Utf8Text;
+    return out;
+}
+
+export fn merge_result_manifest_build_and_store(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    base: &ManifestLeafInputList,
+    ours: &ManifestLeafInputList,
+    theirs: &ManifestLeafInputList,
+) !MergeResultManifest {
+    if merge_result_has_directory_rename_conflict(base, ours, theirs) ||
+        merge_result_has_directory_rename_conflict(base, theirs, ours) {
+        return error.MergeResultDirectoryRenameConflict;
+    }
+
+    const plan: MergePlanner = try merge_planner_build(arena, base, ours, theirs);
+    if plan.entries.len == 0 as usize {
+        return error.MergeResultEmpty;
+    }
+
+    const raw_entries: &ManifestLeafInputEntry = arena_alloc(
+        arena,
+        @size_of(ManifestLeafInputEntry) as usize * plan.entries.len,
+    ) as &ManifestLeafInputEntry;
+    if raw_entries == null {
+        return error.MergeResultAlloc;
+    }
+
+    var out_len: usize = 0;
+    var i: usize = 0;
+    while i < plan.entries.len {
+        const entry: &MergePlannerEntry = &plan.entries.ptr[i];
+        if entry.decision == MergePlannerDecisionKind.TakeOurs {
+            if entry.has_ours {
+                raw_entries[out_len] = merge_result_entry_copy(&ours.ptr[entry.ours_index]);
+                out_len = out_len + 1 as usize;
+            }
+        } else if entry.decision == MergePlannerDecisionKind.TakeTheirs {
+            if entry.has_theirs {
+                raw_entries[out_len] = merge_result_entry_copy(&theirs.ptr[entry.theirs_index]);
+                out_len = out_len + 1 as usize;
+            }
+        } else if entry.decision == MergePlannerDecisionKind.KeepBase {
+            if entry.has_base {
+                raw_entries[out_len] = merge_result_entry_copy(&base.ptr[entry.base_index]);
+                out_len = out_len + 1 as usize;
+            }
+        } else if entry.decision == MergePlannerDecisionKind.MergeText {
+            raw_entries[out_len] = try merge_result_render_text_entry(
+                arena,
+                store,
+                &plan,
+                base,
+                ours,
+                theirs,
+                i,
+            );
+            out_len = out_len + 1 as usize;
+        } else {
+            return error.MergeResultUnsupportedConflict;
+        }
+        i = i + 1 as usize;
+    }
+
+    if out_len == 0 as usize {
+        return error.MergeResultEmpty;
+    }
+
+    const entries: ManifestLeafInputList = manifest_leaf_input_list_from_slice(raw_entries[0: out_len]);
+    const manifest_id: ManifestId = try manifest_root_build_and_store(arena, store, entries);
+    return MergeResultManifest{
+        entries: entries,
+        manifest_id: manifest_id,
+    };
+}

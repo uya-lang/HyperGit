@@ -69,6 +69,7 @@ use workspace.scan.WorkspaceFileEntry;
 use workspace.scan.WorkspaceFileKind;
 use workspace.scan.WorkspaceFileList;
 use workspace.scan.workspace_scan_files;
+use workspace.scan.workspace_scan_files_for_pathspecs;
 use workspace.stage.StageEntry;
 use workspace.stage.StageEntryKind;
 use workspace.stage.StageEntryList;
@@ -78,6 +79,9 @@ use workspace.stage.stage_entry_list_from_slice;
 use workspace.stage.stage_snapshot_init;
 use workspace.stage.stage_state_with_entry_count;
 use workspace.stage.stage_zero_commit_id;
+use workspace.stage_file.StageFileLock;
+use workspace.stage_file.stage_file_lock_acquire;
+use workspace.stage_file.stage_file_lock_release;
 use workspace.stage_file.stage_file_read;
 use workspace.stage_file.stage_file_write;
 
@@ -416,9 +420,20 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
     arena_init(&arena, arena_storage, ADD_ARENA_BYTES);
 
-    const scanned_files: WorkspaceFileList = try workspace_scan_files(&arena, repo_path_cstr(root) as &const byte);
+    const scan_pathspecs: ManifestPathspecList = ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len };
+    const scanned_files: WorkspaceFileList = try workspace_scan_files_for_pathspecs(
+        &arena,
+        repo_path_cstr(root) as &const byte,
+        scan_pathspecs,
+    );
 
     const stage_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STAGE_REL);
+    const stage_lock: StageFileLock = stage_file_lock_acquire(repo_path_cstr(&stage_path) as &const byte) catch {
+        return error.AddStageWriteFailed;
+    };
+    defer {
+        stage_file_lock_release(&stage_lock);
+    }
     const existing_snapshot: StageSnapshot = try add_load_existing_snapshot(&stage_path, &arena);
 
     const matched_count: usize = add_count_matches(&scanned_files, &pathspecs);

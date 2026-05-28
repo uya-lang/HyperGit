@@ -1,0 +1,221 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.system;
+use core.ids.Hash32;
+use core.ids.BlobId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.object_id_compare;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.load.manifest_load_flatten;
+use manifest.path.manifest_path_normalize;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use merge.result_manifest.MergeResultManifest;
+use merge.result_manifest.merge_result_manifest_build_and_store;
+use object.codec.decode_small_blob_object;
+use object.codec.small_blob_payload_to_canonical;
+use object.hash.hash_small_blob_payload;
+use object.small_blob.small_blob_payload_from_bytes;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ObjectKind;
+use object.types.SmallBlobPayload;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+
+error TestMergeResultAlloc;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(object_id_from_hash(make_hash(seed)));
+}
+
+fn store_small_text_entry(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    path_text: &const byte,
+    content_text: &const byte,
+    policy_seed: byte,
+) !ManifestLeafInputEntry {
+    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(arena, literal_bytes(content_text));
+    const encoded: ByteList = try small_blob_payload_to_canonical(arena, &payload);
+    const object_id: ObjectId = try store.put(ObjectKind.SmallBlob, encoded.ptr[0: encoded.len]);
+    return ManifestLeafInputEntry{
+        path: try manifest_path_normalize(arena, literal_bytes(path_text)),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: object_id,
+        logical_size: payload.logical_size,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id(policy_seed),
+    };
+}
+
+fn expected_small_blob_object_id(arena: &Arena, text: &const byte) !ObjectId {
+    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(arena, literal_bytes(text));
+    const blob_id: BlobId = try hash_small_blob_payload(arena, &payload);
+    return blob_id.id;
+}
+
+fn load_small_blob_bytes(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    object_id: &ObjectId,
+) !ByteList {
+    const object_bytes: ObjectBytes = try store.get(*object_id, arena);
+    var offset: usize = 0;
+    const payload: SmallBlobPayload = try decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    try expect(offset == object_bytes.bytes.len);
+    return payload.payload;
+}
+
+fn test_merge_result_manifest_stores_clean_text_merge() !void {
+    try expect(system("rm -rf build/merge-result-clean && mkdir -p build/merge-result-clean/objects/loose") == 0);
+    const store: LooseObjectStore = try loose_store_open("build/merge-result-clean/objects/loose");
+
+    var arena_buf: [byte: 33554432] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 33554432 as usize);
+
+    var base_raw: [ManifestLeafInputEntry: 1] = [
+        try store_small_text_entry(&arena, &store, "src/main.uya", "a\nb\n", 1 as byte)
+    ];
+    var ours_raw: [ManifestLeafInputEntry: 1] = [
+        try store_small_text_entry(&arena, &store, "src/main.uya", "a\nx\n", 2 as byte)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 1] = [
+        try store_small_text_entry(&arena, &store, "src/main.uya", "a\nb\n", 3 as byte)
+    ];
+    const base_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(base_raw[0: 1]);
+    const ours_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 1]);
+    const result: MergeResultManifest = try merge_result_manifest_build_and_store(
+        &arena,
+        &store,
+        &base_inputs,
+        &ours_inputs,
+        &theirs_inputs,
+    );
+    const flattened: ManifestLeafInputList = try manifest_load_flatten(&arena, &store, &result.manifest_id);
+
+    try expect(flattened.len == 1 as usize);
+    try expect_byte_list_eq(flattened.ptr[0].path, literal_bytes("src/main.uya"));
+    try expect(flattened.ptr[0].content_type == ContentType.Utf8Text);
+    const expected_id: ObjectId = try expected_small_blob_object_id(&arena, "a\nx\n");
+    try expect(object_id_compare(&flattened.ptr[0].object_id, &expected_id) == 0);
+}
+
+fn test_merge_result_manifest_stores_conflict_marker_blob() !void {
+    try expect(system("rm -rf build/merge-result-conflict && mkdir -p build/merge-result-conflict/objects/loose") == 0);
+    const store: LooseObjectStore = try loose_store_open("build/merge-result-conflict/objects/loose");
+
+    var arena_buf: [byte: 33554432] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 33554432 as usize);
+
+    var base_raw: [ManifestLeafInputEntry: 1] = [
+        try store_small_text_entry(&arena, &store, "src/main.uya", "a\nb\nc\n", 11 as byte)
+    ];
+    var ours_raw: [ManifestLeafInputEntry: 1] = [
+        try store_small_text_entry(&arena, &store, "src/main.uya", "a\nx\nc\n", 12 as byte)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 1] = [
+        try store_small_text_entry(&arena, &store, "src/main.uya", "a\ny\nc\n", 13 as byte)
+    ];
+    const base_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(base_raw[0: 1]);
+    const ours_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 1]);
+    const result: MergeResultManifest = try merge_result_manifest_build_and_store(
+        &arena,
+        &store,
+        &base_inputs,
+        &ours_inputs,
+        &theirs_inputs,
+    );
+    const flattened: ManifestLeafInputList = try manifest_load_flatten(&arena, &store, &result.manifest_id);
+
+    try expect(flattened.len == 1 as usize);
+    const blob_bytes: ByteList = try load_small_blob_bytes(&arena, &store, &flattened.ptr[0].object_id);
+    try expect_byte_list_eq(
+        blob_bytes,
+        literal_bytes("a\n<<<<<<< ours\nx\n||||||| base\nb\n=======\ny\n>>>>>>> theirs\nc\n"),
+    );
+}
+
+fn test_merge_result_manifest_directory_rename_conflict_placeholder() !void {
+    try expect(system("rm -rf build/merge-result-dir-rename && mkdir -p build/merge-result-dir-rename/objects/loose") == 0);
+    const store: LooseObjectStore = try loose_store_open("build/merge-result-dir-rename/objects/loose");
+
+    var arena_buf: [byte: 33554432] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 33554432 as usize);
+
+    var base_raw: [ManifestLeafInputEntry: 1] = [
+        try store_small_text_entry(&arena, &store, "src/lib/main.uya", "base\n", 21 as byte)
+    ];
+    var ours_raw: [ManifestLeafInputEntry: 1] = [
+        try store_small_text_entry(&arena, &store, "src/core/main.uya", "base\n", 21 as byte)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 2] = [
+        try store_small_text_entry(&arena, &store, "src/lib/helper.uya", "helper\n", 22 as byte),
+        try store_small_text_entry(&arena, &store, "src/lib/main.uya", "base\n", 21 as byte),
+    ];
+    const base_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(base_raw[0: 1]);
+    const ours_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 2]);
+
+    const result: MergeResultManifest = merge_result_manifest_build_and_store(
+        &arena,
+        &store,
+        &base_inputs,
+        &ours_inputs,
+        &theirs_inputs,
+    ) catch |err| {
+        try expect(@error_id(err) == @error_id(error.MergeResultDirectoryRenameConflict));
+        return;
+    };
+    _ = result;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Merge Result Manifest Tests");
+    run_test("merge result manifest stores clean text merge", test_merge_result_manifest_stores_clean_text_merge);
+    run_test("merge result manifest stores conflict marker blob", test_merge_result_manifest_stores_conflict_marker_blob);
+    run_test("merge result manifest directory rename conflict placeholder", test_merge_result_manifest_directory_rename_conflict_placeholder);
+    return test_suite_end();
+}

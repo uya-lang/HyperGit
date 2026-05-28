@@ -1,0 +1,53 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use exec.task.Task;
+use exec.task.TaskKind;
+use exec.task.task_init;
+use exec.task.task_kind_from_u16;
+use exec.task.task_kind_max_value;
+use exec.task.task_kind_to_u16;
+
+fn test_task_kind_roundtrip() !void {
+    var value: u16 = 0 as u16;
+    while value <= task_kind_max_value() {
+        const kind: TaskKind = try task_kind_from_u16(value);
+        try expect(task_kind_to_u16(kind) == value);
+        value = value + 1 as u16;
+    }
+}
+
+fn test_task_kind_rejects_invalid_value() !void {
+    const kind: TaskKind = task_kind_from_u16(7 as u16) catch |err| {
+        try expect(@error_id(err) == @error_id(error.ExecInvalidTaskKind));
+        return;
+    };
+    _ = kind;
+    return error.AssertionFailed;
+}
+
+fn test_task_init_sets_fields() !void {
+    const task: Task = task_init(
+        12u64,
+        TaskKind.MergeShard,
+        7 as u16,
+        4096u64,
+        2048u64,
+    );
+    try expect(task.id == 12u64);
+    try expect(task.kind == TaskKind.MergeShard);
+    try expect(task.priority == 7 as u16);
+    try expect(task.input_offset == 4096u64);
+    try expect(task.input_len == 2048u64);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Exec Task Tests");
+    run_test("task kind roundtrip", test_task_kind_roundtrip);
+    run_test("task kind rejects invalid value", test_task_kind_rejects_invalid_value);
+    run_test("task init sets fields", test_task_init_sets_fields);
+    return test_suite_end();
+}

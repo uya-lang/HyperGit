@@ -94,7 +94,7 @@ Uya 语言特性在本项目中的使用原则：
 - manifest 可分片，路径查询不全树扫描。
 - 工作区默认懒加载，文件内容按需 hydrate。
 - 索引是一等数据结构，但任何索引都可从权威对象重建。
-- 大操作拆成任务图，默认并行执行。
+- 大操作拆成任务图，目标是默认并行执行；在 worker pool 和取消/聚合语义未落地前，允许先以串行路径保证正确性。
 - 本地与远端共享同一对象模型，协议传输“视图和查询结果”，不只是裸对象。
 
 ## 4. 推荐源码布局
@@ -808,6 +808,24 @@ export struct StageState {
 - 删除、mode change、稀疏路径部分提交都通过 stage 表达，不能依赖“当前目录上恰好扫到了什么”。
 - 对尚未 hydrate 的未修改文件，stage 可以直接复用 manifest 中已有 `ObjectId`，不需要强制 materialize。
 
+当前落地状态：
+
+- 当前实现里的 `hgx add` 仍是单进程串行路径：先扫描工作区，再按匹配路径顺序生成对象，最后合并写回 `stage.hgi`。
+- loose object 和 chunk store 的对象发布已经按内容寻址去重，但 `stage.hgi` 还没有 repo-local lock、CAS 或版本校验语义。
+- 在补上 stage 原子发布之前，同一仓库并发执行多个 `hgx add` 不是已定义安全语义；未来即使接入 parallel hash/chunk，最终 stage publish 仍应保持单 writer。
+
+当前 `hgx add` 的主要耗时来源：
+
+- 即使 pathspec 很小，当前实现仍先全仓库枚举，再在内存里按 pathspec 过滤。
+- 对每个命中的文件，当前都重新读完整文件并计算对象 ID；还没有复用 `LocalChangeDB`、watcher journal 或 `(inode, mtime_ns, logical_size)` 元数据快速路径。
+- large file add 仍按单线程顺序执行 chunk 切分、hash 和 chunk store publish。
+
+`hgx add` 的优化顺序建议：
+
+1. 先做 pathspec 定向扫描，让 `hgx add src/main.uya` 只触达目标文件或目标子树，而不是全仓库 walk。
+2. 再做 metadata fast path：对于未变化的 materialized file，直接复用已有 working hash / object id，避免重复全量 hash。
+3. 最后接入 parallel object compute：把多文件 hash、大文件 chunk/hash/store 并行化，但 stage publish 仍保持单 writer。
+
 ### 13.2 本地变更数据库
 
 本地变更数据库：
@@ -848,6 +866,11 @@ export struct LocalChange {
 
 HyperGit 的重操作都通过 planner 生成任务图，再交给 worker pool 执行。
 
+当前代码状态：
+
+- `TaskKind` 和基础任务元数据已经存在，但 worker pool、错误聚合、取消和大部分命令接入仍未完成。
+- 因此现在的 `hgx add`、`manifest diff`、`checkout` 等命令可以先保持串行实现；这里描述的是目标执行模型，不表示这些路径都已经并行化。
+
 ```uya
 export enum TaskKind {
     ReadObject,
@@ -883,6 +906,11 @@ export struct Task {
 - fetch/push：按 segment 并行。
 - 大文件 hash/chunk/upload：按 range 或 chunk 并行。
 - merge：全局 namespace preflight 后按独立 shard 并行。
+
+对于 `hgx add`，更合适的分层是：
+
+- 对象计算层可以并行：大文件 chunk 切分、range hash、chunk store publish、工作区 hash 计算。
+- stage 更新层保持串行：把并行任务产出的 `StageEntry` 聚合后，经过锁或 CAS 校验，再一次性发布新的 `stage.hgi`。
 
 ## 15. Diff 与 Merge
 
@@ -1025,7 +1053,7 @@ hgx doctor
 - 算法测试：manifest diff、merge conflict、large file chunking。
 - 协议测试：frame encode/decode、file remote fetch/push、HTTP remote smoke。
 - 属性测试：随机 manifest roundtrip、随机对象 codec roundtrip、随机 pathspec query。
-- 性能基准：百万路径 manifest query、segment lookup、parallel materialize。
+- 性能基准：百万路径 manifest query、segment lookup、parallel materialize、`hgx add` 单文件 pathspec 延迟、重复 add metadata fast path 命中率。
 
 Uya 命令建议：
 

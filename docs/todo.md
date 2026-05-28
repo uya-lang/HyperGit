@@ -165,6 +165,11 @@
 - [x] 实现 small blob hash。
 - [x] 实现 `hgx add <pathspec>`。
 - [x] 实现 staging metadata。
+- [x] `hgx add` 按 pathspec 定向扫描，避免单文件 add 触发全仓库枚举。
+- [ ] `hgx add` 复用 `LocalChangeDB` / `(inode, mtime_ns, logical_size)` 快速路径，未改文件不重复全量 hash。
+- [x] 为 `workspace/stage.hgi` 增加原子发布语义（repo-local lock 或 CAS）。
+- [x] 测试两个 `hgx add` 并发更新 stage 不丢 staging 结果。
+- [ ] 测试 `hgx add <pathspec>` 不遍历无关目录（包括无关大目录和无关权限受限目录）。
 - [x] 实现 staged / unstaged 状态分离输出。
 - [x] 实现 manifest root 构建。
 - [x] 实现 commit object 构建。
@@ -274,29 +279,30 @@
 
 - [x] 实现 merge planner 数据结构。
 - [x] 实现 base/ours/theirs manifest 对齐。
-- [ ] 实现 namespace preflight。
-- [ ] 实现 file/file text merge。
-- [ ] 实现 delete/modify 冲突。
-- [ ] 实现 file/dir 冲突。
-- [ ] 实现 binary merge 保守策略。
-- [ ] 实现 conflict marker 输出。
-- [ ] 实现 merge result manifest。
-- [ ] 测试无冲突合并。
-- [ ] 测试同文件冲突。
-- [ ] 测试目录 rename 冲突占位。
+- [x] 实现 namespace preflight。
+- [x] 实现 file/file text merge。
+- [x] 实现 delete/modify 冲突。
+- [x] 实现 file/dir 冲突。
+- [x] 实现 binary merge 保守策略。
+- [x] 实现 conflict marker 输出。
+- [x] 实现 merge result manifest。
+- [x] 测试无冲突合并。
+- [x] 测试同文件冲突。
+- [x] 测试目录 rename 冲突占位。
 
 ## 17. Parallel Execution
 
-- [ ] 实现 `TaskKind`。
-- [ ] 实现任务队列。
-- [ ] 实现 worker pool。
+- [x] 实现 `TaskKind`。
+- [x] 实现任务队列。
+- [x] 实现 worker pool。
 - [ ] 实现 atomic 进度计数。
 - [ ] 实现任务错误聚合。
 - [ ] 实现 graceful shutdown。
 - [ ] 接入 parallel manifest diff。
 - [ ] 接入 parallel checkout。
 - [ ] 接入 parallel pack read。
-- [ ] 接入 parallel large file hash。
+- [ ] 接入 parallel large file hash（覆盖 `hgx add` / worktree hash 路径）。
+- [ ] 约束 parallel `hgx add` 只并行对象计算，最终 stage publish 保持单 writer。
 - [ ] 测试单 worker 和多 worker 结果一致。
 - [ ] 测试任务失败能正确取消后续任务。
 
@@ -363,6 +369,9 @@
 - [ ] 基准 loose object get。
 - [ ] 基准 segment pack lookup。
 - [ ] 基准 small file commit。
+- [ ] 基准单文件 `hgx add <pathspec>`（大 worktree，小 pathspec）。
+- [ ] 基准目录 `hgx add <pathspec>`（大 worktree，小目录）。
+- [ ] 基准重复 `hgx add` 命中 metadata fast path。
 - [ ] 基准 large file chunk。
 - [ ] 基准 hydrate。
 - [ ] 记录每次基准命令和机器信息。

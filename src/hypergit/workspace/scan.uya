@@ -10,7 +10,9 @@ use libc.errno;
 use libc.opendir;
 use libc.readdir;
 use libc.EACCES;
+use libc.ENOENT;
 use libc.EPERM;
+use manifest.query.ManifestPathspecList;
 use manifest.path.manifest_path_compare;
 use manifest.path.manifest_path_normalize;
 use object.types.ByteList;
@@ -85,6 +87,22 @@ fn workspace_scan_path_from_cstr(text: &const byte) !WorkspaceScanPath {
     }
     out.bytes[len] = 0 as byte;
     out.len = len;
+    return out;
+}
+
+fn workspace_scan_path_from_byte_list(text: &ByteList) !WorkspaceScanPath {
+    if text.len + 1 as usize >= WORKSPACE_SCAN_PATH_MAX {
+        return error.WorkspaceScanPathTooLong;
+    }
+
+    var out: WorkspaceScanPath = workspace_scan_path_empty();
+    var i: usize = 0;
+    while i < text.len {
+        out.bytes[i] = text.ptr[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[text.len] = 0 as byte;
+    out.len = text.len;
     return out;
 }
 
@@ -389,6 +407,67 @@ fn workspace_scan_validate_unique_paths(entries: &WorkspaceFileEntry, len: usize
     }
 }
 
+fn workspace_scan_count_path(root: &WorkspaceScanPath, relative: &WorkspaceScanPath) !usize {
+    if relative.len == 0 as usize {
+        return workspace_scan_count_files(root, relative);
+    }
+
+    const target_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
+    var st: Stat = Stat{};
+    _ = sys_lstat(&target_path.bytes[0] as &const byte, &st) catch |err| {
+        if @error_id(err) == ENOENT as u32 {
+            return 0 as usize;
+        }
+        return error.WorkspaceScanStatFailed;
+    };
+
+    const mode_type: u32 = workspace_scan_mode_type(st.st_mode as u32);
+    if mode_type == WORKSPACE_SCAN_STAT_S_IFDIR {
+        return workspace_scan_count_files(root, relative);
+    }
+    _ = try workspace_scan_kind_from_mode(st.st_mode as u32);
+    return 1 as usize;
+}
+
+fn workspace_scan_collect_single(arena: &Arena, root: &WorkspaceScanPath, relative: &WorkspaceScanPath, entries: &WorkspaceFileEntry, next_index: &usize) !void {
+    const target_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
+    var st: Stat = Stat{};
+    _ = sys_lstat(&target_path.bytes[0] as &const byte, &st) catch |err| {
+        if @error_id(err) == ENOENT as u32 {
+            return;
+        }
+        return error.WorkspaceScanStatFailed;
+    };
+
+    const normalized_path: ByteList = try manifest_path_normalize(arena, relative.bytes[0: relative.len]);
+    entries[*next_index] = WorkspaceFileEntry{
+        path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
+        kind: try workspace_scan_kind_from_mode(st.st_mode as u32),
+        file_mode: workspace_scan_canonical_mode(st.st_mode as u32),
+        logical_size: workspace_scan_logical_size(&st),
+        inode: workspace_scan_inode(&st),
+        mtime_ns: workspace_scan_mtime_ns(&st),
+    };
+    *next_index = *next_index + 1 as usize;
+}
+
+fn workspace_scan_compact_unique_entries(entries: &WorkspaceFileEntry, len: usize) usize {
+    if len == 0 as usize {
+        return 0 as usize;
+    }
+
+    var out_len: usize = 1 as usize;
+    var i: usize = 1 as usize;
+    while i < len {
+        if workspace_scan_entry_compare(&entries[out_len - 1 as usize], &entries[i]) != 0 {
+            entries[out_len] = entries[i];
+            out_len = out_len + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return out_len;
+}
+
 export fn workspace_scan_files(arena: &Arena, root_path: &const byte) !WorkspaceFileList {
     const root: WorkspaceScanPath = try workspace_scan_path_from_cstr(root_path);
     const empty_relative: WorkspaceScanPath = workspace_scan_path_empty();
@@ -411,4 +490,66 @@ export fn workspace_scan_files(arena: &Arena, root_path: &const byte) !Workspace
     try workspace_scan_sort_entries(arena, raw_entries, file_count);
     try workspace_scan_validate_unique_paths(raw_entries, file_count);
     return workspace_file_list_from_slice(raw_entries[0: file_count]);
+}
+
+export fn workspace_scan_files_for_pathspecs(
+    arena: &Arena,
+    root_path: &const byte,
+    pathspecs: ManifestPathspecList,
+) !WorkspaceFileList {
+    if pathspecs.len == 0 as usize {
+        return workspace_scan_files(arena, root_path);
+    }
+
+    const root: WorkspaceScanPath = try workspace_scan_path_from_cstr(root_path);
+    const empty_relative: WorkspaceScanPath = workspace_scan_path_empty();
+    var total_count: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < pathspecs.len {
+        const relative: WorkspaceScanPath = try workspace_scan_path_from_byte_list(&pathspecs.ptr[i]);
+        total_count = total_count + (try workspace_scan_count_path(&root, &relative));
+        i = i + 1 as usize;
+    }
+    if total_count == 0 as usize {
+        return WorkspaceFileList{ ptr: null, len: 0 };
+    }
+
+    const raw_entries: &WorkspaceFileEntry = arena_alloc(arena, @size_of(WorkspaceFileEntry) as usize * total_count) as &WorkspaceFileEntry;
+    if raw_entries == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var next_index: usize = 0 as usize;
+    i = 0 as usize;
+    while i < pathspecs.len {
+        const pathspec: &ByteList = &pathspecs.ptr[i];
+        if pathspec.len == 0 as usize {
+            try workspace_scan_collect_files(arena, &root, &empty_relative, raw_entries, &next_index);
+        } else {
+            const relative: WorkspaceScanPath = try workspace_scan_path_from_byte_list(pathspec);
+            const target_path: WorkspaceScanPath = try workspace_scan_path_join(&root, relative.bytes[0: relative.len]);
+            var st: Stat = Stat{};
+            _ = sys_lstat(&target_path.bytes[0] as &const byte, &st) catch |err| {
+                if @error_id(err) == ENOENT as u32 {
+                    i = i + 1 as usize;
+                    continue;
+                }
+                return error.WorkspaceScanStatFailed;
+            };
+            if workspace_scan_mode_type(st.st_mode as u32) == WORKSPACE_SCAN_STAT_S_IFDIR {
+                try workspace_scan_collect_files(arena, &root, &relative, raw_entries, &next_index);
+            } else {
+                try workspace_scan_collect_single(arena, &root, &relative, raw_entries, &next_index);
+            }
+        }
+        i = i + 1 as usize;
+    }
+
+    if next_index > total_count {
+        return error.WorkspaceScanCountMismatch;
+    }
+    try workspace_scan_sort_entries(arena, raw_entries, next_index);
+    const compact_len: usize = workspace_scan_compact_unique_entries(raw_entries, next_index);
+    try workspace_scan_validate_unique_paths(raw_entries, compact_len);
+    return workspace_file_list_from_slice(raw_entries[0: compact_len]);
 }

@@ -1,0 +1,474 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use object.types.ByteList;
+
+error MergeTextAlloc;
+
+struct MergeTextLineList {
+    ptr: &ByteList,
+    len: usize
+}
+
+struct MergeTextChangeSpan {
+    start: usize,
+    base_end: usize,
+    side_end: usize
+}
+
+export enum MergeTextResultKind {
+    Clean,
+    Conflict
+}
+
+export struct MergeTextResult {
+    kind: MergeTextResultKind,
+    merged: ByteList
+}
+
+fn merge_text_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.MergeTextAlloc;
+    }
+    return raw[0: len];
+}
+
+fn merge_text_byte_list_equal(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn merge_text_line_list_equal(left: &MergeTextLineList, right: &MergeTextLineList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if !merge_text_byte_list_equal(&left.ptr[i], &right.ptr[i]) {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn merge_text_line_count(value: &ByteList) usize {
+    if value.len == 0 as usize || value.ptr == null {
+        return 0 as usize;
+    }
+
+    var count: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while i < value.len {
+        if value.ptr[i] == '\n' as byte {
+            count = count + 1 as usize;
+            start = i + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    if start < value.len {
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn merge_text_split_lines(arena: &Arena, value: &ByteList) !MergeTextLineList {
+    const line_count: usize = merge_text_line_count(value);
+    if line_count == 0 as usize {
+        return MergeTextLineList{ ptr: null, len: 0 };
+    }
+
+    const raw: &ByteList = arena_alloc(arena, @size_of(ByteList) as usize * line_count) as &ByteList;
+    if raw == null {
+        return error.MergeTextAlloc;
+    }
+
+    var start: usize = 0;
+    var out_index: usize = 0;
+    var i: usize = 0;
+    while i < value.len {
+        if value.ptr[i] == '\n' as byte {
+            raw[out_index] = ByteList{
+                ptr: &value.ptr[start],
+                len: i + 1 as usize - start,
+            };
+            out_index = out_index + 1 as usize;
+            start = i + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    if start < value.len {
+        raw[out_index] = ByteList{
+            ptr: &value.ptr[start],
+            len: value.len - start,
+        };
+        out_index = out_index + 1 as usize;
+    }
+    return MergeTextLineList{ ptr: raw, len: out_index };
+}
+
+fn merge_text_common_prefix(base: &MergeTextLineList, side: &MergeTextLineList) usize {
+    var limit: usize = base.len;
+    if side.len < limit {
+        limit = side.len;
+    }
+
+    var count: usize = 0;
+    while count < limit {
+        if !merge_text_byte_list_equal(&base.ptr[count], &side.ptr[count]) {
+            break;
+        }
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn merge_text_common_suffix(base: &MergeTextLineList, side: &MergeTextLineList, prefix: usize) usize {
+    var base_remaining: usize = base.len - prefix;
+    var side_remaining: usize = side.len - prefix;
+    var count: usize = 0;
+    while count < base_remaining && count < side_remaining {
+        const base_index: usize = base.len - 1 as usize - count;
+        const side_index: usize = side.len - 1 as usize - count;
+        if !merge_text_byte_list_equal(&base.ptr[base_index], &side.ptr[side_index]) {
+            break;
+        }
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn merge_text_detect_change(base: &MergeTextLineList, side: &MergeTextLineList) MergeTextChangeSpan {
+    const prefix: usize = merge_text_common_prefix(base, side);
+    const suffix: usize = merge_text_common_suffix(base, side, prefix);
+    return MergeTextChangeSpan{
+        start: prefix,
+        base_end: base.len - suffix,
+        side_end: side.len - suffix,
+    };
+}
+
+fn merge_text_range_equal(
+    left: &MergeTextLineList,
+    left_start: usize,
+    left_end: usize,
+    right: &MergeTextLineList,
+    right_start: usize,
+    right_end: usize,
+) bool {
+    if left_end - left_start != right_end - right_start {
+        return false;
+    }
+
+    var i: usize = 0;
+    while i < left_end - left_start {
+        if !merge_text_byte_list_equal(&left.ptr[left_start + i], &right.ptr[right_start + i]) {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn merge_text_range_len(lines: &MergeTextLineList, start: usize, end: usize) usize {
+    var total: usize = 0;
+    var i: usize = start;
+    while i < end {
+        total = total + lines.ptr[i].len;
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn merge_text_copy_range(
+    out: &[byte],
+    offset: &usize,
+    lines: &MergeTextLineList,
+    start: usize,
+    end: usize,
+) void {
+    var i: usize = start;
+    while i < end {
+        const line: &ByteList = &lines.ptr[i];
+        var j: usize = 0;
+        while j < line.len {
+            out.ptr[*offset + j] = line.ptr[j];
+            j = j + 1 as usize;
+        }
+        *offset = *offset + line.len;
+        i = i + 1 as usize;
+    }
+}
+
+fn merge_text_copy_literal(out: &[byte], offset: &usize, literal: &[const byte]) void {
+    var i: usize = 0;
+    while i < literal.len {
+        out.ptr[*offset + i] = literal.ptr[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + literal.len;
+}
+
+fn merge_text_join_five_ranges(
+    arena: &Arena,
+    a_lines: &MergeTextLineList,
+    a_start: usize,
+    a_end: usize,
+    b_lines: &MergeTextLineList,
+    b_start: usize,
+    b_end: usize,
+    c_lines: &MergeTextLineList,
+    c_start: usize,
+    c_end: usize,
+    d_lines: &MergeTextLineList,
+    d_start: usize,
+    d_end: usize,
+    e_lines: &MergeTextLineList,
+    e_start: usize,
+    e_end: usize,
+) !ByteList {
+    const total_len: usize = merge_text_range_len(a_lines, a_start, a_end) +
+        merge_text_range_len(b_lines, b_start, b_end) +
+        merge_text_range_len(c_lines, c_start, c_end) +
+        merge_text_range_len(d_lines, d_start, d_end) +
+        merge_text_range_len(e_lines, e_start, e_end);
+    const out: &[byte] = try merge_text_arena_bytes(arena, total_len);
+    var offset: usize = 0;
+    merge_text_copy_range(out, &offset, a_lines, a_start, a_end);
+    merge_text_copy_range(out, &offset, b_lines, b_start, b_end);
+    merge_text_copy_range(out, &offset, c_lines, c_start, c_end);
+    merge_text_copy_range(out, &offset, d_lines, d_start, d_end);
+    merge_text_copy_range(out, &offset, e_lines, e_start, e_end);
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn merge_text_full_copy(arena: &Arena, lines: &MergeTextLineList) !ByteList {
+    const empty: MergeTextLineList = MergeTextLineList{ ptr: null, len: 0 };
+    return merge_text_join_five_ranges(
+        arena,
+        lines,
+        0 as usize,
+        lines.len,
+        &empty,
+        0 as usize,
+        0 as usize,
+        &empty,
+        0 as usize,
+        0 as usize,
+        &empty,
+        0 as usize,
+        0 as usize,
+        &empty,
+        0 as usize,
+        0 as usize,
+    );
+}
+
+fn merge_text_spans_are_disjoint(left: &MergeTextChangeSpan, right: &MergeTextChangeSpan) bool {
+    if left.base_end < right.start || right.base_end < left.start {
+        return true;
+    }
+    if left.base_end == right.start {
+        return !(left.start == left.base_end &&
+            right.start == right.base_end &&
+            left.start == right.start);
+    }
+    if right.base_end == left.start {
+        return !(left.start == left.base_end &&
+            right.start == right.base_end &&
+            left.start == right.start);
+    }
+    return false;
+}
+
+fn merge_text_join_disjoint_changes(
+    arena: &Arena,
+    base_lines: &MergeTextLineList,
+    first_side_lines: &MergeTextLineList,
+    first_change: &MergeTextChangeSpan,
+    second_side_lines: &MergeTextLineList,
+    second_change: &MergeTextChangeSpan,
+) !ByteList {
+    return merge_text_join_five_ranges(
+        arena,
+        base_lines,
+        0 as usize,
+        first_change.start,
+        first_side_lines,
+        first_change.start,
+        first_change.side_end,
+        base_lines,
+        first_change.base_end,
+        second_change.start,
+        second_side_lines,
+        second_change.start,
+        second_change.side_end,
+        base_lines,
+        second_change.base_end,
+        base_lines.len,
+    );
+}
+
+fn merge_text_min_usize(left: usize, right: usize) usize {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+fn merge_text_max_usize(left: usize, right: usize) usize {
+    if left > right {
+        return left;
+    }
+    return right;
+}
+
+export fn merge_text_file_file(
+    arena: &Arena,
+    base: &ByteList,
+    ours: &ByteList,
+    theirs: &ByteList,
+) !MergeTextResult {
+    const base_lines: MergeTextLineList = try merge_text_split_lines(arena, base);
+    const ours_lines: MergeTextLineList = try merge_text_split_lines(arena, ours);
+    const theirs_lines: MergeTextLineList = try merge_text_split_lines(arena, theirs);
+
+    if merge_text_line_list_equal(&ours_lines, &theirs_lines) {
+        return MergeTextResult{
+            kind: MergeTextResultKind.Clean,
+            merged: try merge_text_full_copy(arena, &ours_lines),
+        };
+    }
+    if merge_text_line_list_equal(&base_lines, &ours_lines) {
+        return MergeTextResult{
+            kind: MergeTextResultKind.Clean,
+            merged: try merge_text_full_copy(arena, &theirs_lines),
+        };
+    }
+    if merge_text_line_list_equal(&base_lines, &theirs_lines) {
+        return MergeTextResult{
+            kind: MergeTextResultKind.Clean,
+            merged: try merge_text_full_copy(arena, &ours_lines),
+        };
+    }
+
+    const ours_change: MergeTextChangeSpan = merge_text_detect_change(&base_lines, &ours_lines);
+    const theirs_change: MergeTextChangeSpan = merge_text_detect_change(&base_lines, &theirs_lines);
+    if ours_change.start == theirs_change.start &&
+        ours_change.base_end == theirs_change.base_end &&
+        merge_text_range_equal(
+            &ours_lines,
+            ours_change.start,
+            ours_change.side_end,
+            &theirs_lines,
+            theirs_change.start,
+            theirs_change.side_end,
+        ) {
+        return MergeTextResult{
+            kind: MergeTextResultKind.Clean,
+            merged: try merge_text_full_copy(arena, &ours_lines),
+        };
+    }
+
+    if merge_text_spans_are_disjoint(&ours_change, &theirs_change) {
+        if ours_change.start < theirs_change.start ||
+            (ours_change.start == theirs_change.start &&
+                ours_change.base_end == ours_change.start &&
+                theirs_change.base_end > theirs_change.start) {
+            return MergeTextResult{
+                kind: MergeTextResultKind.Clean,
+                merged: try merge_text_join_disjoint_changes(
+                    arena,
+                    &base_lines,
+                    &ours_lines,
+                    &ours_change,
+                    &theirs_lines,
+                    &theirs_change,
+                ),
+            };
+        }
+        if theirs_change.start < ours_change.start ||
+            (theirs_change.start == ours_change.start &&
+                theirs_change.base_end == theirs_change.start &&
+                ours_change.base_end > ours_change.start) {
+            return MergeTextResult{
+                kind: MergeTextResultKind.Clean,
+                merged: try merge_text_join_disjoint_changes(
+                    arena,
+                    &base_lines,
+                    &theirs_lines,
+                    &theirs_change,
+                    &ours_lines,
+                    &ours_change,
+                ),
+            };
+        }
+    }
+
+    return MergeTextResult{
+        kind: MergeTextResultKind.Conflict,
+        merged: ByteList{ ptr: null, len: 0 },
+    };
+}
+
+export fn merge_text_file_file_with_markers(
+    arena: &Arena,
+    base: &ByteList,
+    ours: &ByteList,
+    theirs: &ByteList,
+) !ByteList {
+    const merged: MergeTextResult = try merge_text_file_file(arena, base, ours, theirs);
+    if merged.kind == MergeTextResultKind.Clean {
+        return merged.merged;
+    }
+
+    const ours_marker: &[const byte] = "<<<<<<< ours\n";
+    const base_marker: &[const byte] = "||||||| base\n";
+    const split_marker: &[const byte] = "=======\n";
+    const theirs_marker: &[const byte] = ">>>>>>> theirs\n";
+
+    const base_lines: MergeTextLineList = try merge_text_split_lines(arena, base);
+    const ours_lines: MergeTextLineList = try merge_text_split_lines(arena, ours);
+    const theirs_lines: MergeTextLineList = try merge_text_split_lines(arena, theirs);
+    const ours_change: MergeTextChangeSpan = merge_text_detect_change(&base_lines, &ours_lines);
+    const theirs_change: MergeTextChangeSpan = merge_text_detect_change(&base_lines, &theirs_lines);
+    const conflict_start: usize = merge_text_min_usize(ours_change.start, theirs_change.start);
+    const conflict_base_end: usize = merge_text_max_usize(ours_change.base_end, theirs_change.base_end);
+
+    const total_len: usize = merge_text_range_len(&base_lines, 0 as usize, conflict_start) +
+        ours_marker.len +
+        merge_text_range_len(&ours_lines, conflict_start, ours_change.side_end) +
+        base_marker.len +
+        merge_text_range_len(&base_lines, conflict_start, conflict_base_end) +
+        split_marker.len +
+        merge_text_range_len(&theirs_lines, conflict_start, theirs_change.side_end) +
+        theirs_marker.len +
+        merge_text_range_len(&base_lines, conflict_base_end, base_lines.len);
+    const out: &[byte] = try merge_text_arena_bytes(arena, total_len);
+    var offset: usize = 0;
+    merge_text_copy_range(out, &offset, &base_lines, 0 as usize, conflict_start);
+    merge_text_copy_literal(out, &offset, ours_marker);
+    merge_text_copy_range(out, &offset, &ours_lines, conflict_start, ours_change.side_end);
+    merge_text_copy_literal(out, &offset, base_marker);
+    merge_text_copy_range(out, &offset, &base_lines, conflict_start, conflict_base_end);
+    merge_text_copy_literal(out, &offset, split_marker);
+    merge_text_copy_range(out, &offset, &theirs_lines, conflict_start, theirs_change.side_end);
+    merge_text_copy_literal(out, &offset, theirs_marker);
+    merge_text_copy_range(out, &offset, &base_lines, conflict_base_end, base_lines.len);
+    return ByteList{ ptr: out.ptr, len: out.len };
+}

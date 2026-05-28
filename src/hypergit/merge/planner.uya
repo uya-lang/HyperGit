@@ -1,9 +1,14 @@
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 
+use core.ids.object_id_compare;
+use core.ids.policy_id_compare;
 use manifest.path.manifest_path_compare;
+use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
 use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
 
 error MergePlannerAlloc;
 
@@ -79,6 +84,21 @@ export fn merge_planner_init(entries: MergePlannerEntryList, blocks: MergePlanne
     };
 }
 
+fn merge_planner_path_is_strict_descendant(parent: &ByteList, child: &ByteList) bool {
+    if parent.len == 0 as usize || parent.len >= child.len {
+        return false;
+    }
+
+    var i: usize = 0;
+    while i < parent.len {
+        if parent.ptr[i] != child.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return child.ptr[parent.len] == '/' as byte;
+}
+
 export fn merge_planner_has_blocks(plan: &MergePlanner) bool {
     return plan.blocks.len > 0;
 }
@@ -100,6 +120,41 @@ export fn merge_planner_has_conflicts(plan: &MergePlanner) bool {
         i = i + 1 as usize;
     }
     return false;
+}
+
+export fn merge_planner_namespace_preflight(
+    arena: &Arena,
+    entries: &MergePlannerEntryList,
+) !MergePlannerBlockList {
+    if entries.len < 2 as usize {
+        return MergePlannerBlockList{ ptr: null, len: 0 };
+    }
+
+    const raw: &MergePlannerBlock = arena_alloc(
+        arena,
+        @size_of(MergePlannerBlock) as usize * entries.len,
+    ) as &MergePlannerBlock;
+    if raw == null {
+        return error.MergePlannerAlloc;
+    }
+
+    var out_len: usize = 0;
+    var i: usize = 0;
+    const last_index: usize = entries.len - 1 as usize;
+    while i < last_index {
+        const current: &MergePlannerEntry = &entries.ptr[i];
+        const next: &MergePlannerEntry = &entries.ptr[i + 1 as usize];
+        if merge_planner_path_is_strict_descendant(&current.path, &next.path) {
+            raw[out_len] = MergePlannerBlock{
+                path: ByteList{ ptr: current.path.ptr, len: current.path.len },
+                kind: MergePlannerBlockKind.Namespace,
+            };
+            out_len = out_len + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+
+    return MergePlannerBlockList{ ptr: raw, len: out_len };
 }
 
 fn merge_planner_default_decision(has_base: bool, has_ours: bool) MergePlannerDecisionKind {
@@ -133,6 +188,151 @@ fn merge_planner_pick_next_path(
         chosen = &theirs.ptr[theirs_index].path;
     }
     return chosen;
+}
+
+fn merge_planner_leaf_equal(left: &ManifestLeafInputEntry, right: &ManifestLeafInputEntry) bool {
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.mode != right.mode {
+        return false;
+    }
+    if object_id_compare(&left.object_id, &right.object_id) != 0 {
+        return false;
+    }
+    if left.logical_size != right.logical_size {
+        return false;
+    }
+    if left.content_type != right.content_type {
+        return false;
+    }
+    return policy_id_compare(&left.policy_id, &right.policy_id) == 0;
+}
+
+fn merge_planner_is_text_entry(entry: &ManifestLeafInputEntry) bool {
+    return entry.kind != EntryKind.Symlink && entry.content_type == ContentType.Utf8Text;
+}
+
+fn merge_planner_resolve_entry(
+    entry: &MergePlannerEntry,
+    base: &ManifestLeafInputList,
+    ours: &ManifestLeafInputList,
+    theirs: &ManifestLeafInputList,
+) void {
+    entry.conflict_kind = MergePlannerConflictKind.None;
+
+    if entry.has_base && entry.has_ours && entry.has_theirs {
+        const base_entry: &ManifestLeafInputEntry = &base.ptr[entry.base_index];
+        const ours_entry: &ManifestLeafInputEntry = &ours.ptr[entry.ours_index];
+        const theirs_entry: &ManifestLeafInputEntry = &theirs.ptr[entry.theirs_index];
+        const ours_same_base: bool = merge_planner_leaf_equal(base_entry, ours_entry);
+        const theirs_same_base: bool = merge_planner_leaf_equal(base_entry, theirs_entry);
+        const ours_same_theirs: bool = merge_planner_leaf_equal(ours_entry, theirs_entry);
+        if ours_same_base && theirs_same_base {
+            entry.decision = MergePlannerDecisionKind.KeepBase;
+            return;
+        }
+        if ours_same_theirs {
+            entry.decision = MergePlannerDecisionKind.TakeOurs;
+            return;
+        }
+        if ours_same_base {
+            entry.decision = MergePlannerDecisionKind.TakeTheirs;
+            return;
+        }
+        if theirs_same_base {
+            entry.decision = MergePlannerDecisionKind.TakeOurs;
+            return;
+        }
+        if merge_planner_is_text_entry(base_entry) &&
+            merge_planner_is_text_entry(ours_entry) &&
+            merge_planner_is_text_entry(theirs_entry) {
+            entry.decision = MergePlannerDecisionKind.MergeText;
+            return;
+        }
+        entry.decision = MergePlannerDecisionKind.Conflict;
+        entry.conflict_kind = MergePlannerConflictKind.Binary;
+        return;
+    }
+
+    if entry.has_base && entry.has_ours && !entry.has_theirs {
+        const base_entry: &ManifestLeafInputEntry = &base.ptr[entry.base_index];
+        const ours_entry: &ManifestLeafInputEntry = &ours.ptr[entry.ours_index];
+        if merge_planner_leaf_equal(base_entry, ours_entry) {
+            entry.decision = MergePlannerDecisionKind.TakeTheirs;
+            return;
+        }
+        entry.decision = MergePlannerDecisionKind.Conflict;
+        entry.conflict_kind = MergePlannerConflictKind.DeleteModify;
+        return;
+    }
+
+    if entry.has_base && !entry.has_ours && entry.has_theirs {
+        const base_entry: &ManifestLeafInputEntry = &base.ptr[entry.base_index];
+        const theirs_entry: &ManifestLeafInputEntry = &theirs.ptr[entry.theirs_index];
+        if merge_planner_leaf_equal(base_entry, theirs_entry) {
+            entry.decision = MergePlannerDecisionKind.TakeOurs;
+            return;
+        }
+        entry.decision = MergePlannerDecisionKind.Conflict;
+        entry.conflict_kind = MergePlannerConflictKind.DeleteModify;
+        return;
+    }
+
+    if entry.has_base && !entry.has_ours && !entry.has_theirs {
+        entry.decision = MergePlannerDecisionKind.TakeOurs;
+        return;
+    }
+
+    if !entry.has_base && entry.has_ours && entry.has_theirs {
+        const ours_entry: &ManifestLeafInputEntry = &ours.ptr[entry.ours_index];
+        const theirs_entry: &ManifestLeafInputEntry = &theirs.ptr[entry.theirs_index];
+        if merge_planner_leaf_equal(ours_entry, theirs_entry) {
+            entry.decision = MergePlannerDecisionKind.TakeOurs;
+            return;
+        }
+        if merge_planner_is_text_entry(ours_entry) && merge_planner_is_text_entry(theirs_entry) {
+            entry.decision = MergePlannerDecisionKind.MergeText;
+            return;
+        }
+        entry.decision = MergePlannerDecisionKind.Conflict;
+        entry.conflict_kind = MergePlannerConflictKind.Binary;
+        return;
+    }
+
+    entry.decision = merge_planner_default_decision(entry.has_base, entry.has_ours);
+}
+
+fn merge_planner_resolve_entries(
+    entries: &MergePlannerEntryList,
+    base: &ManifestLeafInputList,
+    ours: &ManifestLeafInputList,
+    theirs: &ManifestLeafInputList,
+) void {
+    var i: usize = 0;
+    while i < entries.len {
+        merge_planner_resolve_entry(&entries.ptr[i], base, ours, theirs);
+        i = i + 1 as usize;
+    }
+}
+
+fn merge_planner_mark_file_directory_conflict(entry: &MergePlannerEntry) void {
+    entry.decision = MergePlannerDecisionKind.Conflict;
+    entry.conflict_kind = MergePlannerConflictKind.FileDirectory;
+}
+
+fn merge_planner_apply_file_directory_conflicts(entries: &MergePlannerEntryList) void {
+    var i: usize = 0;
+    while i < entries.len {
+        var j: usize = i + 1 as usize;
+        while j < entries.len &&
+            merge_planner_path_is_strict_descendant(&entries.ptr[i].path, &entries.ptr[j].path) {
+            merge_planner_mark_file_directory_conflict(&entries.ptr[i]);
+            merge_planner_mark_file_directory_conflict(&entries.ptr[j]);
+            j = j + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
 }
 
 export fn merge_planner_align_inputs(
@@ -197,4 +397,17 @@ export fn merge_planner_align_inputs(
         }
     }
     return MergePlannerEntryList{ ptr: raw, len: out_len };
+}
+
+export fn merge_planner_build(
+    arena: &Arena,
+    base: &ManifestLeafInputList,
+    ours: &ManifestLeafInputList,
+    theirs: &ManifestLeafInputList,
+) !MergePlanner {
+    const entries: MergePlannerEntryList = try merge_planner_align_inputs(arena, base, ours, theirs);
+    merge_planner_resolve_entries(&entries, base, ours, theirs);
+    merge_planner_apply_file_directory_conflicts(&entries);
+    const blocks: MergePlannerBlockList = try merge_planner_namespace_preflight(arena, &entries);
+    return merge_planner_init(entries, blocks);
 }

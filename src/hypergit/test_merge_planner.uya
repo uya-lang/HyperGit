@@ -19,6 +19,7 @@ use merge.planner.MergePlannerDecisionKind;
 use merge.planner.MergePlannerEntry;
 use merge.planner.MergePlannerEntryList;
 use merge.planner.merge_planner_align_inputs;
+use merge.planner.merge_planner_build;
 use merge.planner.merge_planner_block_list_from_slice;
 use merge.planner.merge_planner_entry_has_all_sides;
 use merge.planner.merge_planner_entry_list_from_slice;
@@ -39,6 +40,15 @@ fn literal_bytes(text: &const byte) &[byte] {
 fn literal_byte_list(text: &const byte) ByteList {
     const raw: &[byte] = literal_bytes(text);
     return ByteList{ ptr: raw.ptr, len: raw.len };
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1 as usize;
+    }
 }
 
 fn empty_block_list() MergePlannerBlockList {
@@ -65,6 +75,12 @@ fn make_input(path: &ByteList, seed: byte) ManifestLeafInputEntry {
         content_type: ContentType.Unknown,
         policy_id: policy_id_from_object(object_id_from_hash(make_hash(seed + 40 as byte))),
     };
+}
+
+fn make_input_with_content_type(path: &ByteList, seed: byte, content_type: ContentType) ManifestLeafInputEntry {
+    var entry: ManifestLeafInputEntry = make_input(path, seed);
+    entry.content_type = content_type;
+    return entry;
 }
 
 fn make_entry(path: &const byte, decision: MergePlannerDecisionKind, conflict_kind: MergePlannerConflictKind) MergePlannerEntry {
@@ -172,6 +188,236 @@ fn test_merge_planner_align_inputs_tracks_base_ours_theirs_presence() !void {
     try expect(aligned.ptr[3].decision == MergePlannerDecisionKind.TakeTheirs);
 }
 
+fn test_merge_planner_build_detects_namespace_preflight_block() !void {
+    var ours_path: [byte: 7] = ['s' as byte, 'r' as byte, 'c' as byte, '/' as byte, 'l' as byte, 'i' as byte, 'b' as byte];
+    var theirs_path: [byte: 16] = [
+        's' as byte, 'r' as byte, 'c' as byte, '/' as byte,
+        'l' as byte, 'i' as byte, 'b' as byte, '/' as byte,
+        'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte,
+        '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte
+    ];
+    var ours_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: ours_path[0: 7].ptr, len: 7 as usize }, 11 as byte)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: theirs_path[0: 16].ptr, len: 16 as usize }, 12 as byte)
+    ];
+    const empty_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 0]);
+    const ours_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 1]);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const plan: MergePlanner = try merge_planner_build(
+        &arena,
+        &empty_inputs,
+        &ours_inputs,
+        &theirs_inputs,
+    );
+
+    try expect(plan.entries.len == 2 as usize);
+    try expect(plan.blocks.len == 1 as usize);
+    try expect(plan.blocks.ptr[0].kind == MergePlannerBlockKind.Namespace);
+    try expect_byte_list_eq(plan.blocks.ptr[0].path, literal_bytes("src/lib"));
+    try expect(merge_planner_has_conflicts(&plan));
+}
+
+fn test_merge_planner_build_skips_namespace_preflight_for_siblings() !void {
+    var ours_path: [byte: 11] = [
+        's' as byte, 'r' as byte, 'c' as byte, '/' as byte, 'l' as byte, 'i' as byte, 'b' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte
+    ];
+    var theirs_path: [byte: 12] = [
+        's' as byte, 'r' as byte, 'c' as byte, '/' as byte, 'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte
+    ];
+    var ours_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: ours_path[0: 11].ptr, len: 11 as usize }, 21 as byte)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: theirs_path[0: 12].ptr, len: 12 as usize }, 22 as byte)
+    ];
+    const empty_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 0]);
+    const ours_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 1]);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const plan: MergePlanner = try merge_planner_build(
+        &arena,
+        &empty_inputs,
+        &ours_inputs,
+        &theirs_inputs,
+    );
+
+    try expect(plan.entries.len == 2 as usize);
+    try expect(plan.blocks.len == 0 as usize);
+    try expect(!merge_planner_has_conflicts(&plan));
+}
+
+fn test_merge_planner_build_marks_file_directory_conflicts() !void {
+    var ours_path: [byte: 7] = ['s' as byte, 'r' as byte, 'c' as byte, '/' as byte, 'l' as byte, 'i' as byte, 'b' as byte];
+    var theirs_path: [byte: 16] = [
+        's' as byte, 'r' as byte, 'c' as byte, '/' as byte,
+        'l' as byte, 'i' as byte, 'b' as byte, '/' as byte,
+        'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte,
+        '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte
+    ];
+    var ours_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: ours_path[0: 7].ptr, len: 7 as usize }, 25 as byte)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: theirs_path[0: 16].ptr, len: 16 as usize }, 26 as byte)
+    ];
+    const empty_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 0]);
+    const ours_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 1]);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const plan: MergePlanner = try merge_planner_build(
+        &arena,
+        &empty_inputs,
+        &ours_inputs,
+        &theirs_inputs,
+    );
+
+    try expect(plan.entries.len == 2 as usize);
+    try expect(plan.entries.ptr[0].decision == MergePlannerDecisionKind.Conflict);
+    try expect(plan.entries.ptr[1].decision == MergePlannerDecisionKind.Conflict);
+    try expect(plan.entries.ptr[0].conflict_kind == MergePlannerConflictKind.FileDirectory);
+    try expect(plan.entries.ptr[1].conflict_kind == MergePlannerConflictKind.FileDirectory);
+    try expect(plan.blocks.len == 1 as usize);
+    try expect(plan.blocks.ptr[0].kind == MergePlannerBlockKind.Namespace);
+    try expect(merge_planner_has_conflicts(&plan));
+}
+
+fn test_merge_planner_build_detects_delete_modify_conflict() !void {
+    var path: [byte: 8] = ['m' as byte, 'a' as byte, 'i' as byte, 'n' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte];
+    var base_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 31 as byte)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 32 as byte)
+    ];
+    const empty_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(base_raw[0: 0]);
+    const base_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(base_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 1]);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const plan: MergePlanner = try merge_planner_build(
+        &arena,
+        &base_inputs,
+        &empty_inputs,
+        &theirs_inputs,
+    );
+
+    try expect(plan.entries.len == 1 as usize);
+    try expect(plan.entries.ptr[0].decision == MergePlannerDecisionKind.Conflict);
+    try expect(plan.entries.ptr[0].conflict_kind == MergePlannerConflictKind.DeleteModify);
+    try expect(merge_planner_has_conflicts(&plan));
+}
+
+fn test_merge_planner_build_allows_clean_delete_against_unchanged_side() !void {
+    var path: [byte: 8] = ['m' as byte, 'a' as byte, 'i' as byte, 'n' as byte, '.' as byte, 'u' as byte, 'y' as byte, 'a' as byte];
+    var base_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 41 as byte)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 1] = [
+        make_input(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 41 as byte)
+    ];
+    const empty_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(base_raw[0: 0]);
+    const base_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(base_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 1]);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const plan: MergePlanner = try merge_planner_build(
+        &arena,
+        &base_inputs,
+        &empty_inputs,
+        &theirs_inputs,
+    );
+
+    try expect(plan.entries.len == 1 as usize);
+    try expect(plan.entries.ptr[0].decision == MergePlannerDecisionKind.TakeOurs);
+    try expect(plan.entries.ptr[0].conflict_kind == MergePlannerConflictKind.None);
+    try expect(!merge_planner_has_conflicts(&plan));
+}
+
+fn test_merge_planner_build_uses_conservative_binary_conflict() !void {
+    var path: [byte: 8] = ['d' as byte, 'a' as byte, 't' as byte, 'a' as byte, '.' as byte, 'b' as byte, 'i' as byte, 'n' as byte];
+    var base_raw: [ManifestLeafInputEntry: 1] = [
+        make_input_with_content_type(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 51 as byte, ContentType.Binary)
+    ];
+    var ours_raw: [ManifestLeafInputEntry: 1] = [
+        make_input_with_content_type(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 52 as byte, ContentType.Binary)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 1] = [
+        make_input_with_content_type(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 53 as byte, ContentType.Binary)
+    ];
+    const base_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(base_raw[0: 1]);
+    const ours_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 1]);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const plan: MergePlanner = try merge_planner_build(
+        &arena,
+        &base_inputs,
+        &ours_inputs,
+        &theirs_inputs,
+    );
+
+    try expect(plan.entries.len == 1 as usize);
+    try expect(plan.entries.ptr[0].decision == MergePlannerDecisionKind.Conflict);
+    try expect(plan.entries.ptr[0].conflict_kind == MergePlannerConflictKind.Binary);
+    try expect(merge_planner_has_conflicts(&plan));
+}
+
+fn test_merge_planner_build_takes_single_binary_change() !void {
+    var path: [byte: 8] = ['d' as byte, 'a' as byte, 't' as byte, 'a' as byte, '.' as byte, 'b' as byte, 'i' as byte, 'n' as byte];
+    var base_raw: [ManifestLeafInputEntry: 1] = [
+        make_input_with_content_type(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 61 as byte, ContentType.Binary)
+    ];
+    var ours_raw: [ManifestLeafInputEntry: 1] = [
+        make_input_with_content_type(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 62 as byte, ContentType.Binary)
+    ];
+    var theirs_raw: [ManifestLeafInputEntry: 1] = [
+        make_input_with_content_type(&ByteList{ ptr: path[0: 8].ptr, len: 8 as usize }, 61 as byte, ContentType.Binary)
+    ];
+    const base_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(base_raw[0: 1]);
+    const ours_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(ours_raw[0: 1]);
+    const theirs_inputs: ManifestLeafInputList = manifest_leaf_input_list_from_slice(theirs_raw[0: 1]);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const plan: MergePlanner = try merge_planner_build(
+        &arena,
+        &base_inputs,
+        &ours_inputs,
+        &theirs_inputs,
+    );
+
+    try expect(plan.entries.len == 1 as usize);
+    try expect(plan.entries.ptr[0].decision == MergePlannerDecisionKind.TakeOurs);
+    try expect(plan.entries.ptr[0].conflict_kind == MergePlannerConflictKind.None);
+    try expect(!merge_planner_has_conflicts(&plan));
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Merge Planner Tests");
     run_test("merge planner entry list roundtrip", test_merge_planner_entry_list_roundtrip);
@@ -179,5 +425,12 @@ export fn main() i32 {
     run_test("merge planner detects conflict entry", test_merge_planner_has_conflicts_true_for_conflict_entry);
     run_test("merge planner detects preflight block", test_merge_planner_has_conflicts_true_for_preflight_block);
     run_test("merge planner aligns base ours and theirs inputs", test_merge_planner_align_inputs_tracks_base_ours_theirs_presence);
+    run_test("merge planner build detects namespace preflight block", test_merge_planner_build_detects_namespace_preflight_block);
+    run_test("merge planner build skips namespace preflight for siblings", test_merge_planner_build_skips_namespace_preflight_for_siblings);
+    run_test("merge planner build marks file directory conflicts", test_merge_planner_build_marks_file_directory_conflicts);
+    run_test("merge planner build detects delete modify conflict", test_merge_planner_build_detects_delete_modify_conflict);
+    run_test("merge planner build allows clean delete against unchanged side", test_merge_planner_build_allows_clean_delete_against_unchanged_side);
+    run_test("merge planner build uses conservative binary conflict", test_merge_planner_build_uses_conservative_binary_conflict);
+    run_test("merge planner build takes single binary change", test_merge_planner_build_takes_single_binary_change);
     return test_suite_end();
 }

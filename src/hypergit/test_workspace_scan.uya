@@ -8,10 +8,13 @@ use std.mem.arena.arena_init;
 use std.string.strlen;
 
 use libc.system;
+use manifest.query.ManifestPathspecList;
+use manifest.query.manifest_pathspec_list_from_slice;
 use object.types.ByteList;
 use workspace.scan.WorkspaceFileKind;
 use workspace.scan.WorkspaceFileList;
 use workspace.scan.workspace_scan_files;
+use workspace.scan.workspace_scan_files_for_pathspecs;
 
 fn literal_bytes(text: &const byte) &[byte] {
     return (text as &byte)[0: strlen(text)];
@@ -84,10 +87,35 @@ fn test_workspace_scan_rejects_reserved_manifest_paths() !void {
     return error.AssertionFailed;
 }
 
+fn test_workspace_scan_pathspec_limits_to_requested_subtrees() !void {
+    const setup_status: i32 = system("rm -rf build/workspace-scan-pathspec-test && mkdir -p build/workspace-scan-pathspec-test/repo/src/nested build/workspace-scan-pathspec-test/repo/docs build/workspace-scan-pathspec-test/repo/tmp && printf alpha > build/workspace-scan-pathspec-test/repo/src/main.uya && printf beta > build/workspace-scan-pathspec-test/repo/src/nested/util.uya && printf readme > build/workspace-scan-pathspec-test/repo/docs/readme.md && printf scratch > build/workspace-scan-pathspec-test/repo/tmp/ignored.txt");
+    try expect(setup_status == 0);
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    var raw_specs: [ByteList: 2] = [
+        ByteList{ ptr: literal_bytes("src").ptr, len: literal_bytes("src").len },
+        ByteList{ ptr: literal_bytes("src/main.uya").ptr, len: literal_bytes("src/main.uya").len },
+    ];
+    const pathspecs: ManifestPathspecList = manifest_pathspec_list_from_slice(raw_specs[0: 2]);
+    const files: WorkspaceFileList = try workspace_scan_files_for_pathspecs(
+        &arena,
+        "build/workspace-scan-pathspec-test/repo",
+        pathspecs,
+    );
+
+    try expect(files.len == 2 as usize);
+    try expect_byte_list_eq(files.ptr[0].path, literal_bytes("src/main.uya"));
+    try expect_byte_list_eq(files.ptr[1].path, literal_bytes("src/nested/util.uya"));
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Workspace Scan Tests");
     run_test("workspace scan skips hgit and sorts paths", test_workspace_scan_skips_hgit_and_sorts_paths);
     run_test("workspace scan keeps symlink entries without recursing", test_workspace_scan_keeps_symlink_entries_without_recursing);
     run_test("workspace scan rejects reserved manifest paths", test_workspace_scan_rejects_reserved_manifest_paths);
+    run_test("workspace scan pathspec limits to requested subtrees", test_workspace_scan_pathspec_limits_to_requested_subtrees);
     return test_suite_end();
 }

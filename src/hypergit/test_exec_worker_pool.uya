@@ -1,0 +1,37 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use std.async.Future;
+use std.async.block_on;
+use exec.worker_pool.WorkerPool;
+use exec.worker_pool.worker_pool_async_compute_i32;
+use exec.worker_pool.worker_pool_new;
+use exec.worker_pool.worker_pool_pending_count;
+use exec.worker_pool.worker_pool_shutdown;
+use exec.worker_pool.worker_pool_started_workers;
+
+fn double_i32(value: i32) i32 {
+    return value * 2;
+}
+
+fn test_worker_pool_runs_async_compute() !void {
+    var pool: WorkerPool = worker_pool_new(2);
+    defer {
+        worker_pool_shutdown(&pool);
+    }
+
+    const future: Future<!i32> = worker_pool_async_compute_i32(&pool, &double_i32 as &void, 21);
+    const value: i32 = try block_on<i32>(future);
+    try expect(value == 42);
+    try expect(worker_pool_started_workers(&pool) >= 1);
+    try expect(worker_pool_pending_count(&pool) == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Exec Worker Pool Tests");
+    run_test("worker pool runs async compute", test_worker_pool_runs_async_compute);
+    return test_suite_end();
+}

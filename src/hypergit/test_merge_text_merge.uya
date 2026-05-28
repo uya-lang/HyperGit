@@ -1,0 +1,110 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use merge.text_merge.MergeTextResult;
+use merge.text_merge.MergeTextResultKind;
+use merge.text_merge.merge_text_file_file;
+use merge.text_merge.merge_text_file_file_with_markers;
+use object.types.ByteList;
+use object.types.byte_list_from_slice;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn test_text_merge_takes_changed_side_when_other_matches_base() !void {
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+
+    const base: ByteList = byte_list_from_slice(literal_bytes("a\nb\nc\n"));
+    const ours: ByteList = byte_list_from_slice(literal_bytes("a\nx\nc\n"));
+    const theirs: ByteList = byte_list_from_slice(literal_bytes("a\nb\nc\n"));
+    const result: MergeTextResult = try merge_text_file_file(&arena, &base, &ours, &theirs);
+
+    try expect(result.kind == MergeTextResultKind.Clean);
+    try expect_byte_list_eq(result.merged, literal_bytes("a\nx\nc\n"));
+}
+
+fn test_text_merge_accepts_identical_changes() !void {
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+
+    const base: ByteList = byte_list_from_slice(literal_bytes("a\nb\nc\n"));
+    const ours: ByteList = byte_list_from_slice(literal_bytes("a\nx\nc\n"));
+    const theirs: ByteList = byte_list_from_slice(literal_bytes("a\nx\nc\n"));
+    const result: MergeTextResult = try merge_text_file_file(&arena, &base, &ours, &theirs);
+
+    try expect(result.kind == MergeTextResultKind.Clean);
+    try expect_byte_list_eq(result.merged, literal_bytes("a\nx\nc\n"));
+}
+
+fn test_text_merge_combines_non_overlapping_insertions() !void {
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+
+    const base: ByteList = byte_list_from_slice(literal_bytes("a\nc\n"));
+    const ours: ByteList = byte_list_from_slice(literal_bytes("a\nb\nc\n"));
+    const theirs: ByteList = byte_list_from_slice(literal_bytes("a\nc\nd\n"));
+    const result: MergeTextResult = try merge_text_file_file(&arena, &base, &ours, &theirs);
+
+    try expect(result.kind == MergeTextResultKind.Clean);
+    try expect_byte_list_eq(result.merged, literal_bytes("a\nb\nc\nd\n"));
+}
+
+fn test_text_merge_conflicts_on_overlapping_edits() !void {
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+
+    const base: ByteList = byte_list_from_slice(literal_bytes("a\nb\nc\n"));
+    const ours: ByteList = byte_list_from_slice(literal_bytes("a\nx\nc\n"));
+    const theirs: ByteList = byte_list_from_slice(literal_bytes("a\ny\nc\n"));
+    const result: MergeTextResult = try merge_text_file_file(&arena, &base, &ours, &theirs);
+
+    try expect(result.kind == MergeTextResultKind.Conflict);
+    try expect(result.merged.len == 0 as usize);
+}
+
+fn test_text_merge_renders_conflict_markers() !void {
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+
+    const base: ByteList = byte_list_from_slice(literal_bytes("a\nb\nc\n"));
+    const ours: ByteList = byte_list_from_slice(literal_bytes("a\nx\nc\n"));
+    const theirs: ByteList = byte_list_from_slice(literal_bytes("a\ny\nc\n"));
+    const rendered: ByteList = try merge_text_file_file_with_markers(&arena, &base, &ours, &theirs);
+
+    try expect_byte_list_eq(
+        rendered,
+        literal_bytes("a\n<<<<<<< ours\nx\n||||||| base\nb\n=======\ny\n>>>>>>> theirs\nc\n"),
+    );
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Merge Text Merge Tests");
+    run_test("text merge takes changed side when other matches base", test_text_merge_takes_changed_side_when_other_matches_base);
+    run_test("text merge accepts identical changes", test_text_merge_accepts_identical_changes);
+    run_test("text merge combines non-overlapping insertions", test_text_merge_combines_non_overlapping_insertions);
+    run_test("text merge conflicts on overlapping edits", test_text_merge_conflicts_on_overlapping_edits);
+    run_test("text merge renders conflict markers", test_text_merge_renders_conflict_markers);
+    return test_suite_end();
+}
