@@ -183,3 +183,43 @@ Notes:
 
 - 同一批 Git interop 代码在更早一次编译中曾成功通过，当前表现疑似 codegen/优化阶段的不稳定崩溃。
 - 在把 `git interop` 测试接入默认 `Makefile test` 前，需要先把这个编译器崩溃独立缩小并稳定复现。
+
+## `object.codec.decode_object_kind` 可触发 C 后端生成非法 `invalid initializer`
+
+- Observed trigger command: `~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya`
+- Expected behavior: generated C compiles successfully, and `decode_object_kind` should just decode envelope kind into `ObjectKind`.
+- Actual behavior: host C toolchain rejects generated C with `invalid initializer`, pointing at the generated `hypergit_object_codec_decode_object_kind` function.
+
+Observed error excerpt:
+
+```text
+/tmp/uya_output_*.c: In function ‘hypergit_object_codec_decode_object_kind’:
+error: invalid initializer
+错误：宿主工具链链接失败
+```
+
+Known source trigger:
+
+- [src/hypergit/object/codec.uya](/media/winger/_dde_data/winger/uya/HyperGit/src/hypergit/object/codec.uya:776)
+
+Triggering source pattern:
+
+```uya
+export fn decode_object_kind(input: &[byte], offset: &usize) !ObjectKind {
+    const decoded: DecodedObject = try codec_decode_object(input, offset);
+    return object_kind_from_u16(decoded.envelope.kind) catch |err| {
+        _ = err;
+        return error.CodecNonCanonical;
+    };
+}
+```
+
+Current smallest known reproducer set:
+
+- [src/hypergit/test_git_interop.uya](/media/winger/_dde_data/winger/uya/HyperGit/src/hypergit/test_git_interop.uya:1)
+- [src/hypergit/git/interop.uya](/media/winger/_dde_data/winger/uya/HyperGit/src/hypergit/git/interop.uya:1)
+
+Notes:
+
+- 这个问题和上一条 “Git interop test compilation can segfault the compiler” 不是同一类现象；那条是编译器进程直接崩溃，这条是生成了宿主 C 编译器无法接受的代码。
+- 目前还没有缩到一个不依赖项目模块、但仍稳定触发同一 `invalid initializer` 的更小单文件 repro。
