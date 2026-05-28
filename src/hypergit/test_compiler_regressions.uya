@@ -1,0 +1,109 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use std.async.Future;
+use std.async.block_on;
+use std.thread.ThreadPool;
+use std.thread.async_compute;
+use std.thread.thread_pool_new;
+use std.thread.thread_pool_shutdown;
+
+use core.codec.codec_encode_object;
+use object.codec.decode_object_kind;
+use object.types.ObjectKind;
+use object.types.object_kind_to_u16;
+
+var regression_called: bool = false;
+
+error CompilerRegressionWrapperFailed;
+
+enum WrapperKind {
+    A,
+    B
+}
+
+fn double_i32(value: i32) i32 {
+    return value * 2;
+}
+
+fn wrap_async_compute<T>(pool: &ThreadPool, compute_fn: &void, arg: T) Future<!T> {
+    return async_compute<T>(pool, compute_fn, arg);
+}
+
+fn mark_called() !void {
+    regression_called = true;
+    return;
+}
+
+fn wrapper_returns_void_with_catch() !void {
+    return mark_called() catch {
+        return error.CompilerRegressionWrapperFailed;
+    };
+}
+
+fn wrapper_kind_from_u16(value: u16) !WrapperKind {
+    if value == 0 as u16 {
+        return WrapperKind.A;
+    }
+    if value == 1 as u16 {
+        return WrapperKind.B;
+    }
+    return error.CompilerRegressionWrapperFailed;
+}
+
+fn decode_wrapper_kind(value: u16) !WrapperKind {
+    return wrapper_kind_from_u16(value) catch |err| {
+        _ = err;
+        return error.CompilerRegressionWrapperFailed;
+    };
+}
+
+fn make_payload() [byte: 4] {
+    return ['t' as byte, 'e' as byte, 's' as byte, 't' as byte];
+}
+
+fn test_async_compute_generic_wrapper() !void {
+    var pool: ThreadPool = thread_pool_new(1);
+    defer {
+        thread_pool_shutdown(&pool);
+    }
+
+    const future: Future<!i32> = wrap_async_compute<i32>(&pool, &double_i32 as &void, 21);
+    const value: i32 = try block_on<i32>(future);
+    try expect(value == 42);
+}
+
+fn test_void_return_catch_keeps_side_effects() !void {
+    regression_called = false;
+    try wrapper_returns_void_with_catch();
+    try expect(regression_called);
+}
+
+fn test_error_enum_wrapper_rewraps_error_union() !void {
+    const kind: WrapperKind = try decode_wrapper_kind(1 as u16);
+    try expect(kind == WrapperKind.B);
+}
+
+fn test_decode_object_kind_roundtrip() !void {
+    var payload: [byte: 4] = make_payload();
+    var buf: [byte: 128] = [];
+    var offset: usize = 0 as usize;
+    try codec_encode_object(buf[0: 128], &offset, object_kind_to_u16(ObjectKind.SmallBlob), 0u16, payload[0: 4]);
+
+    var read_offset: usize = 0 as usize;
+    const kind: ObjectKind = try decode_object_kind(buf[0: offset], &read_offset);
+    try expect(kind == ObjectKind.SmallBlob);
+    try expect(read_offset == offset);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Compiler Regression Tests");
+    run_test("generic wrapper around async_compute compiles and runs", test_async_compute_generic_wrapper);
+    run_test("return void catch preserves side effects", test_void_return_catch_keeps_side_effects);
+    run_test("error enum wrapper rewraps error union", test_error_enum_wrapper_rewraps_error_union);
+    run_test("decode_object_kind roundtrip compiles and runs", test_decode_object_kind_roundtrip);
+    return test_suite_end();
+}

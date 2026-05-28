@@ -1,12 +1,27 @@
 # Uya Compiler Bugs
 
+## Validation Refresh (2026-05-29)
+
+使用 `~/uya/uya/bin/uya`（`v0.9.7`）重新逐条验证后，当前状态如下：
+
+- `async_compute<T>` 泛型 wrapper 条目：`docs/repros/uya_async_compute_generic_wrapper.uya` 现在可直接构建成功，原始 link failure 已不再复现。
+- `return some_void_call() catch { ... }` 条目：`docs/repros/uya_void_return_catch_elides_call.uya` 现在构建并运行后返回 `0`，调用不再被错误省略。
+- `error enum wrapper` 条目：`docs/repros/uya_error_enum_wrapper_invalid_c.uya` 现在构建并运行后返回 `0`，错误联合重包场景未再触发 C 后端异常。
+- `uyagin AsyncHandler` 首请求崩溃条目：`docs/repros/uya_uyagin_async_handler_request_crash.uya` 现在能返回 `ok` 响应，未再复现 `Segmentation fault`；当前行为是服务保持运行，需由外部终止。
+- `git interop` 编译器崩溃条目：`~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya` 当前通过，2 个测试均成功。
+- `decode_object_kind` `invalid initializer` 条目：`~/uya/uya/bin/uya test src/hypergit/test_object_codec.uya` 当前通过；`docs/repros/uya_decode_object_kind_invalid_c.uya` 这个独立文件目前由于模块根不匹配，已经不是一个有效的 standalone repro。
+
+为防止这些模式回归，仓库现在有显式回归测试 `src/hypergit/test_compiler_regressions.uya`，并已接入 `Makefile test`。
+本次复验中，`~/uya/uya/bin/uya test src/hypergit/test_compiler_regressions.uya` 也通过，4 个场景全部为 `OK`，其中包含 `error enum wrapper` 重包错误联合的历史回归。
+
 ## Generic wrapper around `async_compute<T>` fails to link
 
-- Trigger command: `~/uya/uya/bin/uya build docs/repros/uya_async_compute_generic_wrapper.uya -o /tmp/uya_async_compute_generic_wrapper`
+- Current status (2026-05-29): 不再复现。`docs/repros/uya_async_compute_generic_wrapper.uya` 在 `v0.9.7` 下可直接构建成功。
+- Validation command: `~/uya/uya/bin/uya build docs/repros/uya_async_compute_generic_wrapper.uya -o /tmp/uya_async_compute_generic_wrapper`
 - Expected behavior: build succeeds, because the code only wraps `async_compute<T>` in another generic function and instantiates it with `i32`.
-- Actual behavior: host C toolchain link step fails with an undeclared symbol for the monomorphized async helper.
+- Historical failure behavior: host C toolchain link step fails with an undeclared symbol for the monomorphized async helper.
 
-Observed error excerpt:
+Historical error excerpt:
 
 ```text
 /tmp/uya_output_*.c: In function `wrap_async_compute_i32_mono`:
@@ -47,11 +62,12 @@ export fn main() i32 {
 
 ## `return some_void_call() catch { ... }` can elide the call entirely
 
-- Trigger command: `~/uya/uya/bin/uya build docs/repros/uya_void_return_catch_elides_call.uya -o /tmp/uya_void_return_catch_elides_call && /tmp/uya_void_return_catch_elides_call; echo $?`
+- Current status (2026-05-29): 不再复现。`docs/repros/uya_void_return_catch_elides_call.uya` 当前构建并运行后返回 `0`。
+- Validation command: `~/uya/uya/bin/uya build docs/repros/uya_void_return_catch_elides_call.uya -o /tmp/uya_void_return_catch_elides_call && /tmp/uya_void_return_catch_elides_call; echo $?`
 - Expected behavior: process exits `0`, because `wrapper()` should invoke `mark_called()`, set `CALLED = true`, then return success.
-- Actual behavior: process exits `2`. Inspecting generated C showed `wrapper()` returning success immediately without emitting the `mark_called()` call.
+- Historical failure behavior: process exits `2`. Inspecting generated C showed `wrapper()` returning success immediately without emitting the `mark_called()` call.
 
-Observed generated C excerpt from `.uyacache/.../fetch.c` after compiling `src/hgx/commands/fetch.uya`:
+Historical generated C excerpt from `.uyacache/.../fetch.c` after compiling `src/hgx/commands/fetch.uya`:
 
 ```text
 struct err_union_void fetch_write_empty_stage(...) {
@@ -97,11 +113,12 @@ export fn main() i32 {
 
 ## External `uyagin` `AsyncHandler` can segfault on the first real request
 
-- Trigger command: `~/uya/uya/bin/uya build docs/repros/uya_uyagin_async_handler_request_crash.uya -o /tmp/uya_uyagin_async_handler_request_crash && /tmp/uya_uyagin_async_handler_request_crash >/tmp/uya_uyagin_async_handler_request_crash.log 2>&1 & pid=$!; sleep 0.3; curl -sv http://127.0.0.1:48129/ok; wait $pid`
+- Current status (2026-05-29): 首请求崩溃不再复现。当前实测返回 `HTTP/1.1 200 OK` 与 `ok` body；服务进程会继续存活，需要外部终止。
+- Validation command: `~/uya/uya/bin/uya build docs/repros/uya_uyagin_async_handler_request_crash.uya -o /tmp/uya_uyagin_async_handler_request_crash && /tmp/uya_uyagin_async_handler_request_crash >/tmp/uya_uyagin_async_handler_request_crash.log 2>&1 & pid=$!; sleep 0.8; curl http://127.0.0.1:48129/ok; kill $pid; wait $pid`
 - Expected behavior: `curl` receives `HTTP/1.1 200 OK` with body `ok\n`, and the server exits cleanly after serving one request in `UyaginMode.Debug`.
-- Actual behavior: `curl` reports `Empty reply from server`, and the generated server process exits with `Segmentation fault (core dumped)`.
+- Historical failure behavior: `curl` reports `Empty reply from server`, and the generated server process exits with `Segmentation fault (core dumped)`.
 
-Observed behavior excerpt:
+Historical behavior excerpt:
 
 ```text
 curl: (52) Empty reply from server
@@ -163,11 +180,12 @@ export fn main() i32 {
 
 ## Git interop test compilation can segfault the compiler
 
-- Trigger command: `~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya`
+- Current status (2026-05-29): 不再复现。`~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya` 当前通过，2 个测试均成功。
+- Validation command: `~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya`
 - Expected behavior: compile succeeds and runs the Git interop prototype tests.
-- Actual behavior: the compiler process exits with `Segmentation fault (core dumped)` before producing a runnable binary.
+- Historical failure behavior: the compiler process exits with `Segmentation fault (core dumped)` before producing a runnable binary.
 
-Observed shell output:
+Historical shell output:
 
 ```text
 /bin/bash: line 1: <pid> Segmentation fault ~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya
@@ -181,16 +199,18 @@ Current smallest known reproduction inputs:
 
 Notes:
 
-- 同一批 Git interop 代码在更早一次编译中曾成功通过，当前表现疑似 codegen/优化阶段的不稳定崩溃。
-- 在把 `git interop` 测试接入默认 `Makefile test` 前，需要先把这个编译器崩溃独立缩小并稳定复现。
+- 这一条目前应视为历史回归记录；现有 `v0.9.7` 复验中未再出现编译器进程崩溃。
+- `src/hypergit/test_git_interop.uya` 已接入默认 `Makefile test`。
 
 ## `object.codec.decode_object_kind` 可触发 C 后端生成非法 `invalid initializer`
 
-- Observed trigger command: `~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya`
+- Current status (2026-05-29): 项目内路径不再复现。`~/uya/uya/bin/uya test src/hypergit/test_object_codec.uya` 当前通过；`docs/repros/uya_decode_object_kind_invalid_c.uya` 则因为模块根不匹配，已经失效为 standalone repro。
+- Validation command: `~/uya/uya/bin/uya test src/hypergit/test_object_codec.uya`
+- Historical trigger command: `~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya`
 - Expected behavior: generated C compiles successfully, and `decode_object_kind` should just decode envelope kind into `ObjectKind`.
-- Actual behavior: host C toolchain rejects generated C with `invalid initializer`, pointing at the generated `hypergit_object_codec_decode_object_kind` function.
+- Historical failure behavior: host C toolchain rejects generated C with `invalid initializer`, pointing at the generated `hypergit_object_codec_decode_object_kind` function.
 
-Observed error excerpt:
+Historical error excerpt:
 
 ```text
 /tmp/uya_output_*.c: In function ‘hypergit_object_codec_decode_object_kind’:
@@ -222,4 +242,4 @@ Current smallest known reproducer set:
 Notes:
 
 - 这个问题和上一条 “Git interop test compilation can segfault the compiler” 不是同一类现象；那条是编译器进程直接崩溃，这条是生成了宿主 C 编译器无法接受的代码。
-- 目前还没有缩到一个不依赖项目模块、但仍稳定触发同一 `invalid initializer` 的更小单文件 repro。
+- `docs/repros/uya_decode_object_kind_invalid_c.uya` 当前会先在类型检查阶段因模块根不匹配失败，因此不再是可用的独立复现输入。

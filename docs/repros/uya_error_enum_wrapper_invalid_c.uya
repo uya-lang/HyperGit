@@ -1,0 +1,35 @@
+use std.runtime.entry;
+
+error WrapperFailed;
+
+enum Kind {
+    A,
+    B
+}
+
+fn kind_from_u16(value: u16) !Kind {
+    if value == 0 as u16 {
+        return Kind.A;
+    }
+    if value == 1 as u16 {
+        return Kind.B;
+    }
+    return error.WrapperFailed;
+}
+
+fn decode_kind(value: u16) !Kind {
+    return kind_from_u16(value) catch |err| {
+        _ = err;
+        return error.WrapperFailed;
+    };
+}
+
+export fn main() i32 {
+    const kind: Kind = decode_kind(1 as u16) catch {
+        return 1;
+    };
+    if kind != Kind.B {
+        return 2;
+    }
+    return 0;
+}

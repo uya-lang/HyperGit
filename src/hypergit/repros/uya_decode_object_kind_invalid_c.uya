@@ -1,0 +1,31 @@
+use std.runtime.entry;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.codec.codec_encode_object;
+use object.codec.decode_object_kind;
+use object.types.ObjectKind;
+use object.types.object_kind_to_u16;
+
+export fn main() i32 {
+    var payload: [byte: 4] = ['t' as byte, 'e' as byte, 's' as byte, 't' as byte];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0 as usize;
+    codec_encode_object(buf[0: 128], &offset, object_kind_to_u16(ObjectKind.SmallBlob), 0u16, payload[0: 4]) catch {
+        return 1;
+    };
+
+    var read_offset: usize = 0 as usize;
+    const kind: ObjectKind = decode_object_kind(buf[0: offset], &read_offset) catch {
+        return 2;
+    };
+    if kind != ObjectKind.SmallBlob {
+        return 3;
+    }
+
+    var arena_buf: [byte: 32] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32 as usize);
+    _ = arena;
+    return 0;
+}

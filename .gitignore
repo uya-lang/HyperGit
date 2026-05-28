@@ -5,3 +5,4 @@ bin/*
 !bin/.gitkeep
 build/*
 !build/.gitkeep
+.marscode/deviceInfo.json

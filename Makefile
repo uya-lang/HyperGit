@@ -22,6 +22,8 @@ test:
 	$(UYA) test src/hypergit/test_object_model.uya
 	$(UYA) test src/hypergit/test_policy_placeholder.uya
 	$(UYA) test src/hypergit/test_object_codec.uya
+	$(UYA) test src/hypergit/test_compiler_regressions.uya
+	$(UYA) test src/hypergit/test_git_interop.uya
 	$(UYA) test src/hypergit/test_large_chunker.uya
 	$(UYA) test src/hypergit/test_large_chunk_hash.uya
 	$(UYA) test src/hypergit/test_large_chunk_store.uya
