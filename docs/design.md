@@ -598,11 +598,98 @@ export interface ObjectStore {
 Segment pack 结构：
 
 ```text
-Header
-ObjectRecord...
-IndexFooter
-ChecksumFooter
+.hgp
+  PackHeader
+  ObjectRecord...
+  PackFooter
+
+.hgi
+  PackIndexHeader
+  ObjectIndexEntry...
+  PrefixBloomBlock (optional v1 placeholder)
+  PackIndexFooter
 ```
+
+### 11.1 `.hgp` pack header
+
+`.hgp` 是 append-only data segment；实现只允许尾部追加，不允许原地改写 record。第一版 header 固定 64 bytes，全部 little-endian：
+
+| 偏移 | 字段 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| `0x00` | `magic` | `u32` | 固定为 `HGP1`，用于快速拒绝错误文件类型 |
+| `0x04` | `version` | `u16` | v1 固定为 `1` |
+| `0x06` | `header_bytes` | `u16` | v1 固定为 `64`，后续版本可扩展 header 但必须递增 |
+| `0x08` | `segment_seq` | `u64` | 单仓库单调递增的 segment 序号，对应 `seg-000001.hgp` 命名 |
+| `0x10` | `object_count` | `u64` | 当前 segment 内 record 数量 |
+| `0x18` | `data_bytes` | `u64` | 所有 `ObjectRecord` payload 总字节数，不含 header/footer |
+| `0x20` | `index_ref_offset` | `u64` | 指向 `.hgp` 内 footer 区，保存 sidecar `.hgi` 摘要和 build watermark |
+| `0x28` | `created_at_ms` | `i64` | segment 首次发布时间 |
+| `0x30` | `base_generation` | `u64` | compaction 来源代次；前台直写为 `0` |
+| `0x38` | `flags` | `u32` | 预留位，v1 必须写 `0` |
+| `0x3c` | `header_crc32` | `u32` | 仅覆盖前 60 bytes，用于快速发现 header 损坏 |
+
+`ObjectRecord` 的第一版布局：
+
+| 顺序 | 字段 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| 1 | `record_bytes` | `u32` | 包括 record header + object bytes + trailer 的总长度 |
+| 2 | `kind` | `u16` | `ObjectKind` |
+| 3 | `flags` | `u16` | 压缩/外联/保留位；v1 先全部写 `0` |
+| 4 | `object_id` | `Hash32` | 直接保存对象 ID，便于顺序扫描时校验 |
+| 5 | `payload_crc32` | `u32` | 仅覆盖对象 bytes，不覆盖 record header |
+| 6 | `object_bytes` | `byte slice` | 与 loose object 完全一致的权威字节 |
+| 7 | `trailer_crc32` | `u32` | 覆盖整个 record，便于局部损坏定位 |
+
+约束：
+
+- record 必须按写入顺序 append，不做洞填充；删除只能通过 compaction 回收。
+- `object_bytes` 的 canonical 内容必须与 loose store 完全一致，不能因 pack 引入重编码。
+- footer 必须至少包含：`segment_seq`、对应 `.hgi` 文件的 `Hash32`、footer 自身 checksum。
+- 校验顺序固定为：`magic/version` -> `header_crc32` -> `record trailer_crc32` -> `payload_crc32`。
+
+### 11.2 `.hgi` pack index
+
+`.hgi` 是 sidecar index，允许重建。v1 采用按 `object_id` 升序排列的定长主表，方便二分查找和后续 mmap。
+
+`PackIndexHeader` 固定 48 bytes：
+
+| 偏移 | 字段 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| `0x00` | `magic` | `u32` | 固定为 `HGI1` |
+| `0x04` | `version` | `u16` | v1 固定为 `1` |
+| `0x06` | `header_bytes` | `u16` | v1 固定为 `48` |
+| `0x08` | `segment_seq` | `u64` | 必须与配套 `.hgp` 一致 |
+| `0x10` | `entry_count` | `u64` | 主表 entry 数量 |
+| `0x18` | `entries_offset` | `u64` | 主表起始偏移，v1 固定为 `48` |
+| `0x20` | `bloom_offset` | `u64` | prefix bloom block 起始偏移；v1 无 bloom 时等于 footer offset |
+| `0x28` | `header_crc32` | `u32` | 覆盖前 40 bytes |
+| `0x2c` | `reserved` | `u32` | v1 必须写 `0` |
+
+`ObjectIndexEntry` 固定 64 bytes：
+
+| 偏移 | 字段 | 类型 | 说明 |
+| --- | --- | --- | --- |
+| `0x00` | `object_id` | `Hash32` | 主键，整表按它严格升序 |
+| `0x20` | `record_offset` | `u64` | 指向 `.hgp` 内对应 `ObjectRecord` 起始位置 |
+| `0x28` | `record_bytes` | `u32` | record 总长度 |
+| `0x2c` | `kind` | `u16` | `ObjectKind`，用于快速跳过非目标类型 |
+| `0x2e` | `flags` | `u16` | 与 pack record flags 对齐 |
+| `0x30` | `logical_size` | `u64` | 对 blob/chunk 可直接提供统计信息；commit/manifest 记编码字节数 |
+| `0x38` | `prefix_hint` | `u32` | 预留给路径/模块 locality hint，v1 可写 `0` |
+| `0x3c` | `entry_crc32` | `u32` | 覆盖前 60 bytes |
+
+`PackIndexFooter` 至少包含：
+
+- `pack_hash: Hash32`：对应 `.hgp` 全文件 hash。
+- `entries_hash: Hash32`：主表 hash，用于重建后快速比对。
+- `footer_crc32: u32`：覆盖整个 footer。
+
+约束：
+
+- `.hgi` 损坏只允许降级到慢路径，不得把对象内容读错。
+- `record_offset + record_bytes` 必须落在 `.hgp` 数据区边界内；越界直接视为索引损坏。
+- 同一 `object_id` 在一个 `.hgi` 中只能出现一次；compaction 去重由 writer 保证。
+- v1 的 bloom block 可以为空，但 `bloom_offset` 仍需指向 footer，以便后续版本原地扩展。
 
 分组维度：
 

@@ -1,0 +1,379 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.string.strlen;
+
+use libc.free;
+use libc.fprintf;
+use libc.malloc;
+use libc.stderr;
+use cli.EXIT_OK;
+use cli.EXIT_RUNTIME_ERROR;
+use cli.EXIT_USAGE_ERROR;
+use commands.checkout.checkout_apply_plan;
+use commands.checkout.checkout_current_local_changes;
+use commands.checkout.checkout_current_sparse_profile;
+use commands.checkout.checkout_current_state;
+use commands.checkout.checkout_manifest_inputs_from_commit;
+use commands.checkout.checkout_state_has_base_commit;
+use commands.checkout.checkout_sync_virtual_state;
+use commands.checkout.CHECKOUT_DIRTY_TEXT;
+use commands.checkout.CHECKOUT_NO_COMMITS_TEXT;
+use commands.checkout.CHECKOUT_NOT_REPO_TEXT;
+use commands.checkout.CHECKOUT_PERMISSION_TEXT;
+use manifest.path.manifest_path_compare;
+use manifest.path.manifest_path_normalize;
+use manifest.query.ManifestPathspecList;
+use manifest.query.manifest_pathspec_list_from_slice;
+use manifest.query.manifest_pathspec_matches_any;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use object.types.ByteList;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_join_literal;
+use store.repo_layout.repo_read_config;
+use workspace.checkout_plan.CheckoutAction;
+use workspace.checkout_plan.CheckoutActionKind;
+use workspace.checkout_plan.CheckoutActionList;
+use workspace.checkout_plan.CheckoutPathList;
+use workspace.checkout_plan.CheckoutPlan;
+use workspace.local_view.workspace_local_view_filter_expected_inputs;
+use workspace.local_view.workspace_local_view_filter_target_inputs;
+use workspace.local_view.workspace_local_view_find_change;
+use workspace.local_view.workspace_local_view_merge_virtual_changes;
+use workspace.reconcile.workspace_reconcile_scan;
+use workspace.sparse_profile.SparseProfile;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
+use workspace.state.WorkspaceState;
+
+const DEHYDRATE_ARENA_BYTES: usize = 33554432 as usize;
+
+error DehydrateAlloc;
+error DehydrateDirtyPath;
+error DehydrateNoMatches;
+
+export const DEHYDRATE_USAGE_TEXT: &const byte = "error: dehydrate requires at least one pathspec\n";
+export const DEHYDRATE_FAILURE_TEXT: &const byte = "error: failed to dehydrate workspace paths\n";
+export const DEHYDRATE_NO_MATCH_TEXT: &const byte = "error: pathspec did not match any tracked paths\n";
+
+fn dehydrate_manifest_has_path(inputs: &ManifestLeafInputList, path: &ByteList) bool {
+    var i: usize = 0;
+    while i < inputs.len {
+        if manifest_path_compare(&inputs.ptr[i].path, path) == 0 {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn dehydrate_collect_pathspecs(arena: &Arena, argc: i32) !ManifestPathspecList {
+    const pathspec_count: usize = (argc - 2) as usize;
+    const raw_specs: &ByteList = arena_alloc(arena, @size_of(ByteList) as usize * pathspec_count) as &ByteList;
+    if raw_specs == null {
+        return error.DehydrateAlloc;
+    }
+
+    var i: usize = 0;
+    while i < pathspec_count {
+        const raw_arg: &byte = get_argv(i as i32 + 2);
+        const normalized: ByteList = try manifest_path_normalize(arena, (raw_arg as &byte)[0: strlen(raw_arg as &const byte)]);
+        raw_specs[i] = ByteList{ ptr: normalized.ptr, len: normalized.len };
+        i = i + 1 as usize;
+    }
+    return manifest_pathspec_list_from_slice(raw_specs[0: pathspec_count]);
+}
+
+fn dehydrate_load_effective_changes(
+    arena: &Arena,
+    root: &RepoPath,
+    current_inputs: &ManifestLeafInputList,
+    current_local_changes: &LocalChangeList,
+    current_state: &WorkspaceState,
+) !LocalChangeList {
+    const current_materialized: ManifestLeafInputList = try workspace_local_view_filter_expected_inputs(
+        arena,
+        current_inputs,
+        current_local_changes,
+    );
+    const current_reconcile: LocalChangeList = try workspace_reconcile_scan(
+        arena,
+        repo_path_cstr(root) as &const byte,
+        &current_materialized,
+        current_state.watcher_seq,
+        current_state.watcher_seq + 1u64,
+    );
+    return workspace_local_view_merge_virtual_changes(
+        arena,
+        current_inputs,
+        &current_materialized,
+        &current_reconcile,
+        current_state.watcher_seq,
+        current_state.watcher_seq + 1u64,
+    );
+}
+
+fn dehydrate_build_actions(
+    arena: &Arena,
+    current_inputs: &ManifestLeafInputList,
+    current_changes: &LocalChangeList,
+    pathspecs: ManifestPathspecList,
+) !CheckoutActionList {
+    var matched_count: usize = 0;
+    var delete_count: usize = 0;
+    var i: usize = 0;
+    while i < current_inputs.len {
+        const input: &ManifestLeafInputEntry = &current_inputs.ptr[i];
+        if manifest_pathspec_matches_any(ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len }, &input.path) {
+            matched_count = matched_count + 1 as usize;
+            const change_index: isize = workspace_local_view_find_change(current_changes, &input.path);
+            if change_index >= 0 as isize {
+                const status: ChangeStatus = current_changes.ptr[change_index as usize].status;
+                if status == ChangeStatus.Added || status == ChangeStatus.Modified || status == ChangeStatus.Conflict {
+                    return error.DehydrateDirtyPath;
+                }
+                if status == ChangeStatus.Materialized {
+                    delete_count = delete_count + 1 as usize;
+                }
+            }
+        }
+        i = i + 1 as usize;
+    }
+    if matched_count == 0 {
+        return error.DehydrateNoMatches;
+    }
+    if delete_count == 0 {
+        return CheckoutActionList{ ptr: null, len: 0 };
+    }
+
+    const raw_actions: &CheckoutAction = arena_alloc(arena, @size_of(CheckoutAction) as usize * delete_count) as &CheckoutAction;
+    if raw_actions == null {
+        return error.DehydrateAlloc;
+    }
+
+    var out_index: usize = 0;
+    i = 0;
+    while i < current_inputs.len {
+        const input: &ManifestLeafInputEntry = &current_inputs.ptr[i];
+        if !manifest_pathspec_matches_any(ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len }, &input.path) {
+            i = i + 1 as usize;
+            continue;
+        }
+        const change_index: isize = workspace_local_view_find_change(current_changes, &input.path);
+        if change_index >= 0 as isize && current_changes.ptr[change_index as usize].status == ChangeStatus.Materialized {
+            raw_actions[out_index] = CheckoutAction{
+                kind: CheckoutActionKind.DeleteFile,
+                path: ByteList{ ptr: input.path.ptr, len: input.path.len },
+                object_id: input.object_id,
+                file_mode: input.mode,
+            };
+            out_index = out_index + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return CheckoutActionList{ ptr: raw_actions, len: out_index };
+}
+
+fn dehydrate_clone_overrides(
+    arena: &Arena,
+    changes: &LocalChangeList,
+    current_inputs: &ManifestLeafInputList,
+    pathspecs: ManifestPathspecList,
+) !LocalChangeList {
+    if changes.len == 0 {
+        return LocalChangeList{ ptr: null, len: 0 };
+    }
+
+    const raw_changes: &LocalChange = arena_alloc(arena, @size_of(LocalChange) as usize * changes.len) as &LocalChange;
+    if raw_changes == null {
+        return error.DehydrateAlloc;
+    }
+
+    var i: usize = 0;
+    while i < changes.len {
+        raw_changes[i] = changes.ptr[i];
+        if dehydrate_manifest_has_path(current_inputs, &raw_changes[i].path) &&
+            manifest_pathspec_matches_any(ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len }, &raw_changes[i].path) {
+            raw_changes[i].status = ChangeStatus.Virtual;
+        }
+        i = i + 1 as usize;
+    }
+    return LocalChangeList{ ptr: raw_changes, len: changes.len };
+}
+
+export fn run_dehydrate() i32 {
+    const argc: i32 = get_argc();
+    if argc <= 2 {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_USAGE_TEXT);
+        return EXIT_USAGE_ERROR;
+    }
+
+    const root: RepoPath = repo_find_root_from_cwd() catch |err| {
+        if @error_id(err) == @error_id(error.RepoNotFound) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_NOT_REPO_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const config: RepoConfig = repo_read_config(&root) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const arena_storage: &byte = malloc(DEHYDRATE_ARENA_BYTES) as &byte;
+    if arena_storage == null {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    defer {
+        free(arena_storage as &void);
+    }
+    var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+    arena_init(&arena, arena_storage, DEHYDRATE_ARENA_BYTES);
+
+    const pathspecs: ManifestPathspecList = dehydrate_collect_pathspecs(&arena, argc) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_state: WorkspaceState = checkout_current_state(&arena, &root, &config) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    if !checkout_state_has_base_commit(&current_state) {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_NO_COMMITS_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+
+    const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_profile: SparseProfile = checkout_current_sparse_profile(&arena, &root) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_local_changes: LocalChangeList = checkout_current_local_changes(&arena, &root) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_inputs: ManifestLeafInputList = checkout_manifest_inputs_from_commit(&arena, &store, &current_state.base_commit) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_changes: LocalChangeList = dehydrate_load_effective_changes(
+        &arena,
+        &root,
+        &current_inputs,
+        &current_local_changes,
+        &current_state,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const actions: CheckoutActionList = dehydrate_build_actions(&arena, &current_inputs, &current_changes, pathspecs) catch |err| {
+        if @error_id(err) == @error_id(error.DehydrateDirtyPath) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_DIRTY_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.DehydrateNoMatches) {
+            fprintf(stderr, "%s" as *byte, DEHYDRATE_NO_MATCH_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const plan: CheckoutPlan = CheckoutPlan{
+        actions: actions,
+        blocked_paths: CheckoutPathList{ ptr: null, len: 0 },
+    };
+    checkout_apply_plan(&arena, &store, &root, &plan) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const updated_changes: LocalChangeList = dehydrate_clone_overrides(
+        &arena,
+        &current_changes,
+        &current_inputs,
+        ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+    ) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const target_materialized: ManifestLeafInputList = workspace_local_view_filter_target_inputs(
+        &arena,
+        &current_inputs,
+        &current_profile,
+        &updated_changes,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    var next_state: WorkspaceState = checkout_current_state(&arena, &root, &config) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const final_changes: LocalChangeList = workspace_reconcile_scan(
+        &arena,
+        repo_path_cstr(&root) as &const byte,
+        &target_materialized,
+        next_state.watcher_seq + 1u64,
+        next_state.watcher_seq + 2u64,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    checkout_sync_virtual_state(
+        &arena,
+        &root,
+        &next_state.base_commit,
+        &current_inputs,
+        &target_materialized,
+        &final_changes,
+        &next_state,
+        next_state.watcher_seq + 1u64,
+        next_state.watcher_seq + 2u64,
+    ) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, DEHYDRATE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    return EXIT_OK;
+}

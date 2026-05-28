@@ -225,23 +225,23 @@
 
 ## 13. Sparse / Hydrate
 
-- [ ] 定义 sparse profile 格式。
-- [ ] 实现 `hgx sparse add`。
-- [ ] 实现 `hgx sparse remove`。
-- [ ] 实现 sparse profile 持久化。
-- [ ] 实现 virtual path 状态。
-- [ ] 实现 `hgx hydrate <pathspec>`。
-- [ ] 实现 `hgx dehydrate <pathspec>`。
-- [ ] 实现缺失对象错误提示。
-- [ ] 实现 hydrate 进度输出。
-- [ ] 测试 sparse add 后 checkout 范围变化。
-- [ ] 测试 dehydrate 不删除 dirty file。
-- [ ] 测试 hydrate 恢复文件内容。
+- [x] 定义 sparse profile 格式。
+- [x] 实现 `hgx sparse add`。
+- [x] 实现 `hgx sparse remove`。
+- [x] 实现 sparse profile 持久化。
+- [x] 实现 virtual path 状态。
+- [x] 实现 `hgx hydrate <pathspec>`。
+- [x] 实现 `hgx dehydrate <pathspec>`。
+- [x] 实现缺失对象错误提示。
+- [x] 实现 hydrate 进度输出。
+- [x] 测试 sparse add 后 checkout 范围变化。
+- [x] 测试 dehydrate 不删除 dirty file。
+- [x] 测试 hydrate 恢复文件内容。
 
 ## 14. Segment Pack
 
-- [ ] 设计 `.hgp` pack header。
-- [ ] 设计 `.hgi` pack index。
+- [x] 设计 `.hgp` pack header。
+- [x] 设计 `.hgi` pack index。
 - [ ] 实现 segment writer。
 - [ ] 实现 segment reader。
 - [ ] 实现 object record checksum。

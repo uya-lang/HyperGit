@@ -9,6 +9,7 @@ use object.types.ByteList;
 
 export enum ChangeStatus {
     Materialized,
+    Virtual,
     Added,
     Modified,
     Deleted,
@@ -80,7 +81,7 @@ export fn workspace_state_with_counts(
 }
 
 export fn change_status_is_dirty(status: ChangeStatus) bool {
-    return status != ChangeStatus.Materialized;
+    return status != ChangeStatus.Materialized && status != ChangeStatus.Virtual;
 }
 
 export fn local_change_is_dirty(change: &LocalChange) bool {

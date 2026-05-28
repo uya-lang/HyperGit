@@ -45,6 +45,7 @@ export const HGIT_INDEXES_REL: &const byte = ".hgit/indexes";
 export const HGIT_INDEXES_COMMIT_GRAPH_REL: &const byte = ".hgit/indexes/commit-graph.hgi";
 export const HGIT_WORKSPACE_REL: &const byte = ".hgit/workspace";
 export const HGIT_WORKSPACE_STATE_REL: &const byte = ".hgit/workspace/state.json";
+export const HGIT_WORKSPACE_SPARSE_REL: &const byte = ".hgit/workspace/sparse.json";
 export const HGIT_WORKSPACE_STAGE_REL: &const byte = ".hgit/workspace/stage.hgi";
 export const HGIT_WORKSPACE_LOCAL_CHANGE_REL: &const byte = ".hgit/workspace/local-change.hgi";
 

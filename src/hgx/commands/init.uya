@@ -11,6 +11,7 @@ use cli.EXIT_RUNTIME_ERROR;
 use object.types.ByteList;
 use store.repo_layout.RepoInitResult;
 use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
+use store.repo_layout.HGIT_WORKSPACE_SPARSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STATE_REL;
 use store.repo_layout.RepoPath;
 use store.repo_layout.repo_init_current_dir;
@@ -18,6 +19,10 @@ use store.repo_layout.repo_path_join_literal;
 use store.repo_layout.repo_path_cstr;
 use workspace.local_change_file.local_change_file_read;
 use workspace.local_change_file.local_change_file_write;
+use workspace.sparse_profile.SparseProfile;
+use workspace.sparse_profile.sparse_profile_default;
+use workspace.sparse_profile.sparse_profile_file_read;
+use workspace.sparse_profile.sparse_profile_file_write;
 use workspace.state.LocalChangeList;
 use workspace.state.WorkspaceState;
 use workspace.state.workspace_state_init;
@@ -40,6 +45,25 @@ fn init_ensure_workspace_state(root: &RepoPath) !void {
     var st: Stat = Stat{};
     if stat(repo_path_cstr(&state_path) as &const byte, &st) != 0 {
         const state: WorkspaceState = workspace_state_init(init_repo_root_bytes(root), workspace_state_zero_commit());
+        try workspace_state_file_write(repo_path_cstr(&state_path) as &const byte, &state);
+    }
+}
+
+fn init_ensure_sparse_profile(root: &RepoPath) !void {
+    const sparse_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_SPARSE_REL);
+    var st: Stat = Stat{};
+    if stat(repo_path_cstr(&sparse_path) as &const byte, &st) != 0 {
+        var arena_buf: [byte: 4096] = [];
+        var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+        arena_init(&arena, &arena_buf[0], 4096 as usize);
+        const profile: SparseProfile = try sparse_profile_default(&arena);
+        try sparse_profile_file_write(repo_path_cstr(&sparse_path) as &const byte, &profile);
+
+        const state_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STATE_REL);
+        var state: WorkspaceState = workspace_state_file_read(&arena, repo_path_cstr(&state_path) as &const byte) catch {
+            return;
+        };
+        state.sparse_profile_id = profile.profile_id;
         try workspace_state_file_write(repo_path_cstr(&state_path) as &const byte, &state);
     }
 }
@@ -68,6 +92,10 @@ export fn run_init() i32 {
     };
 
     init_ensure_workspace_state(&result.repo_root) catch {
+        fprintf(stderr, "%s" as *byte, INIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    init_ensure_sparse_profile(&result.repo_root) catch {
         fprintf(stderr, "%s" as *byte, INIT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };

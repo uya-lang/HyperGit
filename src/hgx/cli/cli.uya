@@ -11,6 +11,9 @@ export enum DispatchAction {
     Status,
     Diff,
     Checkout,
+    Hydrate,
+    Dehydrate,
+    Sparse,
     Add,
     Commit,
     Log,
@@ -76,6 +79,30 @@ export fn plan_from_first_arg(argc: i32, first_arg: &byte) DispatchPlan {
     if same_arg(first_arg, "checkout") {
         return DispatchPlan {
             action: DispatchAction.Checkout,
+            exit_code: EXIT_OK,
+            subject: first_arg,
+        };
+    }
+
+    if same_arg(first_arg, "hydrate") {
+        return DispatchPlan {
+            action: DispatchAction.Hydrate,
+            exit_code: EXIT_OK,
+            subject: first_arg,
+        };
+    }
+
+    if same_arg(first_arg, "dehydrate") {
+        return DispatchPlan {
+            action: DispatchAction.Dehydrate,
+            exit_code: EXIT_OK,
+            subject: first_arg,
+        };
+    }
+
+    if same_arg(first_arg, "sparse") {
+        return DispatchPlan {
+            action: DispatchAction.Sparse,
             exit_code: EXIT_OK,
             subject: first_arg,
         };

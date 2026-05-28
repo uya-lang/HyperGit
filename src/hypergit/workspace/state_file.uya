@@ -15,10 +15,8 @@ use std.json.value.JsonValue;
 use std.string.strlen;
 
 use libc.free;
-use libc.fprintf;
 use libc.malloc;
 use libc.rename;
-use libc.stderr;
 use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.HASH32_HEX_BYTES;
@@ -297,8 +295,6 @@ export fn workspace_state_file_read(arena: &Arena, path: &const byte) !Workspace
     const materialized_count: u64 = try workspace_state_parse_u64_value(input, "\"materialized_count\":");
     const dirty_count: u64 = try workspace_state_parse_u64_value(input, "\"dirty_count\":");
     const watcher_seq: u64 = try workspace_state_parse_u64_value(input, "\"watcher_seq\":");
-    fprintf(stderr, "state-parse root=%zu base=%zu view=%zu sparse=%zu mat=%llu dirty=%llu watcher=%llu\n" as *byte, root.len, base_hex.len, view_hex.len, sparse_hex.len, materialized_count, dirty_count, watcher_seq);
-
     if base_hex.len != HASH32_HEX_BYTES || view_hex.len != HASH32_HEX_BYTES || sparse_hex.len != HASH32_HEX_BYTES {
         return error.WorkspaceStateFileInvalid;
     }

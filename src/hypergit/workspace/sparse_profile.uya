@@ -1,0 +1,474 @@
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.fwrite;
+use std.json.encoder.json_expect_i64;
+use std.json.encoder.json_expect_str;
+use std.json.encoder.json_object_find_index;
+use std.json.parser.parse;
+use std.json.value.JsonArray;
+use std.json.value.JsonObject;
+use std.json.value.JsonStrView;
+use std.json.value.JsonValue;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.string.strlen;
+
+use libc.free;
+use libc.malloc;
+use libc.rename;
+use libc.Stat;
+use libc.stat;
+use core.ids.Hash32;
+use core.ids.hash_domain_payload;
+use manifest.path.manifest_path_normalize;
+use manifest.query.manifest_pathspec_matches_path;
+use object.types.ByteList;
+
+export const SPARSE_PROFILE_VERSION: i64 = 1i64;
+const SPARSE_PROFILE_BYTES_MAX: usize = 65536 as usize;
+const SPARSE_PROFILE_PATH_MAX: usize = 4096 as usize;
+
+error SparseProfileAlloc;
+error SparseProfileInvalid;
+error SparseProfileNotFound;
+error SparseProfileOpenFailed;
+error SparseProfileReadFailed;
+error SparseProfileWriteFailed;
+error SparseProfileTooLarge;
+error SparseProfilePathTooLong;
+
+export enum SparseRuleMode {
+    Include,
+    Exclude
+}
+
+export struct SparseRule {
+    pathspec: ByteList,
+    mode: SparseRuleMode
+}
+
+export struct SparseRuleList {
+    ptr: &SparseRule,
+    len: usize
+}
+
+export struct SparseProfile {
+    rules: SparseRuleList,
+    profile_id: Hash32
+}
+
+struct SparseProfilePath {
+    bytes: [byte: 4096] = [],
+    len: usize = 0
+}
+
+fn sparse_profile_path_from_cstr(text: &const byte) !SparseProfilePath {
+    if text == null {
+        return error.SparseProfilePathTooLong;
+    }
+    const len: usize = strlen(text);
+    if len >= SPARSE_PROFILE_PATH_MAX {
+        return error.SparseProfilePathTooLong;
+    }
+    var out: SparseProfilePath = SparseProfilePath{ bytes: [], len: len };
+    var i: usize = 0;
+    while i < len {
+        out.bytes[i] = text[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[len] = 0 as byte;
+    return out;
+}
+
+fn sparse_profile_temp_path(path: &SparseProfilePath) !SparseProfilePath {
+    const suffix: &const byte = ".tmp";
+    const suffix_len: usize = 4 as usize;
+    if path.len + suffix_len >= SPARSE_PROFILE_PATH_MAX {
+        return error.SparseProfilePathTooLong;
+    }
+
+    var out: SparseProfilePath = *path;
+    var i: usize = 0;
+    while i < suffix_len {
+        out.bytes[path.len + i] = suffix[i];
+        i = i + 1 as usize;
+    }
+    out.len = path.len + suffix_len;
+    out.bytes[out.len] = 0 as byte;
+    return out;
+}
+
+fn sparse_profile_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.SparseProfileAlloc;
+    }
+    return raw[0: len];
+}
+
+fn sparse_profile_byte_list_equal(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn sparse_profile_copy_json_str(arena: &Arena, value: JsonStrView) !ByteList {
+    const out: &[byte] = try sparse_profile_arena_bytes(arena, value.len);
+    var i: usize = 0;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn sparse_profile_mode_from_str(text: &ByteList) !SparseRuleMode {
+    if text.len == 7 as usize &&
+        text.ptr[0] == 'i' as byte &&
+        text.ptr[1] == 'n' as byte &&
+        text.ptr[2] == 'c' as byte &&
+        text.ptr[3] == 'l' as byte &&
+        text.ptr[4] == 'u' as byte &&
+        text.ptr[5] == 'd' as byte &&
+        text.ptr[6] == 'e' as byte {
+        return SparseRuleMode.Include;
+    }
+    if text.len == 7 as usize &&
+        text.ptr[0] == 'e' as byte &&
+        text.ptr[1] == 'x' as byte &&
+        text.ptr[2] == 'c' as byte &&
+        text.ptr[3] == 'l' as byte &&
+        text.ptr[4] == 'u' as byte &&
+        text.ptr[5] == 'd' as byte &&
+        text.ptr[6] == 'e' as byte {
+        return SparseRuleMode.Exclude;
+    }
+    return error.SparseProfileInvalid;
+}
+
+fn sparse_profile_mode_text(mode: SparseRuleMode) &const byte {
+    if mode == SparseRuleMode.Include {
+        return "include" as &const byte;
+    }
+    return "exclude" as &const byte;
+}
+
+export fn sparse_rule_list_from_slice(slice: &[SparseRule]) SparseRuleList {
+    return SparseRuleList{ ptr: slice.ptr, len: slice.len };
+}
+
+fn sparse_profile_json_string_len(value: &ByteList) usize {
+    var total: usize = 2 as usize;
+    var i: usize = 0;
+    while i < value.len {
+        const ch: byte = value.ptr[i];
+        if ch == '"' as byte || ch == '\\' as byte {
+            total = total + 2 as usize;
+        } else {
+            total = total + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn sparse_profile_write_literal(output: &[byte], offset: &usize, text: &const byte) !void {
+    const len: usize = strlen(text);
+    if *offset + len > output.len {
+        return error.SparseProfileWriteFailed;
+    }
+    var i: usize = 0;
+    while i < len {
+        output.ptr[*offset + i] = text[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + len;
+}
+
+fn sparse_profile_write_json_string(output: &[byte], offset: &usize, value: &ByteList) !void {
+    if *offset + sparse_profile_json_string_len(value) > output.len {
+        return error.SparseProfileWriteFailed;
+    }
+    output.ptr[*offset] = '"' as byte;
+    *offset = *offset + 1 as usize;
+
+    var i: usize = 0;
+    while i < value.len {
+        const ch: byte = value.ptr[i];
+        if ch == '"' as byte || ch == '\\' as byte {
+            output.ptr[*offset] = '\\' as byte;
+            *offset = *offset + 1 as usize;
+        }
+        output.ptr[*offset] = ch;
+        *offset = *offset + 1 as usize;
+        i = i + 1 as usize;
+    }
+
+    output.ptr[*offset] = '"' as byte;
+    *offset = *offset + 1 as usize;
+}
+
+fn sparse_profile_json_len(profile: &SparseProfile) usize {
+    var total: usize = strlen("{\"version\":1,\"rules\":[") + strlen("]}\n");
+    var i: usize = 0;
+    while i < profile.rules.len {
+        if i > 0 {
+            total = total + 1 as usize;
+        }
+        total = total +
+            strlen("{\"mode\":\"") +
+            strlen(sparse_profile_mode_text(profile.rules.ptr[i].mode)) +
+            strlen("\",\"pathspec\":") +
+            sparse_profile_json_string_len(&profile.rules.ptr[i].pathspec) +
+            1 as usize;
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn sparse_profile_write_json(output: &[byte], profile: &SparseProfile) !usize {
+    var offset: usize = 0;
+    try sparse_profile_write_literal(output, &offset, "{\"version\":1,\"rules\":[");
+
+    var i: usize = 0;
+    while i < profile.rules.len {
+        if i > 0 {
+            try sparse_profile_write_literal(output, &offset, ",");
+        }
+        try sparse_profile_write_literal(output, &offset, "{\"mode\":\"");
+        try sparse_profile_write_literal(output, &offset, sparse_profile_mode_text(profile.rules.ptr[i].mode));
+        try sparse_profile_write_literal(output, &offset, "\",\"pathspec\":");
+        try sparse_profile_write_json_string(output, &offset, &profile.rules.ptr[i].pathspec);
+        try sparse_profile_write_literal(output, &offset, "}");
+        i = i + 1 as usize;
+    }
+
+    try sparse_profile_write_literal(output, &offset, "]}\n");
+    return offset;
+}
+
+fn sparse_profile_hash_from_rules(arena: &Arena, rules: SparseRuleList) !Hash32 {
+    const profile: SparseProfile = SparseProfile{
+        rules: SparseRuleList{ ptr: rules.ptr, len: rules.len },
+        profile_id: Hash32{ bytes: [] },
+    };
+    const total_len: usize = sparse_profile_json_len(&profile);
+    const payload: &[byte] = try sparse_profile_arena_bytes(arena, total_len);
+    const written: usize = try sparse_profile_write_json(payload, &profile);
+    return hash_domain_payload(arena, "sparse-profile", payload.ptr[0: written]);
+}
+
+fn sparse_profile_from_rules(arena: &Arena, rules: SparseRuleList) !SparseProfile {
+    return SparseProfile{
+        rules: SparseRuleList{ ptr: rules.ptr, len: rules.len },
+        profile_id: try sparse_profile_hash_from_rules(arena, rules),
+    };
+}
+
+export fn sparse_profile_default(arena: &Arena) !SparseProfile {
+    _ = arena;
+    return sparse_profile_from_rules(arena, SparseRuleList{ ptr: null, len: 0 });
+}
+
+export fn sparse_profile_matches(profile: &SparseProfile, path: &ByteList) bool {
+    var visible: bool = true;
+    var i: usize = 0;
+    while i < profile.rules.len {
+        const rule: &SparseRule = &profile.rules.ptr[i];
+        if manifest_pathspec_matches_path(&rule.pathspec, path) {
+            visible = rule.mode == SparseRuleMode.Include;
+        }
+        i = i + 1 as usize;
+    }
+    return visible;
+}
+
+export fn sparse_profile_with_rule(arena: &Arena, profile: &SparseProfile, pathspec: &ByteList, mode: SparseRuleMode) !SparseProfile {
+    var keep_count: usize = 0;
+    var i: usize = 0;
+    while i < profile.rules.len {
+        if !sparse_profile_byte_list_equal(&profile.rules.ptr[i].pathspec, pathspec) {
+            keep_count = keep_count + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+
+    const raw_rules: &SparseRule = arena_alloc(arena, @size_of(SparseRule) as usize * (keep_count + 1 as usize)) as &SparseRule;
+    if raw_rules == null {
+        return error.SparseProfileAlloc;
+    }
+
+    var out_index: usize = 0;
+    i = 0;
+    while i < profile.rules.len {
+        const existing: &SparseRule = &profile.rules.ptr[i];
+        if !sparse_profile_byte_list_equal(&existing.pathspec, pathspec) {
+            raw_rules[out_index] = SparseRule{
+                pathspec: ByteList{ ptr: existing.pathspec.ptr, len: existing.pathspec.len },
+                mode: existing.mode,
+            };
+            out_index = out_index + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+
+    raw_rules[out_index] = SparseRule{
+        pathspec: ByteList{ ptr: pathspec.ptr, len: pathspec.len },
+        mode: mode,
+    };
+    return sparse_profile_from_rules(arena, SparseRuleList{ ptr: raw_rules, len: keep_count + 1 as usize });
+}
+
+export fn sparse_profile_file_read(arena: &Arena, path: &const byte) !SparseProfile {
+    if path == null {
+        return error.SparseProfileNotFound;
+    }
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return error.SparseProfileNotFound;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var st: Stat = Stat{};
+    if stat(path, &st) != 0 {
+        return error.SparseProfileReadFailed;
+    }
+    const size: usize = st.st_size as usize;
+    if size == 0 {
+        return error.SparseProfileInvalid;
+    }
+    if size > SPARSE_PROFILE_BYTES_MAX {
+        return error.SparseProfileTooLarge;
+    }
+
+    const input: &[byte] = try sparse_profile_arena_bytes(arena, size);
+    const read_count: usize = fread(input.ptr, 1 as usize, size, stream);
+    if read_count != size {
+        return error.SparseProfileReadFailed;
+    }
+
+    const value: JsonValue = parse(arena, input.ptr, size) catch {
+        return error.SparseProfileInvalid;
+    };
+    var object: JsonObject = JsonObject{ pairs: null, len: 0 };
+    match value {
+        .obj(o) => { object = o; },
+        else => { return error.SparseProfileInvalid; },
+    }
+
+    const version_index: usize = json_object_find_index(&object, "version", 7 as usize) catch {
+        return error.SparseProfileInvalid;
+    };
+    const rules_index: usize = json_object_find_index(&object, "rules", 5 as usize) catch {
+        return error.SparseProfileInvalid;
+    };
+    const version: i64 = json_expect_i64(&object.pairs[version_index].value) catch {
+        return error.SparseProfileInvalid;
+    };
+    if version != SPARSE_PROFILE_VERSION {
+        return error.SparseProfileInvalid;
+    }
+
+    var rules_array: JsonArray = JsonArray{ items: null, len: 0 };
+    match object.pairs[rules_index].value {
+        .arr(items) => { rules_array = items; },
+        else => { return error.SparseProfileInvalid; },
+    }
+    if rules_array.len == 0 {
+        return sparse_profile_default(arena);
+    }
+
+    const raw_rules: &SparseRule = arena_alloc(arena, @size_of(SparseRule) as usize * rules_array.len) as &SparseRule;
+    if raw_rules == null {
+        return error.SparseProfileAlloc;
+    }
+
+    var i: usize = 0;
+    while i < rules_array.len {
+        var rule_object: JsonObject = JsonObject{ pairs: null, len: 0 };
+        match rules_array.items[i] {
+            .obj(o) => { rule_object = o; },
+            else => { return error.SparseProfileInvalid; },
+        }
+        const mode_index: usize = json_object_find_index(&rule_object, "mode", 4 as usize) catch {
+            return error.SparseProfileInvalid;
+        };
+        const pathspec_index: usize = json_object_find_index(&rule_object, "pathspec", 8 as usize) catch {
+            return error.SparseProfileInvalid;
+        };
+        const mode_text: JsonStrView = json_expect_str(&rule_object.pairs[mode_index].value) catch {
+            return error.SparseProfileInvalid;
+        };
+        const raw_pathspec: JsonStrView = json_expect_str(&rule_object.pairs[pathspec_index].value) catch {
+            return error.SparseProfileInvalid;
+        };
+        const normalized: ByteList = try manifest_path_normalize(arena, raw_pathspec.ptr[0: raw_pathspec.len]);
+        raw_rules[i] = SparseRule{
+            pathspec: ByteList{ ptr: normalized.ptr, len: normalized.len },
+            mode: try sparse_profile_mode_from_str(&ByteList{ ptr: mode_text.ptr, len: mode_text.len }),
+        };
+        i = i + 1 as usize;
+    }
+    return sparse_profile_from_rules(arena, SparseRuleList{ ptr: raw_rules, len: rules_array.len });
+}
+
+export fn sparse_profile_file_default(arena: &Arena, path: &const byte) !SparseProfile {
+    return sparse_profile_file_read(arena, path) catch |err| {
+        if @error_id(err) == @error_id(error.SparseProfileNotFound) {
+            return sparse_profile_default(arena);
+        }
+        return err;
+    };
+}
+
+export fn sparse_profile_file_write(path: &const byte, profile: &SparseProfile) !void {
+    const final_path: SparseProfilePath = try sparse_profile_path_from_cstr(path);
+    const temp_path: SparseProfilePath = try sparse_profile_temp_path(&final_path);
+    const total_len: usize = sparse_profile_json_len(profile);
+    if total_len > SPARSE_PROFILE_BYTES_MAX {
+        return error.SparseProfileTooLarge;
+    }
+
+    const stream: &FILE = fopen(&temp_path.bytes[0] as &const byte, "w");
+    if stream == null {
+        return error.SparseProfileOpenFailed;
+    }
+
+    const payload: &byte = malloc(total_len) as &byte;
+    if payload == null {
+        _ = fclose(stream);
+        return error.SparseProfileAlloc;
+    }
+    defer {
+        free(payload as &void);
+    }
+
+    const output: &[byte] = payload[0: total_len];
+    const written: usize = try sparse_profile_write_json(output, profile);
+    if fwrite(output.ptr as &const byte, 1 as usize, written, stream) != written {
+        _ = fclose(stream);
+        return error.SparseProfileWriteFailed;
+    }
+    if fclose(stream) != 0 {
+        return error.SparseProfileWriteFailed;
+    }
+    if rename(&temp_path.bytes[0] as &const byte, &final_path.bytes[0] as &const byte) != 0 {
+        return error.SparseProfileWriteFailed;
+    }
+}

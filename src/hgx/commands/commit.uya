@@ -56,6 +56,7 @@ use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_INDEXES_COMMIT_GRAPH_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
+use store.repo_layout.HGIT_WORKSPACE_SPARSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STATE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
 use store.repo_layout.RepoConfig;
@@ -64,8 +65,13 @@ use store.repo_layout.repo_find_root_from_cwd;
 use store.repo_layout.repo_path_cstr;
 use store.repo_layout.repo_path_join_literal;
 use store.repo_layout.repo_read_config;
+use workspace.local_change_file.local_change_file_read;
 use workspace.local_change_file.local_change_file_write;
+use workspace.local_view.workspace_local_view_filter_target_inputs;
+use workspace.local_view.workspace_local_view_merge_virtual_changes;
 use workspace.reconcile.workspace_reconcile_scan;
+use workspace.sparse_profile.SparseProfile;
+use workspace.sparse_profile.sparse_profile_file_default;
 use workspace.state.LocalChangeList;
 use workspace.state.local_change_dirty_count;
 use workspace.state.local_change_materialized_count;
@@ -277,31 +283,59 @@ fn commit_write_empty_stage(stage_path: &RepoPath, base_commit: CommitId, timest
     return stage_file_write(repo_path_cstr(stage_path) as &const byte, &snapshot);
 }
 
+fn commit_load_local_changes(arena: &Arena, root: &RepoPath) !LocalChangeList {
+    const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
+    return local_change_file_read(arena, repo_path_cstr(&local_change_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.LocalChangeFileNotFound) {
+            return LocalChangeList{ ptr: null, len: 0 };
+        }
+        return error.CommitStoreFailed;
+    };
+}
+
 fn commit_sync_workspace_state(
     arena: &Arena,
     root: &RepoPath,
     commit_id: &CommitId,
     manifest_inputs: &ManifestLeafInputList,
 ) !void {
+    const sparse_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_SPARSE_REL);
+    const profile: SparseProfile = try sparse_profile_file_default(arena, repo_path_cstr(&sparse_path) as &const byte);
+    const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
+    const stored_changes: LocalChangeList = try commit_load_local_changes(arena, root);
+    const materialized_inputs: ManifestLeafInputList = try workspace_local_view_filter_target_inputs(
+        arena,
+        manifest_inputs,
+        &profile,
+        &stored_changes,
+    );
     const local_changes: LocalChangeList = try workspace_reconcile_scan(
         arena,
         repo_path_cstr(root) as &const byte,
-        manifest_inputs,
+        &materialized_inputs,
         0u64,
         1u64,
     );
-    const state: WorkspaceState = workspace_state_with_counts(
+    const merged_changes: LocalChangeList = try workspace_local_view_merge_virtual_changes(
+        arena,
+        manifest_inputs,
+        &materialized_inputs,
+        &local_changes,
+        0u64,
+        1u64,
+    );
+    var state: WorkspaceState = workspace_state_with_counts(
         commit_repo_root_bytes(root),
         commit_id[0],
-        local_change_materialized_count(&local_changes),
-        local_change_dirty_count(&local_changes),
+        local_change_materialized_count(&merged_changes),
+        local_change_dirty_count(&merged_changes),
         0u64,
     );
+    state.sparse_profile_id = profile.profile_id;
     const state_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STATE_REL);
     try workspace_state_file_write(repo_path_cstr(&state_path) as &const byte, &state);
 
-    const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
-    try local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &local_changes);
+    try local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &merged_changes);
 }
 
 fn commit_parent_payload(arena: &Arena, store: &LooseObjectStore, parent: &CommitId) !CommitPayload {

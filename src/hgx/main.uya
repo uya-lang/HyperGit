@@ -8,9 +8,12 @@ use cli.plan_from_first_arg;
 use commands.add.run_add;
 use commands.commit.run_commit;
 use commands.checkout.run_checkout;
+use commands.dehydrate.run_dehydrate;
 use commands.diff.run_diff;
 use commands.help.run_help;
+use commands.hydrate.run_hydrate;
 use commands.log.run_log;
+use commands.sparse.run_sparse;
 use commands.version.run_version;
 use commands.status.run_status;
 use commands.doctor.run_doctor;
@@ -32,6 +35,12 @@ export fn main() i32 {
         return run_diff();
     } else if plan.action == DispatchAction.Checkout {
         return run_checkout();
+    } else if plan.action == DispatchAction.Hydrate {
+        return run_hydrate();
+    } else if plan.action == DispatchAction.Dehydrate {
+        return run_dehydrate();
+    } else if plan.action == DispatchAction.Sparse {
+        return run_sparse();
     } else if plan.action == DispatchAction.Add {
         return run_add();
     } else if plan.action == DispatchAction.Commit {

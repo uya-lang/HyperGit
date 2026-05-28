@@ -1,0 +1,59 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.system;
+use manifest.path.manifest_path_normalize;
+use object.types.ByteList;
+use workspace.sparse_profile.SparseProfile;
+use workspace.sparse_profile.SparseRuleMode;
+use workspace.sparse_profile.sparse_profile_default;
+use workspace.sparse_profile.sparse_profile_file_read;
+use workspace.sparse_profile.sparse_profile_file_write;
+use workspace.sparse_profile.sparse_profile_matches;
+use workspace.sparse_profile.sparse_profile_with_rule;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn normalize_literal(arena: &Arena, text: &const byte) !ByteList {
+    return try manifest_path_normalize(arena, literal_bytes(text));
+}
+
+fn test_sparse_profile_roundtrip_and_match_rules() !void {
+    try expect(system("rm -rf build/sparse-profile-test && mkdir -p build/sparse-profile-test") == 0);
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    var profile: SparseProfile = try sparse_profile_default(&arena);
+    const docs: ByteList = try normalize_literal(&arena, "docs");
+    const docs_api: ByteList = try normalize_literal(&arena, "docs/api");
+    profile = try sparse_profile_with_rule(&arena, &profile, &docs, SparseRuleMode.Exclude);
+    profile = try sparse_profile_with_rule(&arena, &profile, &docs_api, SparseRuleMode.Include);
+    try sparse_profile_file_write("build/sparse-profile-test/sparse.json", &profile);
+
+    const loaded: SparseProfile = try sparse_profile_file_read(&arena, "build/sparse-profile-test/sparse.json");
+    const docs_readme: ByteList = try normalize_literal(&arena, "docs/readme.md");
+    const docs_api_index: ByteList = try normalize_literal(&arena, "docs/api/index.md");
+    const src_main: ByteList = try normalize_literal(&arena, "src/main.uya");
+
+    try expect(loaded.rules.len == 2 as usize);
+    try expect(!sparse_profile_matches(&loaded, &docs_readme));
+    try expect(sparse_profile_matches(&loaded, &docs_api_index));
+    try expect(sparse_profile_matches(&loaded, &src_main));
+    try expect(system("grep -F '\"mode\":\"exclude\"' build/sparse-profile-test/sparse.json >/dev/null") == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Sparse Profile Tests");
+    run_test("sparse profile roundtrip and match rules", test_sparse_profile_roundtrip_and_match_rules);
+    return test_suite_end();
+}

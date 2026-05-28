@@ -35,11 +35,13 @@ test:
 	$(UYA) test src/hypergit/test_workspace_scan.uya
 	$(UYA) test src/hypergit/test_workspace_state_file.uya
 	$(UYA) test src/hypergit/test_local_change_file.uya
+	$(UYA) test src/hypergit/test_sparse_profile.uya
 	$(UYA) test src/hypergit/test_workspace_reconcile.uya
 	$(UYA) test src/hypergit/test_loose_store.uya
 	$(UYA) test src/hypergit/test_checkout_plan.uya
 	$(UYA) test src/hgx/test_repo_layout.uya
 	$(UYA) test src/hgx/test_head_ref.uya
+	$(UYA) test src/hgx/test_hydrate_missing_object.uya
 	$(UYA) test src/hgx/test_commit_partial_stage.uya
 	$(UYA) test src/hgx/test_cli_args.uya
 	./tests/test_cli_golden.sh
@@ -56,6 +58,9 @@ test:
 	./tests/test_checkout_content.sh
 	./tests/test_checkout_dirty.sh
 	./tests/test_checkout_state_recovery.sh
+	./tests/test_sparse_checkout.sh
+	./tests/test_dehydrate_dirty.sh
+	./tests/test_hydrate_restore.sh
 	./tests/test_repo_init.sh
 	./tests/test_status_empty.sh
 	./tests/test_status_clean.sh

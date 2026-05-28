@@ -1,0 +1,67 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use libc.chdir;
+use libc.remove;
+use libc.system;
+use core.ids.CommitId;
+use manifest.load.manifest_load_flatten;
+use manifest.trie.ManifestLeafInputList;
+use object.codec.decode_commit_object;
+use object.types.CommitPayload;
+use store.head_ref.repo_read_head_commit;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_object_path;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_current_dir;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_read_config;
+
+fn test_hydrate_reports_missing_object_path() !void {
+    const suite_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("/home/winger/uya/HyperGit") == 0);
+
+    try expect(system("rm -rf build/hydrate-missing-test && mkdir -p build/hydrate-missing-test/repo build/hydrate-missing-test/bin") == 0);
+    try expect(system("$HOME/uya/uya/bin/uya build src/hgx/main.uya -o build/hydrate-missing-test/bin/hgx >/dev/null 2>&1") == 0);
+    try expect(system("cd build/hydrate-missing-test/repo && ../bin/hgx init >/dev/null 2>&1 && mkdir -p src && printf source >src/main.uya && ../bin/hgx add src/main.uya >/dev/null 2>&1 && HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' ../bin/hgx commit -m first >/dev/null 2>&1 && ../bin/hgx dehydrate src/main.uya >/dev/null 2>&1") == 0);
+
+    const original_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("build/hydrate-missing-test/repo") == 0);
+    const root: RepoPath = try repo_find_root_from_cwd();
+    const config: RepoConfig = try repo_read_config(&root);
+    const head_commit: CommitId = try repo_read_head_commit(&root, &config);
+    const store: LooseObjectStore = try loose_store_open(".hgit/objects/loose");
+
+    var arena_buf: [byte: 65536] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 65536 as usize);
+    const object_bytes: ObjectBytes = try store.get(head_commit.id, &arena);
+    var offset: usize = 0;
+    const payload: CommitPayload = try decode_commit_object(&arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    const manifest_inputs: ManifestLeafInputList = try manifest_load_flatten(&arena, &store, &payload.manifest_root);
+    try expect(manifest_inputs.len == 1 as usize);
+
+    var object_path: [byte: 4096] = [];
+    _ = try loose_store_object_path(&store, &manifest_inputs.ptr[0].object_id, object_path[0: 4096]);
+    try expect(remove(&object_path[0] as &const byte) == 0);
+
+    try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
+    try expect(system("cd build/hydrate-missing-test/repo && set +e && ../bin/hgx hydrate src/main.uya >stdout 2>stderr; status=$?; set -e; test \"$status\" -ne 0") == 0);
+    try expect(system("grep -F 'error: missing object for path src/main.uya' build/hydrate-missing-test/repo/stderr >/dev/null") == 0);
+    try expect(chdir(repo_path_cstr(&suite_cwd) as &const byte) == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("Hydrate Missing Object Tests");
+    run_test("hydrate reports missing object path", test_hydrate_reports_missing_object_path);
+    return test_suite_end();
+}

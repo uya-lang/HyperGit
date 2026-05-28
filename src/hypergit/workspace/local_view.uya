@@ -1,0 +1,218 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.ids.Hash32;
+use manifest.path.manifest_path_compare;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use workspace.sparse_profile.SparseProfile;
+use workspace.sparse_profile.sparse_profile_matches;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_list_from_slice;
+
+error LocalViewAlloc;
+
+fn local_view_find_change(changes: &LocalChangeList, path: &ByteList) isize {
+    var i: usize = 0;
+    while i < changes.len {
+        if manifest_path_compare(&changes.ptr[i].path, path) == 0 {
+            return i as isize;
+        }
+        i = i + 1 as usize;
+    }
+    return -1 as isize;
+}
+
+fn local_view_should_include_expected(changes: &LocalChangeList, path: &ByteList) bool {
+    const index: isize = local_view_find_change(changes, path);
+    if index < 0 as isize {
+        return true;
+    }
+    return changes.ptr[index as usize].status != ChangeStatus.Virtual;
+}
+
+fn local_view_should_include_target(profile: &SparseProfile, changes: &LocalChangeList, path: &ByteList) bool {
+    const index: isize = local_view_find_change(changes, path);
+    if index >= 0 as isize {
+        return changes.ptr[index as usize].status != ChangeStatus.Virtual;
+    }
+    return sparse_profile_matches(profile, path);
+}
+
+fn local_view_filter_manifest_expected(arena: &Arena, inputs: &ManifestLeafInputList, changes: &LocalChangeList) !ManifestLeafInputList {
+    var count: usize = 0;
+    var i: usize = 0;
+    while i < inputs.len {
+        if local_view_should_include_expected(changes, &inputs.ptr[i].path) {
+            count = count + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    if count == 0 {
+        return ManifestLeafInputList{ ptr: null, len: 0 };
+    }
+
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(arena, @size_of(ManifestLeafInputEntry) as usize * count) as &ManifestLeafInputEntry;
+    if raw_inputs == null {
+        return error.LocalViewAlloc;
+    }
+
+    var out_index: usize = 0;
+    i = 0;
+    while i < inputs.len {
+        if local_view_should_include_expected(changes, &inputs.ptr[i].path) {
+            raw_inputs[out_index] = inputs.ptr[i];
+            out_index = out_index + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return manifest_leaf_input_list_from_slice(raw_inputs[0: count]);
+}
+
+fn local_view_filter_manifest_target(arena: &Arena, inputs: &ManifestLeafInputList, profile: &SparseProfile, changes: &LocalChangeList) !ManifestLeafInputList {
+    var count: usize = 0;
+    var i: usize = 0;
+    while i < inputs.len {
+        if local_view_should_include_target(profile, changes, &inputs.ptr[i].path) {
+            count = count + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    if count == 0 {
+        return ManifestLeafInputList{ ptr: null, len: 0 };
+    }
+
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(arena, @size_of(ManifestLeafInputEntry) as usize * count) as &ManifestLeafInputEntry;
+    if raw_inputs == null {
+        return error.LocalViewAlloc;
+    }
+
+    var out_index: usize = 0;
+    i = 0;
+    while i < inputs.len {
+        if local_view_should_include_target(profile, changes, &inputs.ptr[i].path) {
+            raw_inputs[out_index] = inputs.ptr[i];
+            out_index = out_index + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return manifest_leaf_input_list_from_slice(raw_inputs[0: count]);
+}
+
+fn local_view_build_virtual_changes(arena: &Arena, full_inputs: &ManifestLeafInputList, materialized_inputs: &ManifestLeafInputList, watcher_seq: u64, reconcile_epoch: u64) !LocalChangeList {
+    if full_inputs.len == materialized_inputs.len {
+        return LocalChangeList{ ptr: null, len: 0 };
+    }
+
+    const virtual_count: usize = full_inputs.len - materialized_inputs.len;
+    const raw_changes: &LocalChange = arena_alloc(arena, @size_of(LocalChange) as usize * virtual_count) as &LocalChange;
+    if raw_changes == null {
+        return error.LocalViewAlloc;
+    }
+
+    var full_index: usize = 0;
+    var materialized_index: usize = 0;
+    var out_index: usize = 0;
+    while full_index < full_inputs.len {
+        if materialized_index < materialized_inputs.len &&
+            manifest_path_compare(&full_inputs.ptr[full_index].path, &materialized_inputs.ptr[materialized_index].path) == 0 {
+            full_index = full_index + 1 as usize;
+            materialized_index = materialized_index + 1 as usize;
+            continue;
+        }
+
+        const input: &ManifestLeafInputEntry = &full_inputs.ptr[full_index];
+        raw_changes[out_index] = LocalChange{
+            path: ByteList{ ptr: input.path.ptr, len: input.path.len },
+            base_object: input.object_id,
+            working_hash: Hash32{ bytes: [] },
+            status: ChangeStatus.Virtual,
+            last_seen_inode: 0u64,
+            last_seen_mtime_ns: 0i64,
+            watcher_seq: watcher_seq,
+            reconcile_epoch: reconcile_epoch,
+        };
+        out_index = out_index + 1 as usize;
+        full_index = full_index + 1 as usize;
+    }
+    return local_change_list_from_slice(raw_changes[0: out_index]);
+}
+
+fn local_view_merge_changes(arena: &Arena, left: &LocalChangeList, right: &LocalChangeList) !LocalChangeList {
+    if left.len == 0 {
+        return LocalChangeList{ ptr: right.ptr, len: right.len };
+    }
+    if right.len == 0 {
+        return LocalChangeList{ ptr: left.ptr, len: left.len };
+    }
+
+    const raw_changes: &LocalChange = arena_alloc(arena, @size_of(LocalChange) as usize * (left.len + right.len)) as &LocalChange;
+    if raw_changes == null {
+        return error.LocalViewAlloc;
+    }
+
+    var left_index: usize = 0;
+    var right_index: usize = 0;
+    var out_index: usize = 0;
+    while left_index < left.len && right_index < right.len {
+        const cmp: i32 = manifest_path_compare(&left.ptr[left_index].path, &right.ptr[right_index].path);
+        if cmp < 0 {
+            raw_changes[out_index] = left.ptr[left_index];
+            left_index = left_index + 1 as usize;
+        } else if cmp > 0 {
+            raw_changes[out_index] = right.ptr[right_index];
+            right_index = right_index + 1 as usize;
+        } else {
+            raw_changes[out_index] = left.ptr[left_index];
+            left_index = left_index + 1 as usize;
+            right_index = right_index + 1 as usize;
+        }
+        out_index = out_index + 1 as usize;
+    }
+
+    while left_index < left.len {
+        raw_changes[out_index] = left.ptr[left_index];
+        left_index = left_index + 1 as usize;
+        out_index = out_index + 1 as usize;
+    }
+    while right_index < right.len {
+        raw_changes[out_index] = right.ptr[right_index];
+        right_index = right_index + 1 as usize;
+        out_index = out_index + 1 as usize;
+    }
+    return local_change_list_from_slice(raw_changes[0: out_index]);
+}
+
+export fn workspace_local_view_find_change(changes: &LocalChangeList, path: &ByteList) isize {
+    return local_view_find_change(changes, path);
+}
+
+export fn workspace_local_view_filter_expected_inputs(arena: &Arena, inputs: &ManifestLeafInputList, changes: &LocalChangeList) !ManifestLeafInputList {
+    return local_view_filter_manifest_expected(arena, inputs, changes);
+}
+
+export fn workspace_local_view_filter_target_inputs(arena: &Arena, inputs: &ManifestLeafInputList, profile: &SparseProfile, changes: &LocalChangeList) !ManifestLeafInputList {
+    return local_view_filter_manifest_target(arena, inputs, profile, changes);
+}
+
+export fn workspace_local_view_merge_virtual_changes(
+    arena: &Arena,
+    full_inputs: &ManifestLeafInputList,
+    materialized_inputs: &ManifestLeafInputList,
+    changes: &LocalChangeList,
+    watcher_seq: u64,
+    reconcile_epoch: u64,
+) !LocalChangeList {
+    const virtual_changes: LocalChangeList = try local_view_build_virtual_changes(
+        arena,
+        full_inputs,
+        materialized_inputs,
+        watcher_seq,
+        reconcile_epoch,
+    );
+    return local_view_merge_changes(arena, changes, &virtual_changes);
+}

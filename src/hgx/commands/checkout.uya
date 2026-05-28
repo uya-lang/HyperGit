@@ -1,7 +1,7 @@
-use std.io.file.FILE;
-use std.io.file.fclose;
-use std.io.file.fopen;
-use std.io.file.fwrite;
+use std.io.file.File;
+use std.io.file.file_close;
+use std.io.file.file_open;
+use std.io.file.file_write;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_init;
 use std.runtime.get_argc;
@@ -21,6 +21,9 @@ use libc.stderr;
 use libc.EACCES;
 use libc.EEXIST;
 use libc.EPERM;
+use libc.O_CREAT;
+use libc.O_TRUNC;
+use libc.O_WRONLY;
 use libc.S_IRWXU;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
@@ -42,6 +45,7 @@ use store.loose_store.loose_store_open;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
+use store.repo_layout.HGIT_WORKSPACE_SPARSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STATE_REL;
 use store.repo_layout.REPO_PATH_MAX;
 use store.repo_layout.RepoConfig;
@@ -54,8 +58,14 @@ use workspace.checkout_plan.CheckoutAction;
 use workspace.checkout_plan.CheckoutActionKind;
 use workspace.checkout_plan.CheckoutPlan;
 use workspace.checkout_plan.checkout_plan_build;
+use workspace.local_change_file.local_change_file_read;
 use workspace.local_change_file.local_change_file_write;
+use workspace.local_view.workspace_local_view_filter_expected_inputs;
+use workspace.local_view.workspace_local_view_filter_target_inputs;
+use workspace.local_view.workspace_local_view_merge_virtual_changes;
 use workspace.reconcile.workspace_reconcile_scan;
+use workspace.sparse_profile.SparseProfile;
+use workspace.sparse_profile.sparse_profile_file_default;
 use workspace.state.LocalChangeList;
 use workspace.state.WorkspaceState;
 use workspace.state.local_change_dirty_count;
@@ -174,7 +184,7 @@ fn checkout_commit_payload(arena: &Arena, store: &LooseObjectStore, commit_id: &
     return payload;
 }
 
-fn checkout_manifest_inputs_from_commit(arena: &Arena, store: &LooseObjectStore, commit_id: &CommitId) !ManifestLeafInputList {
+export fn checkout_manifest_inputs_from_commit(arena: &Arena, store: &LooseObjectStore, commit_id: &CommitId) !ManifestLeafInputList {
     const payload: CommitPayload = try checkout_commit_payload(arena, store, commit_id);
     return manifest_load_flatten(arena, store, &payload.manifest_root) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
@@ -275,22 +285,25 @@ fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, path: &C
         return error.CheckoutFailure;
     }
     try checkout_ensure_parent_dirs(path);
-    const stream: &FILE = fopen(&path.bytes[0] as &const byte, "w");
-    if stream == null {
+    const fs_mode: u32 = action.file_mode & 0o777u32;
+    const file: File = file_open(&path.bytes[0] as &const byte, O_WRONLY | O_CREAT | O_TRUNC, fs_mode) catch {
         if checkout_errno_permission() {
             return error.CheckoutPermissionDenied;
         }
         return error.CheckoutWriteFailed;
-    }
+    };
     defer {
-        _ = fclose(stream);
+        file_close(&file) catch {};
     }
-    if fwrite(payload.payload.ptr as &const byte, 1 as usize, payload.payload.len, stream) != payload.payload.len {
+    const written: usize = file_write(&file, payload.payload.ptr as &const byte, payload.payload.len) catch {
+        return error.CheckoutWriteFailed;
+    };
+    if written != payload.payload.len {
         return error.CheckoutWriteFailed;
     }
 }
 
-fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &RepoPath, plan: &CheckoutPlan) !void {
+export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &RepoPath, plan: &CheckoutPlan) !void {
     const root_path: CheckoutFsPath = checkout_fs_path_from_repo_path(root);
     var i: usize = 0;
     while i < plan.actions.len {
@@ -305,18 +318,64 @@ fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &RepoPath,
     }
 }
 
-fn checkout_current_state(arena: &Arena, root: &RepoPath, config: &RepoConfig) !WorkspaceState {
-    _ = arena;
-    const has_head: bool = repo_head_ref_exists(root, config) catch {
-        return workspace_state_init(checkout_repo_root_bytes(root), workspace_state_zero_commit());
+export fn checkout_current_state(arena: &Arena, root: &RepoPath, config: &RepoConfig) !WorkspaceState {
+    const state_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STATE_REL);
+    return workspace_state_file_read(arena, repo_path_cstr(&state_path) as &const byte) catch {
+        const has_head: bool = repo_head_ref_exists(root, config) catch {
+            return workspace_state_init(checkout_repo_root_bytes(root), workspace_state_zero_commit());
+        };
+        if !has_head {
+            return workspace_state_init(checkout_repo_root_bytes(root), workspace_state_zero_commit());
+        }
+        const head_commit: CommitId = repo_read_head_commit(root, config) catch {
+            return workspace_state_init(checkout_repo_root_bytes(root), workspace_state_zero_commit());
+        };
+        return workspace_state_init(checkout_repo_root_bytes(root), head_commit);
     };
-    if !has_head {
-        return workspace_state_init(checkout_repo_root_bytes(root), workspace_state_zero_commit());
-    }
-    const head_commit: CommitId = repo_read_head_commit(root, config) catch {
-        return workspace_state_init(checkout_repo_root_bytes(root), workspace_state_zero_commit());
+}
+
+export fn checkout_current_local_changes(arena: &Arena, root: &RepoPath) !LocalChangeList {
+    const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
+    return local_change_file_read(arena, repo_path_cstr(&local_change_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.LocalChangeFileNotFound) {
+            return LocalChangeList{ ptr: null, len: 0 };
+        }
+        return error.CheckoutFailure;
     };
-    return workspace_state_init(checkout_repo_root_bytes(root), head_commit);
+}
+
+export fn checkout_current_sparse_profile(arena: &Arena, root: &RepoPath) !SparseProfile {
+    const sparse_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_SPARSE_REL);
+    return sparse_profile_file_default(arena, repo_path_cstr(&sparse_path) as &const byte) catch {
+        return error.CheckoutFailure;
+    };
+}
+
+export fn checkout_state_has_base_commit(state: &WorkspaceState) bool {
+    return state.base_commit.id.hash.bytes[0] != 0 as byte ||
+        state.base_commit.id.hash.bytes[31] != 0 as byte;
+}
+
+export fn checkout_sync_virtual_state(
+    arena: &Arena,
+    root: &RepoPath,
+    commit_id: &CommitId,
+    full_inputs: &ManifestLeafInputList,
+    materialized_inputs: &ManifestLeafInputList,
+    local_changes: &LocalChangeList,
+    current_state: &WorkspaceState,
+    watcher_seq: u64,
+    reconcile_epoch: u64,
+) !void {
+    const merged_changes: LocalChangeList = try workspace_local_view_merge_virtual_changes(
+        arena,
+        full_inputs,
+        materialized_inputs,
+        local_changes,
+        watcher_seq,
+        reconcile_epoch,
+    );
+    try checkout_sync_workspace_files(arena, root, commit_id, full_inputs, &merged_changes, current_state);
 }
 
 fn checkout_sync_workspace_files(
@@ -402,9 +461,17 @@ export fn run_checkout() i32 {
         fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
+    const current_profile: SparseProfile = checkout_current_sparse_profile(&arena, &root) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_local_changes: LocalChangeList = checkout_current_local_changes(&arena, &root) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
 
     var current_inputs: ManifestLeafInputList = ManifestLeafInputList{ ptr: null, len: 0 };
-    if current_state.base_commit.id.hash.bytes[0] != 0 as byte || current_state.base_commit.id.hash.bytes[31] != 0 as byte {
+    if checkout_state_has_base_commit(&current_state) {
         current_inputs = checkout_manifest_inputs_from_commit(&arena, &store, &current_state.base_commit) catch |err| {
             if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
                 fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
@@ -422,11 +489,28 @@ export fn run_checkout() i32 {
         fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
+    const current_materialized: ManifestLeafInputList = workspace_local_view_filter_expected_inputs(
+        &arena,
+        &current_inputs,
+        &current_local_changes,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const target_materialized: ManifestLeafInputList = workspace_local_view_filter_target_inputs(
+        &arena,
+        &target_inputs,
+        &current_profile,
+        &current_local_changes,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
 
     const local_changes: LocalChangeList = workspace_reconcile_scan(
         &arena,
         repo_path_cstr(&root) as &const byte,
-        &current_inputs,
+        &current_materialized,
         current_state.watcher_seq,
         current_state.watcher_seq + 1u64,
     ) catch {
@@ -434,12 +518,22 @@ export fn run_checkout() i32 {
         return EXIT_RUNTIME_ERROR;
     };
 
-    const plan: CheckoutPlan = checkout_plan_build(&arena, &current_inputs, &target_inputs, &local_changes) catch {
+    const plan: CheckoutPlan = checkout_plan_build(&arena, &current_materialized, &target_materialized, &local_changes) catch {
         fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
     if plan.blocked_paths.len > 0 {
-        checkout_sync_workspace_files(&arena, &root, &current_state.base_commit, &current_inputs, &local_changes, &current_state) catch {
+        checkout_sync_virtual_state(
+            &arena,
+            &root,
+            &current_state.base_commit,
+            &current_inputs,
+            &current_materialized,
+            &local_changes,
+            &current_state,
+            current_state.watcher_seq,
+            current_state.watcher_seq + 1u64,
+        ) catch {
             fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
         };
@@ -459,14 +553,24 @@ export fn run_checkout() i32 {
     const final_changes: LocalChangeList = workspace_reconcile_scan(
         &arena,
         repo_path_cstr(&root) as &const byte,
-        &target_inputs,
+        &target_materialized,
         current_state.watcher_seq + 1u64,
         current_state.watcher_seq + 2u64,
     ) catch {
         fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
-    checkout_sync_workspace_files(&arena, &root, &target_commit, &target_inputs, &final_changes, &current_state) catch |err| {
+    checkout_sync_virtual_state(
+        &arena,
+        &root,
+        &target_commit,
+        &target_inputs,
+        &target_materialized,
+        &final_changes,
+        &current_state,
+        current_state.watcher_seq + 1u64,
+        current_state.watcher_seq + 2u64,
+    ) catch |err| {
         if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
             fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;

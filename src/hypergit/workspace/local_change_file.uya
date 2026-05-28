@@ -51,16 +51,19 @@ fn change_status_to_u16(status: ChangeStatus) u16 {
     if status == ChangeStatus.Materialized {
         return 0 as u16;
     }
-    if status == ChangeStatus.Added {
+    if status == ChangeStatus.Virtual {
         return 1 as u16;
     }
-    if status == ChangeStatus.Modified {
+    if status == ChangeStatus.Added {
         return 2 as u16;
     }
-    if status == ChangeStatus.Deleted {
+    if status == ChangeStatus.Modified {
         return 3 as u16;
     }
-    return 4 as u16;
+    if status == ChangeStatus.Deleted {
+        return 4 as u16;
+    }
+    return 5 as u16;
 }
 
 fn change_status_from_u16(value: u16) !ChangeStatus {
@@ -68,15 +71,18 @@ fn change_status_from_u16(value: u16) !ChangeStatus {
         return ChangeStatus.Materialized;
     }
     if value == 1 as u16 {
-        return ChangeStatus.Added;
+        return ChangeStatus.Virtual;
     }
     if value == 2 as u16 {
-        return ChangeStatus.Modified;
+        return ChangeStatus.Added;
     }
     if value == 3 as u16 {
-        return ChangeStatus.Deleted;
+        return ChangeStatus.Modified;
     }
     if value == 4 as u16 {
+        return ChangeStatus.Deleted;
+    }
+    if value == 5 as u16 {
         return ChangeStatus.Conflict;
     }
     return error.LocalChangeFileInvalid;

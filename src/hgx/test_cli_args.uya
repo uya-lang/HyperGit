@@ -56,6 +56,24 @@ fn test_checkout_command() !void {
     try assert_eq_i32(plan.exit_code, EXIT_OK);
 }
 
+fn test_hydrate_command() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "hydrate");
+    try expect(plan.action == DispatchAction.Hydrate);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
+}
+
+fn test_dehydrate_command() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "dehydrate");
+    try expect(plan.action == DispatchAction.Dehydrate);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
+}
+
+fn test_sparse_command() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "sparse");
+    try expect(plan.action == DispatchAction.Sparse);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
+}
+
 fn test_add_command() !void {
     const plan: DispatchPlan = plan_from_first_arg(2, "add");
     try expect(plan.action == DispatchAction.Add);
@@ -96,6 +114,9 @@ export fn main() i32 {
     run_test("status command", test_status_command);
     run_test("diff command", test_diff_command);
     run_test("checkout command", test_checkout_command);
+    run_test("hydrate command", test_hydrate_command);
+    run_test("dehydrate command", test_dehydrate_command);
+    run_test("sparse command", test_sparse_command);
     run_test("add command", test_add_command);
     run_test("commit command", test_commit_command);
     run_test("log command", test_log_command);
