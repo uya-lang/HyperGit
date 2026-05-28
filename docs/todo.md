@@ -298,9 +298,9 @@
 - [x] 实现 atomic 进度计数。
 - [x] 实现任务错误聚合。
 - [x] 实现 graceful shutdown。
-- [ ] 接入 parallel manifest diff。
-- [ ] 接入 parallel checkout。
-- [ ] 接入 parallel pack read。
+- [x] 接入 parallel manifest diff。
+- [x] 接入 parallel checkout。
+- [x] 接入 parallel pack read。
 - [ ] 接入 parallel large file hash（覆盖 `hgx add` / worktree hash 路径）。
 - [ ] 约束 parallel `hgx add` 只并行对象计算，最终 stage publish 保持单 writer。
 - [ ] 测试单 worker 和多 worker 结果一致。

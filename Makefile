@@ -39,6 +39,7 @@ test:
 	$(UYA) test src/hypergit/test_manifest_shard.uya
 	$(UYA) test src/hypergit/test_manifest_root.uya
 	$(UYA) test src/hypergit/test_manifest_query.uya
+	$(UYA) test src/hypergit/test_manifest_flat_diff.uya
 	$(UYA) test src/hypergit/test_manifest_diff.uya
 	$(UYA) test src/hypergit/test_commit_build.uya
 	$(UYA) test src/hypergit/test_commit_graph.uya
@@ -77,6 +78,7 @@ test:
 	./tests/test_diff_binary.sh
 	./tests/test_diff_large_file.sh
 	./tests/test_checkout_content.sh
+	./tests/test_checkout_parallel_apply.sh
 	./tests/test_checkout_dirty.sh
 	./tests/test_checkout_state_recovery.sh
 	./tests/test_sparse_checkout.sh

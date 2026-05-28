@@ -2,12 +2,19 @@ use std.io.file.File;
 use std.io.file.file_close;
 use std.io.file.file_open;
 use std.io.file.file_write;
+use std.async.Future;
+use std.async.block_on;
+use std.async.future_ready_ok;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_init;
 use std.runtime.get_argc;
 use std.runtime.get_argv;
 use std.string.strcmp;
 use std.string.strlen;
+use std.thread.ThreadPool;
+use std.thread.async_compute;
+use std.thread.thread_pool_new;
+use std.thread.thread_pool_shutdown;
 
 use libc.Stat;
 use libc.errno;
@@ -30,6 +37,7 @@ use cli.EXIT_RUNTIME_ERROR;
 use cli.EXIT_USAGE_ERROR;
 use core.ids.CommitId;
 use core.ids.HASH32_HEX_BYTES;
+use core.ids.ObjectId;
 use core.ids.commit_id_decode_hex;
 use large.chunk_store.ChunkStore;
 use large.chunk_store.chunk_store_open;
@@ -86,8 +94,14 @@ use workspace.state_file.workspace_state_file_write;
 
 const CHECKOUT_ARENA_BYTES: usize = 33554432 as usize;
 const CHECKOUT_PATH_MAX: usize = 4096 as usize;
+const CHECKOUT_PARALLEL_WORKERS: usize = 4 as usize;
 const CHECKOUT_STAT_S_IFMT: u32 = 61440u32;
 const CHECKOUT_STAT_S_IFDIR: u32 = 16384u32;
+const CHECKOUT_TASK_OK: usize = 0 as usize;
+const CHECKOUT_TASK_PERMISSION: usize = 1 as usize;
+const CHECKOUT_TASK_WRITE_FAILED: usize = 2 as usize;
+const CHECKOUT_TASK_FAILURE: usize = 3 as usize;
+const CHECKOUT_TASK_ALLOC: usize = 4 as usize;
 
 error CheckoutAlloc;
 error CheckoutInvalidSpec;
@@ -99,6 +113,15 @@ error CheckoutPathTooLong;
 struct CheckoutFsPath {
     bytes: [byte: 4096] = [],
     len: usize = 0
+}
+
+struct CheckoutApplyTask {
+    objects_root: &RepoPath,
+    chunk_store_root: &RepoPath,
+    fs_path: CheckoutFsPath,
+    kind: CheckoutActionKind,
+    object_id: ObjectId,
+    file_mode: u32
 }
 
 export const CHECKOUT_USAGE_TEXT: &const byte = "error: checkout requires <ref>\n";
@@ -329,15 +352,83 @@ fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, chunk_st
     }
 }
 
+fn checkout_apply_task_error_code(err_id: u32) usize {
+    if err_id == @error_id(error.CheckoutPermissionDenied) {
+        return CHECKOUT_TASK_PERMISSION;
+    }
+    if err_id == @error_id(error.CheckoutWriteFailed) {
+        return CHECKOUT_TASK_WRITE_FAILED;
+    }
+    if err_id == @error_id(error.CheckoutAlloc) {
+        return CHECKOUT_TASK_ALLOC;
+    }
+    return CHECKOUT_TASK_FAILURE;
+}
+
+fn checkout_apply_task_status(status: usize) !void {
+    if status == CHECKOUT_TASK_OK {
+        return;
+    }
+    if status == CHECKOUT_TASK_PERMISSION {
+        return error.CheckoutPermissionDenied;
+    }
+    if status == CHECKOUT_TASK_WRITE_FAILED {
+        return error.CheckoutWriteFailed;
+    }
+    if status == CHECKOUT_TASK_ALLOC {
+        return error.CheckoutAlloc;
+    }
+    return error.CheckoutFailure;
+}
+
+fn checkout_apply_task_run(task_bits: usize) usize {
+    const task: &CheckoutApplyTask = @ptr_from_usize(task_bits) as &CheckoutApplyTask;
+    if task.kind == CheckoutActionKind.DeleteFile {
+        _ = remove(&task.fs_path.bytes[0] as &const byte);
+        return CHECKOUT_TASK_OK;
+    }
+
+    const store: LooseObjectStore = loose_store_open(repo_path_cstr(task.objects_root)) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return CHECKOUT_TASK_PERMISSION;
+        }
+        return CHECKOUT_TASK_FAILURE;
+    };
+    const chunk_store: ChunkStore = chunk_store_open(repo_path_cstr(task.chunk_store_root)) catch |err| {
+        if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
+            return CHECKOUT_TASK_PERMISSION;
+        }
+        return CHECKOUT_TASK_FAILURE;
+    };
+
+    const arena_storage: &byte = malloc(CHECKOUT_ARENA_BYTES) as &byte;
+    if arena_storage == null {
+        return CHECKOUT_TASK_ALLOC;
+    }
+    defer {
+        free(arena_storage as &void);
+    }
+    var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+    arena_init(&arena, arena_storage, CHECKOUT_ARENA_BYTES);
+
+    const action: CheckoutAction = CheckoutAction{
+        kind: task.kind,
+        path: ByteList{ ptr: null, len: 0 },
+        object_id: task.object_id,
+        file_mode: task.file_mode,
+    };
+    checkout_write_blob_to_path(&arena, &store, &chunk_store, &task.fs_path, &action) catch |err| {
+        return checkout_apply_task_error_code(@error_id(err));
+    };
+    return CHECKOUT_TASK_OK;
+}
+
 export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &RepoPath, plan: &CheckoutPlan) !void {
     const root_path: CheckoutFsPath = checkout_fs_path_from_repo_path(root);
     const chunk_store_root: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_CHUNKS_REL);
-    const chunk_store: ChunkStore = chunk_store_open(repo_path_cstr(&chunk_store_root)) catch |err| {
-        if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
-            return error.CheckoutPermissionDenied;
-        }
-        return error.CheckoutFailure;
-    };
+    const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
+
+    var write_count: usize = 0;
     var i: usize = 0;
     while i < plan.actions.len {
         const action: &CheckoutAction = &plan.actions.ptr[i];
@@ -345,9 +436,85 @@ export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &Re
         if action.kind == CheckoutActionKind.DeleteFile {
             _ = remove(&fs_path.bytes[0] as &const byte);
         } else {
-            try checkout_write_blob_to_path(arena, store, &chunk_store, &fs_path, action);
+            write_count = write_count + 1 as usize;
         }
         i = i + 1 as usize;
+    }
+
+    if write_count == 0 as usize {
+        return;
+    }
+
+    const tasks: &CheckoutApplyTask = arena_alloc(arena, @size_of(CheckoutApplyTask) as usize * write_count) as &CheckoutApplyTask;
+    if tasks == null {
+        return error.CheckoutAlloc;
+    }
+
+    var write_index: usize = 0;
+    i = 0;
+    while i < plan.actions.len {
+        const action: &CheckoutAction = &plan.actions.ptr[i];
+        if action.kind == CheckoutActionKind.WriteFile {
+            tasks[write_index] = CheckoutApplyTask{
+                objects_root: &objects_root,
+                chunk_store_root: &chunk_store_root,
+                fs_path: try checkout_fs_path_join(&root_path, &action.path),
+                kind: action.kind,
+                object_id: action.object_id,
+                file_mode: action.file_mode,
+            };
+            write_index = write_index + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+
+    if write_count == 1 as usize {
+        try checkout_apply_task_status(checkout_apply_task_run(@usize_from_ptr((&tasks[0]) as &void)));
+        return;
+    }
+
+    var worker_count: usize = write_count;
+    if worker_count > CHECKOUT_PARALLEL_WORKERS {
+        worker_count = CHECKOUT_PARALLEL_WORKERS;
+    }
+    var pool: ThreadPool = thread_pool_new(worker_count as i32);
+    defer {
+        thread_pool_shutdown(&pool);
+    }
+
+    var ready0: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var ready1: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var ready2: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var ready3: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var futures: [Future<!usize>: 4] = [ready0, ready1, ready2, ready3];
+
+    var offset: usize = 0;
+    while offset < write_count {
+        var batch_count: usize = worker_count;
+        if batch_count > write_count - offset {
+            batch_count = write_count - offset;
+        }
+
+        var batch_index: usize = 0;
+        while batch_index < batch_count {
+            futures[batch_index] = async_compute<usize>(
+                &pool,
+                &checkout_apply_task_run as &void,
+                @usize_from_ptr((&tasks[offset + batch_index]) as &void),
+            );
+            batch_index = batch_index + 1 as usize;
+        }
+
+        batch_index = 0;
+        while batch_index < batch_count {
+            const status: usize = block_on<usize>(futures[batch_index]) catch {
+                return error.CheckoutFailure;
+            };
+            try checkout_apply_task_status(status);
+            batch_index = batch_index + 1 as usize;
+        }
+
+        offset = offset + batch_count;
     }
 }
 

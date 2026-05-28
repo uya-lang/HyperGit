@@ -44,6 +44,10 @@ export fn worker_pool_shutdown_graceful(pool: &WorkerPool, control: &ExecControl
     thread_pool_shutdown(&pool.inner);
 }
 
+export fn worker_pool_async_compute<T>(pool: &WorkerPool, compute_fn: &void, arg: T) Future<!T> {
+    return async_compute<T>(&pool.inner, compute_fn, arg);
+}
+
 export fn worker_pool_async_compute_i32(pool: &WorkerPool, compute_fn: &void, arg: i32) Future<!i32> {
-    return async_compute<i32>(&pool.inner, compute_fn, arg);
+    return worker_pool_async_compute<i32>(pool, compute_fn, arg);
 }

@@ -4,9 +4,16 @@ use std.io.file.fclose;
 use std.io.file.fopen;
 use std.io.file.fread;
 use std.io.file.fwrite;
+use std.async.Future;
+use std.async.block_on;
+use std.async.future_ready_ok;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 use std.mem.arena.arena_init;
+use std.thread.ThreadPool;
+use std.thread.async_compute;
+use std.thread.thread_pool_new;
+use std.thread.thread_pool_shutdown;
 
 use libc.Stat;
 use libc.DIR;
@@ -60,6 +67,10 @@ export const SEGMENT_PACK_MAX_BYTES: usize = 67108864 as usize;
 const SEGMENT_PACK_HEADER_CRC_OFFSET: usize = 60 as usize;
 const PACK_INDEX_HEADER_CRC_OFFSET: usize = 40 as usize;
 const SEGMENT_PACK_MAX_RECORD_BYTES: usize = 4294967295 as usize;
+const SEGMENT_PACK_READ_PARALLEL_WORKERS: usize = 4 as usize;
+const SEGMENT_PACK_VALIDATE_OK: usize = 0 as usize;
+const SEGMENT_PACK_VALIDATE_INVALID: usize = 1 as usize;
+const SEGMENT_PACK_VALIDATE_READ_FAILED: usize = 2 as usize;
 
 error SegmentPackOpenFailed;
 error SegmentPackNotFound;
@@ -163,8 +174,124 @@ export struct SegmentPackIndexSnapshot {
     raw_bytes: ByteList
 }
 
+struct SegmentPackValidateTask {
+    input: ByteList,
+    records: &SegmentPackRecord,
+    start: usize,
+    len: usize
+}
+
 fn segment_pack_zero_hash() Hash32 {
     return Hash32{ bytes: [] };
+}
+
+fn segment_pack_validate_record_bytes(input: &[byte], record: &SegmentPackRecord) !void {
+    if record.payload_crc32 != crc32_compute(record.object_bytes.ptr[0: record.object_bytes.len]) {
+        return error.SegmentPackInvalid;
+    }
+    const record_offset: usize = record.record_offset as usize;
+    const trailer_len: usize = record.record_bytes as usize - SEGMENT_PACK_RECORD_TRAILER_BYTES;
+    if record.trailer_crc32 != crc32_compute(input.ptr[record_offset: trailer_len]) {
+        return error.SegmentPackInvalid;
+    }
+}
+
+fn segment_pack_validate_task_run(task_bits: usize) usize {
+    const task: &SegmentPackValidateTask = @ptr_from_usize(task_bits) as &SegmentPackValidateTask;
+    const input: &[byte] = task.input.ptr[0: task.input.len];
+    var i: usize = 0 as usize;
+    while i < task.len {
+        segment_pack_validate_record_bytes(input, &task.records[task.start + i as usize]) catch |err| {
+            if @error_id(err) == @error_id(error.SegmentPackInvalid) {
+                return SEGMENT_PACK_VALIDATE_INVALID;
+            }
+            return SEGMENT_PACK_VALIDATE_READ_FAILED;
+        };
+        i = i + 1 as usize;
+    }
+    return SEGMENT_PACK_VALIDATE_OK;
+}
+
+fn segment_pack_validate_records_parallel(arena: &Arena, input: &[byte], records: SegmentPackRecordList) !void {
+    if records.len == 0 as usize {
+        return;
+    }
+    if records.len == 1 as usize {
+        try segment_pack_validate_record_bytes(input, &records.ptr[0]);
+        return;
+    }
+
+    var worker_count: usize = records.len;
+    if worker_count > SEGMENT_PACK_READ_PARALLEL_WORKERS {
+        worker_count = SEGMENT_PACK_READ_PARALLEL_WORKERS;
+    }
+    if worker_count <= 1 as usize {
+        var single_index: usize = 0 as usize;
+        while single_index < records.len {
+            try segment_pack_validate_record_bytes(input, &records.ptr[single_index]);
+            single_index = single_index + 1 as usize;
+        }
+        return;
+    }
+
+    const tasks: &SegmentPackValidateTask = arena_alloc(arena, @size_of(SegmentPackValidateTask) as usize * worker_count) as &SegmentPackValidateTask;
+    if tasks == null {
+        return error.SegmentPackAlloc;
+    }
+
+    const base_len: usize = records.len / worker_count;
+    const extra: usize = records.len % worker_count;
+    var cursor: usize = 0 as usize;
+    var task_index: usize = 0 as usize;
+    while task_index < worker_count {
+        var shard_len: usize = base_len;
+        if task_index < extra {
+            shard_len = shard_len + 1 as usize;
+        }
+        tasks[task_index] = SegmentPackValidateTask{
+            input: ByteList{ ptr: input.ptr, len: input.len },
+            records: records.ptr,
+            start: cursor,
+            len: shard_len,
+        };
+        cursor = cursor + shard_len;
+        task_index = task_index + 1 as usize;
+    }
+
+    var pool: ThreadPool = thread_pool_new(worker_count as i32);
+    defer {
+        thread_pool_shutdown(&pool);
+    }
+
+    var ready0: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var ready1: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var ready2: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var ready3: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var futures: [Future<!usize>: 4] = [ready0, ready1, ready2, ready3];
+
+    task_index = 0 as usize;
+    while task_index < worker_count {
+        futures[task_index] = async_compute<usize>(
+            &pool,
+            &segment_pack_validate_task_run as &void,
+            @usize_from_ptr((&tasks[task_index]) as &void),
+        );
+        task_index = task_index + 1 as usize;
+    }
+
+    task_index = 0 as usize;
+    while task_index < worker_count {
+        const status: usize = block_on<usize>(futures[task_index]) catch {
+            return error.SegmentPackReadFailed;
+        };
+        if status == SEGMENT_PACK_VALIDATE_INVALID {
+            return error.SegmentPackInvalid;
+        }
+        if status != SEGMENT_PACK_VALIDATE_OK {
+            return error.SegmentPackReadFailed;
+        }
+        task_index = task_index + 1 as usize;
+    }
 }
 
 fn segment_pack_record_total_bytes(record: &SegmentPackWriteInput) !u32 {
@@ -431,12 +558,6 @@ export fn segment_pack_read(path: &const byte, arena: &Arena) !SegmentPackSnapsh
         const object_bytes: ByteList = ByteList{ ptr: &input.ptr[offset], len: object_len };
         offset = offset + object_len;
         const trailer_crc32: u32 = try codec_decode_u32(input, &offset);
-        if payload_crc32 != crc32_compute(object_bytes.ptr[0: object_bytes.len]) {
-            return error.SegmentPackInvalid;
-        }
-        if trailer_crc32 != crc32_compute(input.ptr[record_offset: record_bytes as usize - SEGMENT_PACK_RECORD_TRAILER_BYTES]) {
-            return error.SegmentPackInvalid;
-        }
         if raw_records == null {
             return error.SegmentPackInvalid;
         }
@@ -452,6 +573,12 @@ export fn segment_pack_read(path: &const byte, arena: &Arena) !SegmentPackSnapsh
         };
         record_index = record_index + 1 as usize;
     }
+
+    try segment_pack_validate_records_parallel(
+        arena,
+        input,
+        SegmentPackRecordList{ ptr: raw_records, len: header.object_count as usize },
+    );
 
     if offset as u64 != header.index_ref_offset {
         return error.SegmentPackInvalid;

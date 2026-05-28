@@ -1,0 +1,211 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.flat_diff.ManifestFlatDiffEntry;
+use manifest.flat_diff.ManifestFlatDiffEntryKind;
+use manifest.flat_diff.ManifestFlatDiffEntryList;
+use manifest.flat_diff.manifest_flat_diff;
+use manifest.flat_diff.manifest_flat_diff_parallel;
+use manifest.path.manifest_path_normalize;
+use manifest.query.ManifestPathspecList;
+use manifest.query.manifest_pathspec_list_from_slice;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(make_hash(seed));
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(make_object_id(seed));
+}
+
+fn normalize_literal(arena: &Arena, text: &const byte) !ByteList {
+    return try manifest_path_normalize(arena, literal_bytes(text));
+}
+
+fn make_input(arena: &Arena, text: &const byte, seed: byte) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try normalize_literal(arena, text),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id(seed),
+        logical_size: seed as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id(seed + 32 as byte),
+    };
+}
+
+fn expect_flat_diff_lists_equal(actual: &ManifestFlatDiffEntryList, expected: &ManifestFlatDiffEntryList) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        const left: &ManifestFlatDiffEntry = &actual.ptr[i];
+        const right: &ManifestFlatDiffEntry = &expected.ptr[i];
+        try expect(left.kind == right.kind);
+        try expect(left.left_index == right.left_index);
+        try expect(left.right_index == right.right_index);
+        try expect_byte_list_eq(left.path, right.path.ptr[0: right.path.len]);
+        try expect(right.rename_hint_from.len == 0 as usize);
+        try expect(left.rename_hint_from.len == 0 as usize);
+        i = i + 1 as usize;
+    }
+}
+
+fn test_manifest_flat_diff_parallel_matches_serial_across_root_shards() !void {
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    const left_readme: ManifestLeafInputEntry = try make_input(&arena, "README.md", 10 as byte);
+    const left_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 11 as byte);
+    const left_src_b: ManifestLeafInputEntry = try make_input(&arena, "src/b.uya", 12 as byte);
+    const left_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 13 as byte);
+    const left_vendor: ManifestLeafInputEntry = try make_input(&arena, "vendor/a.bin", 14 as byte);
+    var left_entries: [ManifestLeafInputEntry: 5] = [left_readme, left_src_a, left_src_b, left_tests, left_vendor];
+
+    const right_readme: ManifestLeafInputEntry = try make_input(&arena, "README.md", 10 as byte);
+    const right_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 21 as byte);
+    const right_src_c: ManifestLeafInputEntry = try make_input(&arena, "src/c.uya", 22 as byte);
+    const right_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 13 as byte);
+    const right_vendor: ManifestLeafInputEntry = try make_input(&arena, "vendor/b.bin", 23 as byte);
+    var right_entries: [ManifestLeafInputEntry: 5] = [right_readme, right_src_a, right_src_c, right_tests, right_vendor];
+
+    const left_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(left_entries[0: 5]);
+    const right_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(right_entries[0: 5]);
+    var no_specs: [ByteList: 1] = [ByteList{ ptr: null, len: 0 }];
+
+    const serial: ManifestFlatDiffEntryList = try manifest_flat_diff(
+        &arena,
+        &left_list,
+        &right_list,
+        manifest_pathspec_list_from_slice(no_specs[0: 0]),
+    );
+    const parallel: ManifestFlatDiffEntryList = try manifest_flat_diff_parallel(
+        &arena,
+        &left_list,
+        &right_list,
+        manifest_pathspec_list_from_slice(no_specs[0: 0]),
+        4,
+    );
+
+    try expect_flat_diff_lists_equal(&parallel, &serial);
+}
+
+fn test_manifest_flat_diff_parallel_respects_pathspec_filter() !void {
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    const left_docs: ManifestLeafInputEntry = try make_input(&arena, "docs/readme.md", 30 as byte);
+    const left_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 31 as byte);
+    const left_src_b: ManifestLeafInputEntry = try make_input(&arena, "src/b.uya", 32 as byte);
+    const left_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 33 as byte);
+    var left_entries: [ManifestLeafInputEntry: 4] = [left_docs, left_src_a, left_src_b, left_tests];
+
+    const right_docs: ManifestLeafInputEntry = try make_input(&arena, "docs/readme.md", 30 as byte);
+    const right_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 41 as byte);
+    const right_src_c: ManifestLeafInputEntry = try make_input(&arena, "src/c.uya", 42 as byte);
+    const right_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 43 as byte);
+    var right_entries: [ManifestLeafInputEntry: 4] = [right_docs, right_src_a, right_src_c, right_tests];
+
+    const left_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(left_entries[0: 4]);
+    const right_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(right_entries[0: 4]);
+    const src_spec: ByteList = try normalize_literal(&arena, "src");
+    var specs: [ByteList: 1] = [src_spec];
+    const serial: ManifestFlatDiffEntryList = try manifest_flat_diff(
+        &arena,
+        &left_list,
+        &right_list,
+        manifest_pathspec_list_from_slice(specs[0: 1]),
+    );
+    const parallel: ManifestFlatDiffEntryList = try manifest_flat_diff_parallel(
+        &arena,
+        &left_list,
+        &right_list,
+        manifest_pathspec_list_from_slice(specs[0: 1]),
+        3,
+    );
+
+    try expect_flat_diff_lists_equal(&parallel, &serial);
+}
+
+fn test_manifest_flat_diff_parallel_single_worker_matches_serial() !void {
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const left_one: ManifestLeafInputEntry = try make_input(&arena, "alpha.txt", 50 as byte);
+    const left_two: ManifestLeafInputEntry = try make_input(&arena, "beta.txt", 51 as byte);
+    var left_entries: [ManifestLeafInputEntry: 2] = [left_one, left_two];
+
+    const right_one: ManifestLeafInputEntry = try make_input(&arena, "alpha.txt", 50 as byte);
+    const right_three: ManifestLeafInputEntry = try make_input(&arena, "gamma.txt", 52 as byte);
+    var right_entries: [ManifestLeafInputEntry: 2] = [right_one, right_three];
+
+    const left_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(left_entries[0: 2]);
+    const right_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(right_entries[0: 2]);
+    var no_specs: [ByteList: 1] = [ByteList{ ptr: null, len: 0 }];
+
+    const serial: ManifestFlatDiffEntryList = try manifest_flat_diff(
+        &arena,
+        &left_list,
+        &right_list,
+        manifest_pathspec_list_from_slice(no_specs[0: 0]),
+    );
+    const single_worker: ManifestFlatDiffEntryList = try manifest_flat_diff_parallel(
+        &arena,
+        &left_list,
+        &right_list,
+        manifest_pathspec_list_from_slice(no_specs[0: 0]),
+        1,
+    );
+
+    try expect_flat_diff_lists_equal(&single_worker, &serial);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Manifest Flat Diff Tests");
+    run_test("manifest flat diff parallel matches serial across root shards", test_manifest_flat_diff_parallel_matches_serial_across_root_shards);
+    run_test("manifest flat diff parallel respects pathspec filter", test_manifest_flat_diff_parallel_respects_pathspec_filter);
+    run_test("manifest flat diff parallel single worker matches serial", test_manifest_flat_diff_parallel_single_worker_matches_serial);
+    return test_suite_end();
+}

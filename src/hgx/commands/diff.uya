@@ -35,6 +35,7 @@ use manifest.flat_diff.ManifestFlatDiffEntry;
 use manifest.flat_diff.ManifestFlatDiffEntryKind;
 use manifest.flat_diff.ManifestFlatDiffEntryList;
 use manifest.flat_diff.manifest_flat_diff;
+use manifest.flat_diff.manifest_flat_diff_parallel;
 use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_bytes_is_utf8;
 use manifest.path.manifest_path_normalize;
@@ -82,6 +83,7 @@ use std.io.file.file_read;
 
 const DIFF_ARENA_BYTES: usize = 33554432 as usize;
 const DIFF_PATHSPEC_ARENA_BYTES: usize = 1048576 as usize;
+const DIFF_PARALLEL_MANIFEST_WORKERS: i32 = 4;
 const DIFF_FILE_MODE_EXEC_BITS: u32 = 73u32;
 const DIFF_FILE_MODE_TYPE_MASK: u32 = 61440u32;
 const DIFF_FILE_MODE_SYMLINK: u32 = 40960u32;
@@ -1253,7 +1255,13 @@ export fn run_diff() i32 {
         right_source = DiffInputSourceKind.Workspace;
     }
 
-    const entries: ManifestFlatDiffEntryList = manifest_flat_diff(&arena, &left_inputs, &right_inputs, pathspecs) catch {
+    const entries: ManifestFlatDiffEntryList = manifest_flat_diff_parallel(
+        &arena,
+        &left_inputs,
+        &right_inputs,
+        pathspecs,
+        DIFF_PARALLEL_MANIFEST_WORKERS,
+    ) catch {
         fprintf(stderr, "%s" as *byte, DIFF_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
