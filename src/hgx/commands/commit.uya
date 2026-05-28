@@ -20,11 +20,10 @@ use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.ManifestId;
 use core.ids.ObjectId;
-use core.ids.PolicyId;
 use core.ids.commit_id_compare;
 use core.ids.manifest_id_from_object;
 use core.ids.object_id_from_hash;
-use core.ids.policy_id_from_object;
+use core.policy.placeholder_policy_id;
 use index.commit_graph.CommitGraphEntryList;
 use index.commit_graph.CommitGraphPathList;
 use index.commit_graph.commit_graph_changed_path_bloom_build;
@@ -123,10 +122,6 @@ fn commit_same_arg(actual: &byte, expected: &const byte) bool {
         return false;
     }
     return strcmp(actual as &const byte, expected) == 0;
-}
-
-fn commit_zero_policy_id() PolicyId {
-    return policy_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
 }
 
 fn commit_zero_manifest_id() ManifestId {
@@ -269,7 +264,7 @@ fn commit_manifest_inputs_from_stage(arena: &Arena, store: &LooseObjectStore, sn
             object_id: ObjectId{ hash: entry.staged_object.hash },
             logical_size: logical_size,
             content_type: ContentType.Unknown,
-            policy_id: commit_zero_policy_id(),
+            policy_id: placeholder_policy_id(),
         };
         out_index = out_index + 1 as usize;
         i = i + 1 as usize;

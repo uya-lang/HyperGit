@@ -327,36 +327,36 @@
 
 - [x] 评估 Uya `std.http` 当前 API。
 - [x] 实现 HTTP route skeleton。
-- [ ] 实现 capabilities endpoint。
-- [ ] 实现 object batch endpoint。
-- [ ] 实现 manifest query endpoint。
-- [ ] 实现 fetch endpoint。
-- [ ] 实现 push endpoint。
-- [ ] 实现 request size limit。
-- [ ] 实现基础鉴权 hook。
+- [x] 实现 capabilities endpoint。
+- [x] 实现 object batch endpoint。
+- [x] 实现 manifest query endpoint。
+- [x] 实现 fetch endpoint。
+- [x] 实现 push endpoint。
+- [x] 实现 request size limit。
+- [x] 实现基础鉴权 hook。
 - [ ] 实现服务端 smoke test。
 
 ## 20. Security / Policy
 
-- [ ] 实现 path traversal 防护。
-- [ ] 实现绝对路径拒绝。
-- [ ] 实现非法 symlink escape 检查。
-- [ ] 实现 object hash 强校验。
-- [ ] 实现 pack checksum 强校验。
-- [ ] 实现 policy id 占位。
-- [ ] 实现 dedupe scope 占位。
-- [ ] 实现 audit event 占位。
-- [ ] 测试恶意路径。
-- [ ] 测试损坏对象无法 checkout。
+- [x] 实现 path traversal 防护。
+- [x] 实现绝对路径拒绝。
+- [x] 实现非法 symlink escape 检查。
+- [x] 实现 object hash 强校验。
+- [x] 实现 pack checksum 强校验。
+- [x] 实现 policy id 占位。
+- [x] 实现 dedupe scope 占位。
+- [x] 实现 audit event 占位。
+- [x] 测试恶意路径。
+- [x] 测试损坏对象无法 checkout。
 
 ## 21. Git 互操作
 
-- [ ] 编写 Git import/export 设计补充文档。
-- [ ] 实现读取 loose Git blob 原型。
+- [x] 编写 Git import/export 设计补充文档。
+- [x] 实现读取 loose Git blob 原型。
 - [ ] 实现 Git tree -> manifest 转换原型。
 - [ ] 实现 Git commit -> HyperGit commit 映射原型。
 - [ ] 实现 HyperGit manifest -> Git tree 导出原型。
-- [ ] 明确 native chunked blob 的 Git 降级策略。
+- [x] 明确 native chunked blob 的 Git 降级策略。
 - [ ] 测试小仓库 Git import。
 - [ ] 测试导出后 Git 能读取。
 

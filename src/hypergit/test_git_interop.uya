@@ -1,0 +1,119 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+
+use libc.Stat;
+use libc.stat;
+use libc.system;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use git.interop.GitLooseBlobPrototype;
+use git.interop.git_import_loose_blob_as_small_blob_prototype;
+use git.interop.git_read_loose_blob_prototype;
+use git.interop.git_tree_to_manifest_entries_prototype;
+use git.interop.git_tree_to_manifest_prototype;
+use git.interop.GitTreeEntryPrototypeList;
+use object.codec.decode_small_blob_object;
+use object.types.EntryKind;
+use object.types.SmallBlobPayload;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn read_file_bytes(arena: &Arena, path: &const byte) !&[byte] {
+    var st: Stat = Stat{};
+    try expect(stat(path, &st) == 0);
+    const size: usize = st.st_size as usize;
+    const raw: &byte = arena_alloc(arena, size) as &byte;
+    try expect(raw != null);
+    const out: &[byte] = raw[0: size];
+    const stream: &FILE = fopen(path, "r");
+    try expect(stream != null);
+    defer {
+        _ = fclose(stream);
+    }
+    try expect(fread(out.ptr, 1 as usize, size, stream) == size);
+    return out;
+}
+
+fn trim_newline(slice: &[byte]) &[byte] {
+    if slice.len > 0 as usize && slice.ptr[slice.len - 1 as usize] == '\n' as byte {
+        return slice.ptr[0: slice.len - 1 as usize];
+    }
+    return slice;
+}
+
+fn expect_byte_slice_eq(actual: &[byte], expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0 as usize;
+    while i < actual.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn test_git_loose_blob_prototype_reads_and_imports_blob() !void {
+    try expect(system("rm -rf build/git-interop-loose && mkdir -p build/git-interop-loose/repo build/git-interop-loose/hgit/objects/loose && cd build/git-interop-loose/repo && git init >/dev/null 2>&1 && printf hello-git > hello.txt && git hash-object -w hello.txt > ../oid.txt") == 0);
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    const oid_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-loose/oid.txt");
+    const oid_hex: &[byte] = trim_newline(oid_file);
+    const blob: GitLooseBlobPrototype = try git_read_loose_blob_prototype(&arena, literal_bytes("build/git-interop-loose/repo/.git"), oid_hex);
+    try expect(blob.oid_hex.len == 40 as usize);
+    try expect_byte_slice_eq(blob.content.ptr[0: blob.content.len], literal_bytes("hello-git"));
+
+    const store: LooseObjectStore = try loose_store_open("build/git-interop-loose/hgit/objects/loose");
+    const object_id: ObjectId = try git_import_loose_blob_as_small_blob_prototype(&arena, &store, literal_bytes("build/git-interop-loose/repo/.git"), oid_hex);
+    try expect(try store.has(object_id));
+
+    var read_offset: usize = 0 as usize;
+    const object_bytes: ObjectBytes = try store.get(object_id, &arena);
+    const payload: SmallBlobPayload = try decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &read_offset);
+    try expect(read_offset == object_bytes.bytes.len);
+    try expect_byte_slice_eq(payload.payload.ptr[0: payload.payload.len], literal_bytes("hello-git"));
+}
+
+fn test_git_tree_to_manifest_prototype_imports_paths_and_modes() !void {
+    try expect(system("rm -rf build/git-interop-tree && mkdir -p build/git-interop-tree/repo build/git-interop-tree/hgit/objects/loose && cd build/git-interop-tree/repo && git init >/dev/null 2>&1 && mkdir -p src && printf tree-main > src/main.txt && printf '#!/bin/sh\\necho hi\\n' > run.sh && chmod +x run.sh && git add src/main.txt run.sh >/dev/null 2>&1 && git write-tree > ../tree.txt") == 0);
+
+    var arena_buf: [byte: 65536] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 65536 as usize);
+
+    const tree_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-tree/tree.txt");
+    const tree_hex: &[byte] = trim_newline(tree_file);
+    const store: LooseObjectStore = try loose_store_open("build/git-interop-tree/hgit/objects/loose");
+
+    const entries: GitTreeEntryPrototypeList = try git_tree_to_manifest_entries_prototype(&arena, &store, literal_bytes("build/git-interop-tree/repo/.git"), tree_hex);
+    try expect(entries.len == 2 as usize);
+    try expect(entries.ptr[0].kind == EntryKind.Executable || entries.ptr[1].kind == EntryKind.Executable);
+    try expect_byte_slice_eq(entries.ptr[0].path.ptr[0: entries.ptr[0].path.len], literal_bytes("run.sh"));
+    try expect_byte_slice_eq(entries.ptr[1].path.ptr[0: entries.ptr[1].path.len], literal_bytes("src/main.txt"));
+
+    const manifest_id: ManifestId = try git_tree_to_manifest_prototype(&arena, &store, literal_bytes("build/git-interop-tree/repo/.git"), tree_hex);
+    try expect(try store.has(manifest_id.id));
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Git Interop Tests");
+    run_test("git loose blob prototype reads and imports blob", test_git_loose_blob_prototype_reads_and_imports_blob);
+    run_test("git tree to manifest prototype imports paths and modes", test_git_tree_to_manifest_prototype_imports_paths_and_modes);
+    return test_suite_end();
+}

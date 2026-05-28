@@ -18,6 +18,7 @@ use std.thread.thread_pool_shutdown;
 
 use libc.Stat;
 use libc.errno;
+use libc.ENOENT;
 use libc.free;
 use libc.fprintf;
 use libc.malloc;
@@ -43,6 +44,7 @@ use large.chunk_store.ChunkStore;
 use large.chunk_store.chunk_store_open;
 use large.range_read.chunked_blob_read_range;
 use manifest.load.manifest_load_flatten;
+use manifest.path.manifest_path_normalize;
 use manifest.trie.ManifestLeafInputList;
 use object.codec.decode_chunked_blob_object;
 use object.codec.decode_commit_object;
@@ -91,17 +93,21 @@ use workspace.state.workspace_state_with_counts;
 use workspace.state.workspace_state_zero_commit;
 use workspace.state_file.workspace_state_file_read;
 use workspace.state_file.workspace_state_file_write;
+use syscall.sys_lstat;
 
 const CHECKOUT_ARENA_BYTES: usize = 33554432 as usize;
 const CHECKOUT_PATH_MAX: usize = 4096 as usize;
 const CHECKOUT_PARALLEL_WORKERS: usize = 4 as usize;
 const CHECKOUT_STAT_S_IFMT: u32 = 61440u32;
 const CHECKOUT_STAT_S_IFDIR: u32 = 16384u32;
+const CHECKOUT_STAT_S_IFLNK: u32 = 40960u32;
 const CHECKOUT_TASK_OK: usize = 0 as usize;
 const CHECKOUT_TASK_PERMISSION: usize = 1 as usize;
 const CHECKOUT_TASK_WRITE_FAILED: usize = 2 as usize;
 const CHECKOUT_TASK_FAILURE: usize = 3 as usize;
 const CHECKOUT_TASK_ALLOC: usize = 4 as usize;
+const CHECKOUT_TASK_UNSAFE_PATH: usize = 5 as usize;
+const CHECKOUT_TASK_SYMLINK_ESCAPE: usize = 6 as usize;
 
 error CheckoutAlloc;
 error CheckoutInvalidSpec;
@@ -109,6 +115,8 @@ error CheckoutNoCommits;
 error CheckoutWriteFailed;
 error CheckoutPermissionDenied;
 error CheckoutPathTooLong;
+error CheckoutUnsafePath;
+error CheckoutSymlinkEscape;
 
 struct CheckoutFsPath {
     bytes: [byte: 4096] = [],
@@ -270,8 +278,40 @@ fn checkout_fs_path_join(base: &CheckoutFsPath, suffix: &ByteList) !CheckoutFsPa
     return out;
 }
 
+fn checkout_validate_action_path(path: &ByteList) !void {
+    if path == null || (path.len > 0 as usize && path.ptr == null) {
+        return error.CheckoutUnsafePath;
+    }
+    if path.len == 0 as usize || path.len >= CHECKOUT_PATH_MAX {
+        return error.CheckoutUnsafePath;
+    }
+
+    var arena_buf: [byte: CHECKOUT_PATH_MAX * 2] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], CHECKOUT_PATH_MAX * 2);
+
+    const normalized: ByteList = manifest_path_normalize(&arena, path.ptr[0: path.len]) catch {
+        return error.CheckoutUnsafePath;
+    };
+    if normalized.len != path.len {
+        return error.CheckoutUnsafePath;
+    }
+
+    var i: usize = 0 as usize;
+    while i < path.len {
+        if normalized.ptr[i] != path.ptr[i] {
+            return error.CheckoutUnsafePath;
+        }
+        i = i + 1 as usize;
+    }
+}
+
 fn checkout_errno_permission() bool {
     return errno == EACCES || errno == EPERM;
+}
+
+fn checkout_path_mode_kind(mode: u32) u32 {
+    return mode & CHECKOUT_STAT_S_IFMT;
 }
 
 fn checkout_path_is_dir(path: &CheckoutFsPath) bool {
@@ -279,7 +319,43 @@ fn checkout_path_is_dir(path: &CheckoutFsPath) bool {
     if stat(&path.bytes[0] as &const byte, &st) != 0 {
         return false;
     }
-    return (st.st_mode as u32 & CHECKOUT_STAT_S_IFMT) == CHECKOUT_STAT_S_IFDIR;
+    return checkout_path_mode_kind(st.st_mode as u32) == CHECKOUT_STAT_S_IFDIR;
+}
+
+fn checkout_path_is_symlink(path: &CheckoutFsPath) !bool {
+    var st: Stat = Stat{};
+    _ = sys_lstat(&path.bytes[0] as &const byte, &st) catch |err| {
+        if @error_id(err) == ENOENT as u32 {
+            return false;
+        }
+        if checkout_errno_permission() {
+            return error.CheckoutPermissionDenied;
+        }
+        return error.CheckoutWriteFailed;
+    };
+    return checkout_path_mode_kind(st.st_mode as u32) == CHECKOUT_STAT_S_IFLNK;
+}
+
+fn checkout_reject_symlink_parents(path: &CheckoutFsPath) !void {
+    var buf: CheckoutFsPath = *path;
+    var i: usize = 1 as usize;
+    while i < path.len {
+        if buf.bytes[i] == '/' as byte {
+            const saved: byte = buf.bytes[i];
+            buf.bytes[i] = 0 as byte;
+            if try checkout_path_is_symlink(&buf) {
+                return error.CheckoutSymlinkEscape;
+            }
+            buf.bytes[i] = saved;
+        }
+        i = i + 1 as usize;
+    }
+}
+
+fn checkout_reject_symlink_target(path: &CheckoutFsPath) !void {
+    if try checkout_path_is_symlink(path) {
+        return error.CheckoutSymlinkEscape;
+    }
 }
 
 fn checkout_ensure_parent_dirs(path: &CheckoutFsPath) !void {
@@ -289,10 +365,29 @@ fn checkout_ensure_parent_dirs(path: &CheckoutFsPath) !void {
         if buf.bytes[i] == '/' as byte {
             const saved: byte = buf.bytes[i];
             buf.bytes[i] = 0 as byte;
-            if mkdir(&buf.bytes[0] as &const byte, S_IRWXU as i32) != 0 && !checkout_path_is_dir(&buf) {
+            var st: Stat = Stat{};
+            _ = sys_lstat(&buf.bytes[0] as &const byte, &st) catch |err| {
+                if @error_id(err) == ENOENT as u32 {
+                    if mkdir(&buf.bytes[0] as &const byte, S_IRWXU as i32) != 0 && !checkout_path_is_dir(&buf) {
+                        if checkout_errno_permission() {
+                            return error.CheckoutPermissionDenied;
+                        }
+                        return error.CheckoutWriteFailed;
+                    }
+                    buf.bytes[i] = saved;
+                    i = i + 1 as usize;
+                    continue;
+                }
                 if checkout_errno_permission() {
                     return error.CheckoutPermissionDenied;
                 }
+                return error.CheckoutWriteFailed;
+            };
+            const kind: u32 = checkout_path_mode_kind(st.st_mode as u32);
+            if kind == CHECKOUT_STAT_S_IFLNK {
+                return error.CheckoutSymlinkEscape;
+            }
+            if kind != CHECKOUT_STAT_S_IFDIR {
                 return error.CheckoutWriteFailed;
             }
             buf.bytes[i] = saved;
@@ -333,7 +428,9 @@ fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, chunk_st
     } else {
         return error.CheckoutFailure;
     }
+    try checkout_reject_symlink_parents(path);
     try checkout_ensure_parent_dirs(path);
+    try checkout_reject_symlink_target(path);
     const fs_mode: u32 = action.file_mode & 0o777u32;
     const file: File = file_open(&path.bytes[0] as &const byte, O_WRONLY | O_CREAT | O_TRUNC, fs_mode) catch {
         if checkout_errno_permission() {
@@ -362,6 +459,12 @@ fn checkout_apply_task_error_code(err_id: u32) usize {
     if err_id == @error_id(error.CheckoutAlloc) {
         return CHECKOUT_TASK_ALLOC;
     }
+    if err_id == @error_id(error.CheckoutUnsafePath) {
+        return CHECKOUT_TASK_UNSAFE_PATH;
+    }
+    if err_id == @error_id(error.CheckoutSymlinkEscape) {
+        return CHECKOUT_TASK_SYMLINK_ESCAPE;
+    }
     return CHECKOUT_TASK_FAILURE;
 }
 
@@ -377,6 +480,12 @@ fn checkout_apply_task_status(status: usize) !void {
     }
     if status == CHECKOUT_TASK_ALLOC {
         return error.CheckoutAlloc;
+    }
+    if status == CHECKOUT_TASK_UNSAFE_PATH {
+        return error.CheckoutUnsafePath;
+    }
+    if status == CHECKOUT_TASK_SYMLINK_ESCAPE {
+        return error.CheckoutSymlinkEscape;
     }
     return error.CheckoutFailure;
 }
@@ -432,8 +541,10 @@ export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &Re
     var i: usize = 0;
     while i < plan.actions.len {
         const action: &CheckoutAction = &plan.actions.ptr[i];
+        try checkout_validate_action_path(&action.path);
         const fs_path: CheckoutFsPath = try checkout_fs_path_join(&root_path, &action.path);
         if action.kind == CheckoutActionKind.DeleteFile {
+            try checkout_reject_symlink_parents(&fs_path);
             _ = remove(&fs_path.bytes[0] as &const byte);
         } else {
             write_count = write_count + 1 as usize;

@@ -1,0 +1,88 @@
+use std.runtime.entry;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.string.strlen;
+use std.http.uyagin.UyaginMode;
+
+use protocol.http_remote.HttpRemoteServer;
+use protocol.http_remote.http_remote_server_close;
+use protocol.http_remote.http_remote_server_listen_loopback_repo;
+
+fn cstr_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn parse_u16_arg(text: &[byte]) !u16 {
+    if text.len == 0 as usize {
+        return error.InvalidRequest;
+    }
+    var value: u32 = 0u32;
+    var i: usize = 0;
+    while i < text.len {
+        const ch: byte = text.ptr[i];
+        if ch < 48 as byte || ch > 57 as byte {
+            return error.InvalidRequest;
+        }
+        value = value * 10u32 + (ch - 48 as byte) as u32;
+        if value > 65535u32 {
+            return error.InvalidRequest;
+        }
+        i = i + 1 as usize;
+    }
+    return value as u16;
+}
+
+fn parse_usize_arg(text: &[byte]) !usize {
+    if text.len == 0 as usize {
+        return 0 as usize;
+    }
+    var value: usize = 0 as usize;
+    var i: usize = 0;
+    while i < text.len {
+        const ch: byte = text.ptr[i];
+        if ch < 48 as byte || ch > 57 as byte {
+            return error.InvalidRequest;
+        }
+        value = value * 10 as usize + (ch - 48 as byte) as usize;
+        i = i + 1 as usize;
+    }
+    return value;
+}
+
+export fn main() i32 {
+    if get_argc() != 5 {
+        return 2;
+    }
+
+    const repo_root: &[byte] = cstr_bytes(get_argv(1) as &const byte);
+    const port: u16 = parse_u16_arg(cstr_bytes(get_argv(2) as &const byte)) catch {
+        return 2;
+    };
+    var token: &[byte] = cstr_bytes(get_argv(3) as &const byte);
+    if token.len == 1 as usize && token.ptr[0] == '-' as byte {
+        token = token[0: 0];
+    }
+    const max_body_bytes: usize = parse_usize_arg(cstr_bytes(get_argv(4) as &const byte)) catch {
+        return 2;
+    };
+
+    var server: HttpRemoteServer = http_remote_server_listen_loopback_repo(
+        port,
+        repo_root,
+        cstr_bytes("main"),
+        token,
+        max_body_bytes,
+    ) catch {
+        return 1;
+    };
+    defer {
+        http_remote_server_close(&server);
+    }
+
+    server.engine.run_options.mode = UyaginMode.Debug;
+    server.engine.run_options.shard_count = 1;
+    _ = server.engine.run_shards(&server.listener) catch {
+        return 1;
+    };
+    return 0;
+}

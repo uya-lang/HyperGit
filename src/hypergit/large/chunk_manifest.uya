@@ -3,10 +3,9 @@ use std.mem.arena.arena_alloc;
 
 use core.codec.codec_hash_payload;
 use core.ids.Hash32;
-use core.ids.ObjectId;
 use core.ids.PolicyId;
-use core.ids.object_id_from_hash;
-use core.ids.policy_id_from_object;
+use core.policy.placeholder_dedupe_scope;
+use core.policy.placeholder_policy_id;
 use large.chunk_hash.ChunkHashes;
 use large.chunk_store.ChunkStorePutResult;
 use large.chunker.LargeChunk;
@@ -49,10 +48,6 @@ fn chunk_manifest_hash_clone(src: &Hash32) Hash32 {
         i = i + 1 as usize;
     }
     return out;
-}
-
-fn chunk_manifest_zero_policy() PolicyId {
-    return policy_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
 }
 
 fn chunk_manifest_alloc_refs(arena: &Arena, count: usize) !&[ChunkRef] {
@@ -136,6 +131,6 @@ export fn chunked_blob_payload_repository_default(
         file_type,
         chunking_strategy,
         parts,
-        chunk_manifest_zero_policy(),
-        DedupeScope.Repository);
+        placeholder_policy_id(),
+        placeholder_dedupe_scope());
 }

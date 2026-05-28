@@ -1,0 +1,48 @@
+use std.runtime.entry;
+use std.http.types.Status;
+use std.http.uyagin.AsyncHandler;
+use std.http.uyagin.Engine;
+use std.http.uyagin.EngineRunOptions;
+use std.http.uyagin.GinContext;
+use std.http.uyagin.GinListener;
+use std.http.uyagin.UyaginMode;
+use std.http.uyagin.uyagin_listen_loopback_with_options;
+use std.http.uyagin.uyagin_new;
+use std.http.uyagin.uyagin_run_options_default;
+use std.async.Future;
+use std.string.strlen;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn ok_future(ctx: &GinContext) Future<!i32> {
+    return ctx.string(Status.OK, "ok\n");
+}
+
+struct OkHandler : AsyncHandler {
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        return try @await ok_future(ctx);
+    }
+}
+
+export fn main() i32 {
+    var engine: Engine = uyagin_new();
+    var options: EngineRunOptions = uyagin_run_options_default();
+    options.mode = UyaginMode.Debug;
+    engine.run_options = options;
+
+    const handler: AsyncHandler = OkHandler{};
+    engine.GET(literal_bytes("/ok"), handler) catch {
+        return 1;
+    };
+
+    const listener: GinListener = uyagin_listen_loopback_with_options(48129 as u16, &engine.run_options) catch {
+        return 1;
+    };
+    _ = engine.run_shards(&listener) catch {
+        return 1;
+    };
+    return 0;
+}

@@ -6,17 +6,338 @@ use std.testing.test_suite_begin;
 use std.testing.test_suite_end;
 use std.http.uyagin.EngineRunOptions;
 use std.http.uyagin.UyaginLimits;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
 
+use libc.system;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fwrite;
+use core.codec.DecodedObject;
+use core.codec.codec_decode_object;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.commit_id_compare;
+use core.ids.commit_id_encode_hex;
+use core.ids.commit_id_from_object;
+use core.ids.hash32_encode_hex;
+use core.ids.manifest_id_compare;
+use core.ids.object_id_compare;
+use core.ids.object_id_from_hash;
+use manifest.root.manifest_root_build_and_store;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.commit_build.commit_object_build_and_store;
+use object.types.BloomFilter;
+use object.types.ByteList;
+use object.types.CommitPayload;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.Identity;
+use object.types.ManifestEntry;
+use object.types.ModuleBitmap;
+use object.types.ObjectKind;
+use object.types.PublishedView;
+use object.types.byte_list_from_slice;
+use object.types.commit_id_list_from_slice;
+use object.types.object_kind_from_u16;
+use protocol.fetch.FetchBlobFilter;
+use protocol.fetch.FetchViewRequest;
+use protocol.fetch.FetchViewResponse;
+use protocol.http_remote.HTTP_REMOTE_DEFAULT_IDLE_TIMEOUT_MS;
 use protocol.http_remote.HTTP_REMOTE_DEFAULT_MAX_CONNECTIONS;
 use protocol.http_remote.HTTP_REMOTE_DEFAULT_READ_TIMEOUT_MS;
 use protocol.http_remote.HTTP_REMOTE_DEFAULT_WRITE_TIMEOUT_MS;
-use protocol.http_remote.HTTP_REMOTE_DEFAULT_IDLE_TIMEOUT_MS;
+use protocol.http_remote.HttpRemoteManifestQueryRequest;
+use protocol.http_remote.HttpRemoteByteListList;
+use protocol.http_remote.HttpRemoteManifestQueryResponse;
+use protocol.http_remote.HttpRemoteObjectBatchRequest;
+use protocol.http_remote.HttpRemoteObjectBatchResponse;
+use protocol.http_remote.HttpRemoteObjectIdList;
 use protocol.http_remote.HttpRemoteServer;
+use protocol.http_remote.decode_http_remote_manifest_query_response;
+use protocol.http_remote.decode_http_remote_object_batch_response;
+use protocol.http_remote.encode_http_remote_manifest_query_request;
+use protocol.http_remote.encode_http_remote_object_batch_request;
+use protocol.http_remote.http_remote_capabilities_json;
 use protocol.http_remote.http_remote_default_limits;
 use protocol.http_remote.http_remote_default_run_options;
+use protocol.http_remote.http_remote_handle_fetch_request;
+use protocol.http_remote.http_remote_handle_manifest_query;
+use protocol.http_remote.http_remote_handle_object_batch;
+use protocol.http_remote.http_remote_handle_push_request;
+use protocol.http_remote.http_remote_manifest_query_request_encoded_len;
+use protocol.http_remote.http_remote_object_batch_request_encoded_len;
 use protocol.http_remote.http_remote_server_close;
 use protocol.http_remote.http_remote_server_listen_loopback;
+use protocol.http_remote.http_remote_server_listen_loopback_repo;
 use protocol.http_remote.http_remote_server_port;
+use protocol.push.PushObjectRecord;
+use protocol.push.PushObjectRecordList;
+use protocol.push.PushObjectsRequest;
+use protocol.push.PushObjectsResponse;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+
+const TEST_PATH_MAX: usize = 1024;
+
+struct TestPath {
+    bytes: [byte: TEST_PATH_MAX] = [],
+    len: usize
+}
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn test_path_empty() TestPath {
+    return TestPath{ bytes: [], len: 0 };
+}
+
+fn test_path_cstr(path: &TestPath) &byte {
+    return &path.bytes[0];
+}
+
+fn test_path_from_literal(text: &const byte) TestPath {
+    const slice: &[byte] = literal_bytes(text);
+    var path: TestPath = test_path_empty();
+    var i: usize = 0;
+    while i < slice.len {
+        path.bytes[i] = slice.ptr[i];
+        i = i + 1 as usize;
+    }
+    path.bytes[slice.len] = 0 as byte;
+    path.len = slice.len;
+    return path;
+}
+
+fn test_path_join(base: &[byte], suffix: &const byte) !TestPath {
+    const suffix_bytes: &[byte] = literal_bytes(suffix);
+    if base.len + suffix_bytes.len + 2 as usize >= TEST_PATH_MAX {
+        return error.AssertionFailed;
+    }
+    var path: TestPath = test_path_empty();
+    var i: usize = 0;
+    while i < base.len {
+        path.bytes[i] = base.ptr[i];
+        i = i + 1 as usize;
+    }
+    path.len = base.len;
+    if path.len > 0 as usize {
+        const last_index: usize = path.len - 1 as usize;
+        if last_index < TEST_PATH_MAX && path.bytes[last_index] != '/' as byte {
+            path.bytes[path.len] = '/' as byte;
+            path.len = path.len + 1 as usize;
+        }
+    }
+    i = 0;
+    while i < suffix_bytes.len {
+        path.bytes[path.len + i] = suffix_bytes.ptr[i];
+        i = i + 1 as usize;
+    }
+    path.len = path.len + suffix_bytes.len;
+    path.bytes[path.len] = 0 as byte;
+    return path;
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(make_hash(seed));
+}
+
+fn empty_bloom() BloomFilter {
+    return BloomFilter{ bytes: ByteList{ ptr: null, len: 0 } };
+}
+
+fn empty_module_bitmap() ModuleBitmap {
+    return ModuleBitmap{ bytes: ByteList{ ptr: null, len: 0 } };
+}
+
+fn contains_bytes(haystack: &[byte], needle: &[byte]) bool {
+    if needle.len == 0 as usize {
+        return true;
+    }
+    if haystack.len < needle.len {
+        return false;
+    }
+    var start: usize = 0;
+    while start + needle.len <= haystack.len {
+        var matched: bool = true;
+        var i: usize = 0;
+        while i < needle.len {
+            if haystack.ptr[start + i] != needle.ptr[i] {
+                matched = false;
+                break;
+            }
+            i = i + 1 as usize;
+        }
+        if matched {
+            return true;
+        }
+        start = start + 1 as usize;
+    }
+    return false;
+}
+
+fn write_head_ref(repo_root: &[byte], branch: &const byte, commit_id: &CommitId) !void {
+    const head_path: TestPath = try test_path_join(repo_root, ".hgit/refs/heads/main");
+    _ = branch;
+    const stream: &FILE = fopen(test_path_cstr(&head_path) as &const byte, "w");
+    try expect(stream != null);
+    defer {
+        _ = fclose(stream);
+    }
+    var buf: [byte: HASH32_HEX_BYTES + 1] = [];
+    _ = try commit_id_encode_hex(commit_id, buf[0: HASH32_HEX_BYTES]);
+    buf[HASH32_HEX_BYTES] = '\n' as byte;
+    try expect(fwrite(&buf[0] as &const byte, 1 as usize, HASH32_HEX_BYTES + 1 as usize, stream) == HASH32_HEX_BYTES + 1 as usize);
+}
+
+fn expect_byte_list_eq(actual: ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0;
+    while i < expected.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn make_identity() Identity {
+    var name: [byte: 5] = ['a' as byte, 'l' as byte, 'i' as byte, 'c' as byte, 'e' as byte];
+    var mail: [byte: 17] = ['a' as byte, 'l' as byte, 'i' as byte, 'c' as byte, 'e' as byte, '@' as byte, 'e' as byte, 'x' as byte, 'a' as byte, 'm' as byte, 'p' as byte, 'l' as byte, 'e' as byte, '.' as byte, 'c' as byte, 'o' as byte, 'm' as byte];
+    return Identity{
+        name: byte_list_from_slice(name[0: 5]),
+        email: byte_list_from_slice(mail[0: 17]),
+    };
+}
+
+fn make_leaf_input(arena: &Arena, path: &[byte], seed: byte) !ManifestLeafInputEntry {
+    const raw: &byte = arena_alloc(arena, path.len);
+    try expect(raw != null);
+    var i: usize = 0;
+    while i < path.len {
+        raw[i] = path.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ManifestLeafInputEntry{
+        path: ByteList{ ptr: raw, len: path.len },
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id(seed),
+        logical_size: seed as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: PolicyId{ id: make_object_id(seed + 40 as byte) },
+    };
+}
+
+fn create_test_repo_dirs(root: &const byte) !void {
+    var cmd: [byte: 512] = [];
+    const prefix: &[byte] = literal_bytes("rm -rf ");
+    const middle: &[byte] = literal_bytes(" && mkdir -p ");
+    const suffix_a: &[byte] = literal_bytes("/.hgit/objects/loose ");
+    const suffix_b: &[byte] = literal_bytes("/.hgit/refs/heads");
+    const root_bytes: &[byte] = literal_bytes(root);
+    var offset: usize = 0;
+    var i: usize = 0;
+    while i < prefix.len {
+        cmd[offset + i] = prefix.ptr[i];
+        i = i + 1 as usize;
+    }
+    offset = offset + prefix.len;
+    i = 0;
+    while i < root_bytes.len {
+        cmd[offset + i] = root_bytes.ptr[i];
+        i = i + 1 as usize;
+    }
+    offset = offset + root_bytes.len;
+    i = 0;
+    while i < middle.len {
+        cmd[offset + i] = middle.ptr[i];
+        i = i + 1 as usize;
+    }
+    offset = offset + middle.len;
+    i = 0;
+    while i < root_bytes.len {
+        cmd[offset + i] = root_bytes.ptr[i];
+        i = i + 1 as usize;
+    }
+    offset = offset + root_bytes.len;
+    i = 0;
+    while i < suffix_a.len {
+        cmd[offset + i] = suffix_a.ptr[i];
+        i = i + 1 as usize;
+    }
+    offset = offset + suffix_a.len;
+    i = 0;
+    while i < root_bytes.len {
+        cmd[offset + i] = root_bytes.ptr[i];
+        i = i + 1 as usize;
+    }
+    offset = offset + root_bytes.len;
+    i = 0;
+    while i < suffix_b.len {
+        cmd[offset + i] = suffix_b.ptr[i];
+        i = i + 1 as usize;
+    }
+    offset = offset + suffix_b.len;
+    cmd[offset] = 0 as byte;
+    try expect(system(&cmd[0] as &const byte) == 0);
+}
+
+fn open_repo_store(repo_root: &const byte) !LooseObjectStore {
+    const object_root: TestPath = try test_path_join(literal_bytes(repo_root), ".hgit/objects/loose");
+    return loose_store_open(test_path_cstr(&object_root));
+}
+
+fn build_manifest_and_commit(store: &LooseObjectStore, manifest_root: &ManifestId, commit_id: &CommitId) !void {
+    var input_arena_buf: [byte: 8192] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 8192 as usize);
+    const input0: ManifestLeafInputEntry = try make_leaf_input(&input_arena, literal_bytes("docs/readme.md"), 11 as byte);
+    const input1: ManifestLeafInputEntry = try make_leaf_input(&input_arena, literal_bytes("src/main.uya"), 12 as byte);
+    const input2: ManifestLeafInputEntry = try make_leaf_input(&input_arena, literal_bytes("src/util.uya"), 13 as byte);
+    var inputs: [ManifestLeafInputEntry: 3] = [input0, input1, input2];
+
+    var build_arena_buf: [byte: 65536] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 65536 as usize);
+
+    manifest_root[0] = try manifest_root_build_and_store(&build_arena, store, manifest_leaf_input_list_from_slice(inputs[0: 3]));
+
+    const author: Identity = make_identity();
+    const committer: Identity = make_identity();
+    var message: [byte: 12] = ['f' as byte, 'i' as byte, 'r' as byte, 's' as byte, 't' as byte, ' ' as byte, 'c' as byte, 'o' as byte, 'm' as byte, 'm' as byte, 'i' as byte, 't' as byte];
+    var no_parents: [CommitId: 1] = [CommitId{ id: ObjectId{ hash: Hash32{ bytes: [] } } }];
+    const payload: CommitPayload = CommitPayload{
+        parents: commit_id_list_from_slice(no_parents[0: 0]),
+        author: author,
+        committer: committer,
+        message: byte_list_from_slice(message[0: 12]),
+        timestamp_ms: 1234i64,
+        manifest_root: manifest_root[0],
+        changed_path_bloom: empty_bloom(),
+        module_bitmap: empty_module_bitmap(),
+        generation: 1u64,
+    };
+    commit_id[0] = try commit_object_build_and_store(&build_arena, store, &payload);
+}
 
 fn test_http_remote_defaults_are_stable() !void {
     const options: EngineRunOptions = http_remote_default_run_options();
@@ -40,9 +361,223 @@ fn test_http_remote_server_listen_loopback_binds_ephemeral_port() !void {
     try assert_eq_i32(server.engine.run_options.max_connections, HTTP_REMOTE_DEFAULT_MAX_CONNECTIONS);
 }
 
+fn test_http_remote_capabilities_and_routes() !void {
+    try create_test_repo_dirs("build/http-remote-capabilities");
+
+    var server: HttpRemoteServer = try http_remote_server_listen_loopback_repo(
+        0 as u16,
+        literal_bytes("build/http-remote-capabilities"),
+        literal_bytes("main"),
+        literal_bytes("token"),
+        1024 as usize,
+    );
+    defer {
+        http_remote_server_close(&server);
+    }
+
+    try assert_eq_i32(server.engine.route_count, 5);
+    try assert_eq_i32(server.engine.middleware_count, 1);
+    try expect(server.engine.limits.max_body_bytes == 1024 as usize);
+
+    var arena_buf: [byte: 2048] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 2048 as usize);
+    const body: ByteList = try http_remote_capabilities_json(&arena, server.runtime);
+    try expect(contains_bytes(body.ptr[0: body.len], literal_bytes("\"default_branch\":\"main\"")));
+    try expect(contains_bytes(body.ptr[0: body.len], literal_bytes("\"object_batch\":\"/objects/batch\"")));
+    try expect(contains_bytes(body.ptr[0: body.len], literal_bytes("\"auth_required\":true")));
+}
+
+fn test_http_remote_object_batch_returns_present_and_missing_records() !void {
+    try create_test_repo_dirs("build/http-remote-object-batch");
+    const store: LooseObjectStore = try open_repo_store("build/http-remote-object-batch");
+
+    var manifest_id: ManifestId = ManifestId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    var commit_id: CommitId = CommitId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    try build_manifest_and_commit(&store, &manifest_id, &commit_id);
+
+    var server: HttpRemoteServer = try http_remote_server_listen_loopback_repo(
+        0 as u16,
+        literal_bytes("build/http-remote-object-batch"),
+        literal_bytes("main"),
+        literal_bytes(""),
+        0 as usize,
+    );
+    defer {
+        http_remote_server_close(&server);
+    }
+
+    var object_ids: [ObjectId: 2] = [manifest_id.id, make_object_id(99 as byte)];
+    const request: HttpRemoteObjectBatchRequest = HttpRemoteObjectBatchRequest{
+        object_ids: HttpRemoteObjectIdList{ ptr: &object_ids[0], len: 2 as usize },
+    };
+
+    var arena_buf: [byte: 131072] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 131072 as usize);
+    const response: HttpRemoteObjectBatchResponse = try http_remote_handle_object_batch(&arena, server.runtime, &request);
+    try expect(response.objects.len == 2 as usize);
+    try expect(response.objects.ptr[0].present);
+    try expect(!response.objects.ptr[1].present);
+    try expect(object_id_compare(&response.objects.ptr[0].object_id, &manifest_id.id) == 0);
+
+    var decode_offset: usize = 0;
+    const decoded: DecodedObject = try codec_decode_object(response.objects.ptr[0].object_bytes.ptr[0: response.objects.ptr[0].object_bytes.len], &decode_offset);
+    try expect(decode_offset == response.objects.ptr[0].object_bytes.len);
+    try expect((try object_kind_from_u16(decoded.envelope.kind)) == ObjectKind.ManifestNode);
+}
+
+fn test_http_remote_manifest_query_filters_entries() !void {
+    try create_test_repo_dirs("build/http-remote-manifest-query");
+    const store: LooseObjectStore = try open_repo_store("build/http-remote-manifest-query");
+
+    var manifest_id: ManifestId = ManifestId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    var commit_id: CommitId = CommitId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    try build_manifest_and_commit(&store, &manifest_id, &commit_id);
+
+    var server: HttpRemoteServer = try http_remote_server_listen_loopback_repo(
+        0 as u16,
+        literal_bytes("build/http-remote-manifest-query"),
+        literal_bytes("main"),
+        literal_bytes(""),
+        0 as usize,
+    );
+    defer {
+        http_remote_server_close(&server);
+    }
+
+    var pathspec_storage: [byte: 3] = ['s' as byte, 'r' as byte, 'c' as byte];
+    var pathspecs: [ByteList: 1] = [ByteList{ ptr: &pathspec_storage[0], len: 3 as usize }];
+    const request: HttpRemoteManifestQueryRequest = HttpRemoteManifestQueryRequest{
+        manifest_id: manifest_id,
+        pathspecs: HttpRemoteByteListList{ ptr: &pathspecs[0], len: 1 as usize },
+    };
+
+    var arena_buf: [byte: 131072] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 131072 as usize);
+    const response: HttpRemoteManifestQueryResponse = try http_remote_handle_manifest_query(&arena, server.runtime, &request);
+    try expect(manifest_id_compare(&response.manifest_id, &manifest_id) == 0);
+    try expect(response.entries.len == 2 as usize);
+    try expect(response.children.len == 0 as usize);
+    try expect_byte_list_eq(response.entries.ptr[0].name, literal_bytes("src/main.uya"));
+    try expect_byte_list_eq(response.entries.ptr[1].name, literal_bytes("src/util.uya"));
+}
+
+fn test_http_remote_fetch_returns_current_published_view() !void {
+    try create_test_repo_dirs("build/http-remote-fetch");
+    const store: LooseObjectStore = try open_repo_store("build/http-remote-fetch");
+
+    var manifest_id: ManifestId = ManifestId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    var commit_id: CommitId = CommitId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    try build_manifest_and_commit(&store, &manifest_id, &commit_id);
+    try write_head_ref(literal_bytes("build/http-remote-fetch"), "main", &commit_id);
+
+    var server: HttpRemoteServer = try http_remote_server_listen_loopback_repo(
+        0 as u16,
+        literal_bytes("build/http-remote-fetch"),
+        literal_bytes("main"),
+        literal_bytes(""),
+        0 as usize,
+    );
+    defer {
+        http_remote_server_close(&server);
+    }
+
+    var empty_frontier: [CommitId: 1] = [commit_id];
+    var ref_storage: [byte: 15] = ['r' as byte, 'e' as byte, 'f' as byte, 's' as byte, '/' as byte, 'h' as byte, 'e' as byte, 'a' as byte, 'd' as byte, 's' as byte, '/' as byte, 'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte];
+    const request: FetchViewRequest = FetchViewRequest{
+        have_frontier: commit_id_list_from_slice(empty_frontier[0: 0]),
+        want_ref: ByteList{ ptr: &ref_storage[0], len: 15 as usize },
+        sparse_profile: ByteList{ ptr: null, len: 0 },
+        blob_filter: FetchBlobFilter{ max_inline_blob_bytes: 0u64, allow_chunked_blobs: true },
+    };
+
+    var arena_buf: [byte: 262144] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 262144 as usize);
+    const response: FetchViewResponse = try http_remote_handle_fetch_request(&arena, server.runtime, &request);
+    try expect(commit_id_compare(&response.view.head_commit, &commit_id) == 0);
+    try expect(manifest_id_compare(&response.view.manifest_root, &manifest_id) == 0);
+    try expect(try store.has(ObjectId{ hash: response.view_id.hash }));
+}
+
+fn test_http_remote_push_stores_objects_and_updates_head() !void {
+    try create_test_repo_dirs("build/http-remote-push-target");
+    try create_test_repo_dirs("build/http-remote-push-source");
+
+    const source_store: LooseObjectStore = try open_repo_store("build/http-remote-push-source");
+    var manifest_id: ManifestId = ManifestId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    var commit_id: CommitId = CommitId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    try build_manifest_and_commit(&source_store, &manifest_id, &commit_id);
+
+    var source_arena_buf: [byte: 262144] = [];
+    var source_arena: Arena = Arena{ buffer: &source_arena_buf[0], size: 0, used: 0 };
+    arena_init(&source_arena, &source_arena_buf[0], 262144 as usize);
+    const manifest_bytes: ObjectBytes = try source_store.get(manifest_id.id, &source_arena);
+    const commit_bytes: ObjectBytes = try source_store.get(commit_id.id, &source_arena);
+
+    var target_server: HttpRemoteServer = try http_remote_server_listen_loopback_repo(
+        0 as u16,
+        literal_bytes("build/http-remote-push-target"),
+        literal_bytes("main"),
+        literal_bytes(""),
+        0 as usize,
+    );
+    defer {
+        http_remote_server_close(&target_server);
+    }
+
+    var target_ref_storage: [byte: 15] = ['r' as byte, 'e' as byte, 'f' as byte, 's' as byte, '/' as byte, 'h' as byte, 'e' as byte, 'a' as byte, 'd' as byte, 's' as byte, '/' as byte, 'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte];
+    var records: [PushObjectRecord: 2] = [
+        PushObjectRecord{
+            object_id: manifest_id.id,
+            object_bytes: manifest_bytes.bytes,
+        },
+        PushObjectRecord{
+            object_id: commit_id.id,
+            object_bytes: commit_bytes.bytes,
+        },
+    ];
+    const pushed_commit: CommitId = CommitId{ id: commit_id.id };
+    const expected_head_commit: CommitId = CommitId{ id: commit_id.id };
+    const request: PushObjectsRequest = PushObjectsRequest{
+        objects: PushObjectRecordList{ ptr: &records[0], len: 2 as usize },
+        target_ref: ByteList{ ptr: &target_ref_storage[0], len: 15 as usize },
+        new_commit: pushed_commit,
+    };
+    const zero_commit: CommitId = CommitId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+
+    var target_arena_buf: [byte: 262144] = [];
+    var target_arena: Arena = Arena{ buffer: &target_arena_buf[0], size: 0, used: 0 };
+    arena_init(&target_arena, &target_arena_buf[0], 262144 as usize);
+    const response: PushObjectsResponse = try http_remote_handle_push_request(&target_arena, target_server.runtime, &request, &zero_commit);
+    try expect(response.accepted_objects == 2u64);
+
+    const target_store: LooseObjectStore = try open_repo_store("build/http-remote-push-target");
+    try expect(try target_store.has(manifest_id.id));
+    try expect(try target_store.has(commit_id.id));
+
+    var empty_frontier: [CommitId: 1] = [expected_head_commit];
+    var fetch_ref_storage: [byte: 15] = ['r' as byte, 'e' as byte, 'f' as byte, 's' as byte, '/' as byte, 'h' as byte, 'e' as byte, 'a' as byte, 'd' as byte, 's' as byte, '/' as byte, 'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte];
+    const fetch_request: FetchViewRequest = FetchViewRequest{
+        have_frontier: commit_id_list_from_slice(empty_frontier[0: 0]),
+        want_ref: ByteList{ ptr: &fetch_ref_storage[0], len: 15 as usize },
+        sparse_profile: ByteList{ ptr: null, len: 0 },
+        blob_filter: FetchBlobFilter{ max_inline_blob_bytes: 0u64, allow_chunked_blobs: true },
+    };
+    const fetch_response: FetchViewResponse = try http_remote_handle_fetch_request(&target_arena, target_server.runtime, &fetch_request);
+    try expect(commit_id_compare(&fetch_response.view.head_commit, &expected_head_commit) == 0);
+}
+
 export fn main() i32 {
-    test_suite_begin("HyperGit HTTP Remote Skeleton Tests");
+    test_suite_begin("HyperGit HTTP Remote Tests");
     run_test("http remote defaults are stable", test_http_remote_defaults_are_stable);
     run_test("http remote server listen loopback binds ephemeral port", test_http_remote_server_listen_loopback_binds_ephemeral_port);
+    run_test("http remote capabilities and routes", test_http_remote_capabilities_and_routes);
+    run_test("http remote object batch returns present and missing records", test_http_remote_object_batch_returns_present_and_missing_records);
+    run_test("http remote manifest query filters entries", test_http_remote_manifest_query_filters_entries);
+    run_test("http remote fetch returns current published view", test_http_remote_fetch_returns_current_published_view);
+    run_test("http remote push stores objects and updates head", test_http_remote_push_stores_objects_and_updates_head);
     return test_suite_end();
 }

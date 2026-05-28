@@ -1,0 +1,44 @@
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_compare;
+use core.ids.policy_id_from_object;
+use object.types.DedupeScope;
+
+export enum AuditEventKind {
+    Placeholder,
+    Checkout,
+    Commit,
+    Fetch,
+    Push
+}
+
+export struct AuditEventPlaceholder {
+    kind: AuditEventKind,
+    policy_id: PolicyId,
+    dedupe_scope: DedupeScope,
+    enabled: bool
+}
+
+export fn placeholder_policy_id() PolicyId {
+    return policy_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
+}
+
+export fn placeholder_dedupe_scope() DedupeScope {
+    return DedupeScope.Repository;
+}
+
+export fn policy_id_is_placeholder(value: &PolicyId) bool {
+    const zero: PolicyId = placeholder_policy_id();
+    return policy_id_compare(value, &zero) == 0;
+}
+
+export fn audit_event_placeholder(kind: AuditEventKind) AuditEventPlaceholder {
+    return AuditEventPlaceholder{
+        kind: kind,
+        policy_id: placeholder_policy_id(),
+        dedupe_scope: placeholder_dedupe_scope(),
+        enabled: false,
+    };
+}

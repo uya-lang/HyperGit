@@ -1,25 +1,1288 @@
+use std.async.Future;
+use std.async.future_ready_ok;
 use std.http.server.HttpServer;
 use std.http.server.http_server_close;
 use std.http.types.MAX_BODY_SIZE;
+use std.http.types.Status;
 use std.http.uyagin.Engine;
 use std.http.uyagin.EngineRunOptions;
+use std.http.uyagin.GinContext;
 use std.http.uyagin.GinListener;
 use std.http.uyagin.UyaginLimits;
+use std.http.uyagin.AsyncHandler;
 use std.http.uyagin.uyagin_limits_default;
 use std.http.uyagin.uyagin_listen_loopback_with_options;
 use std.http.uyagin.uyagin_new;
 use std.http.uyagin.uyagin_run_options_default;
 use std.http.uyagin.uyagin_set_limits;
 use std.http.uyagin.uyagin_set_run_options;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.fwrite;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.time.now_ms;
+
+use libc.Stat;
+use libc.EACCES;
+use libc.EPERM;
+use libc.errno;
+use libc.free;
+use libc.malloc;
+use libc.stat;
+use core.codec.ByteSpan;
+use core.codec.DecodedObject;
+use core.codec.codec_decode_bytes;
+use core.codec.codec_decode_enum_u16;
+use core.codec.codec_decode_object;
+use core.codec.codec_decode_u16;
+use core.codec.codec_decode_u32;
+use core.codec.codec_decode_u64;
+use core.codec.codec_decode_u8;
+use core.codec.codec_decode_varuint;
+use core.codec.codec_encode_bytes;
+use core.codec.codec_encode_enum_u16;
+use core.codec.codec_encode_u16;
+use core.codec.codec_encode_u32;
+use core.codec.codec_encode_u64;
+use core.codec.codec_encode_u8;
+use core.codec.codec_encode_varuint;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.PublishedViewId;
+use core.ids.HASH32_BYTES;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.commit_id_compare;
+use core.ids.commit_id_decode_hex;
+use core.ids.commit_id_encode_hex;
+use core.ids.hash32_encode_hex;
+use core.ids.manifest_id_compare;
+use core.ids.manifest_id_decode_hex;
+use core.ids.manifest_id_encode_hex;
+use core.ids.object_id_compare;
+use core.ids.object_id_decode_hex;
+use core.ids.object_id_encode_hex;
+use core.ids.published_view_id_compare;
+use manifest.query.manifest_pathspec_matches_path;
+use manifest.query.manifest_range_query;
+use manifest.query.ManifestRangeQueryResult;
+use manifest.query.ManifestPathspecList;
+use object.codec.decode_commit_object;
+use object.codec.decode_manifest_node_object;
+use object.codec.published_view_payload_to_canonical;
+use object.hash.hash_published_view;
+use object.types.ByteList;
+use object.types.CommitIdList;
+use object.types.CommitPayload;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ManifestChild;
+use object.types.ManifestChildList;
+use object.types.ManifestEntry;
+use object.types.ManifestEntryList;
+use object.types.ManifestNodePayload;
+use object.types.ObjectKind;
+use object.types.PublishedView;
+use object.types.object_kind_from_u16;
+use object.types.object_kind_to_u16;
+use protocol.fetch.FetchViewRequest;
+use protocol.fetch.FetchViewResponse;
+use protocol.fetch.FetchBlobFilter;
+use protocol.fetch.decode_fetch_view_request;
+use protocol.fetch.encode_fetch_view_response;
+use protocol.fetch.fetch_view_response_encoded_len;
+use protocol.push.PushObjectRecord;
+use protocol.push.PushObjectRecordList;
+use protocol.push.PushObjectsRequest;
+use protocol.push.PushObjectsResponse;
+use protocol.push.decode_push_objects_request;
+use protocol.push.encode_push_objects_response;
+use protocol.push.push_objects_response_encoded_len;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+
+error HttpRemoteAlloc;
+error HttpRemoteInvalidBinaryRequest;
+error HttpRemoteInvalidTargetRef;
+error HttpRemoteHeadNotFound;
+error HttpRemoteManifestNotFound;
+error HttpRemoteManifestDecodeFailed;
+error HttpRemoteObjectMissing;
+error HttpRemoteObjectDecodeFailed;
+error HttpRemoteRefConflict;
 
 export const HTTP_REMOTE_DEFAULT_MAX_CONNECTIONS: i32 = 64;
 export const HTTP_REMOTE_DEFAULT_READ_TIMEOUT_MS: u32 = 15000u32;
 export const HTTP_REMOTE_DEFAULT_WRITE_TIMEOUT_MS: u32 = 15000u32;
 export const HTTP_REMOTE_DEFAULT_IDLE_TIMEOUT_MS: u32 = 30000u32;
+export const HTTP_REMOTE_CAPABILITIES_ROUTE: &const byte = "/capabilities";
+export const HTTP_REMOTE_OBJECT_BATCH_ROUTE: &const byte = "/objects/batch";
+export const HTTP_REMOTE_MANIFEST_QUERY_ROUTE: &const byte = "/manifest/query";
+export const HTTP_REMOTE_FETCH_ROUTE: &const byte = "/fetch";
+export const HTTP_REMOTE_PUSH_ROUTE: &const byte = "/push";
+
+const HTTP_REMOTE_JSON_CONTENT_TYPE: &const byte = "application/json";
+const HTTP_REMOTE_BINARY_CONTENT_TYPE: &const byte = "application/octet-stream";
+const HTTP_REMOTE_AUTHORIZATION_HEADER: &const byte = "Authorization";
+const HTTP_REMOTE_BEARER_PREFIX: &const byte = "Bearer ";
+const HTTP_REMOTE_EXPECTED_HEAD_QUERY: &const byte = "expected_head";
+const HTTP_REMOTE_SERVICE_NAME: &const byte = "hypergit-http-remote";
+const HTTP_REMOTE_AUTH_TOKEN_MAX: usize = 128;
+const HTTP_REMOTE_PATH_MAX: usize = 4096;
+const HTTP_REMOTE_HEAD_REF_BYTES_MAX: usize = HASH32_HEX_BYTES + 2 as usize;
+
+struct HttpRemotePath {
+    bytes: [byte: HTTP_REMOTE_PATH_MAX] = [],
+    len: usize
+}
+
+export struct HttpRemoteRuntime {
+    repo_root: [byte: HTTP_REMOTE_PATH_MAX] = [],
+    repo_root_len: usize,
+    default_branch: [byte: 64] = [],
+    default_branch_len: usize,
+    max_body_bytes: usize,
+    auth_token: [byte: HTTP_REMOTE_AUTH_TOKEN_MAX] = [],
+    auth_token_len: usize
+}
 
 export struct HttpRemoteServer {
     engine: Engine,
-    listener: GinListener
+    listener: GinListener,
+    runtime: &HttpRemoteRuntime
+}
+
+export struct HttpRemoteObjectIdList {
+    ptr: &ObjectId,
+    len: usize
+}
+
+export struct HttpRemoteObjectBatchRequest {
+    object_ids: HttpRemoteObjectIdList
+}
+
+export struct HttpRemoteObjectBatchRecord {
+    object_id: ObjectId,
+    present: bool,
+    kind: ObjectKind,
+    object_bytes: ByteList
+}
+
+export struct HttpRemoteObjectBatchRecordList {
+    ptr: &HttpRemoteObjectBatchRecord,
+    len: usize
+}
+
+export struct HttpRemoteObjectBatchResponse {
+    objects: HttpRemoteObjectBatchRecordList
+}
+
+export struct HttpRemoteByteListList {
+    ptr: &ByteList,
+    len: usize
+}
+
+export struct HttpRemoteManifestQueryRequest {
+    manifest_id: ManifestId,
+    pathspecs: HttpRemoteByteListList
+}
+
+export struct HttpRemoteManifestQueryResponse {
+    manifest_id: ManifestId,
+    prefix: ByteList,
+    level: u16,
+    entries: ManifestEntryList,
+    children: ManifestChildList
+}
+
+fn http_remote_runtime_auth_required(runtime: &HttpRemoteRuntime) bool {
+    return runtime != null && runtime.auth_token_len > 0 as usize;
+}
+
+fn http_remote_slice_eq(left: &[byte], right: &[byte]) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn http_remote_byte_list_eq(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn http_remote_byte_list_from_slice(slice: &[byte]) ByteList {
+    return ByteList{ ptr: slice.ptr, len: slice.len };
+}
+
+fn http_remote_path_empty() HttpRemotePath {
+    return HttpRemotePath{ bytes: [], len: 0 };
+}
+
+fn http_remote_path_cstr(path: &HttpRemotePath) &byte {
+    return &path.bytes[0];
+}
+
+fn http_remote_path_from_runtime_root(runtime: &HttpRemoteRuntime) HttpRemotePath {
+    var out: HttpRemotePath = http_remote_path_empty();
+    var i: usize = 0;
+    while i < runtime.repo_root_len {
+        out.bytes[i] = runtime.repo_root[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[runtime.repo_root_len] = 0 as byte;
+    out.len = runtime.repo_root_len;
+    return out;
+}
+
+fn http_remote_path_append_byte(path: &HttpRemotePath, value: byte) !void {
+    if path.len + 1 as usize >= HTTP_REMOTE_PATH_MAX {
+        return error.HttpRemoteAlloc;
+    }
+    path.bytes[path.len] = value;
+    path.len = path.len + 1 as usize;
+    path.bytes[path.len] = 0 as byte;
+}
+
+fn http_remote_path_append_bytes(path: &HttpRemotePath, src: &[byte]) !void {
+    if path.len + src.len >= HTTP_REMOTE_PATH_MAX {
+        return error.HttpRemoteAlloc;
+    }
+    var i: usize = 0;
+    while i < src.len {
+        path.bytes[path.len + i] = src.ptr[i];
+        i = i + 1 as usize;
+    }
+    path.len = path.len + src.len;
+    path.bytes[path.len] = 0 as byte;
+}
+
+fn http_remote_path_append_literal(path: &HttpRemotePath, text: &const byte) !void {
+    return http_remote_path_append_bytes(path, (text as &byte)[0: http_remote_literal_len(text)]);
+}
+
+fn http_remote_path_join_literal(base: &HttpRemotePath, text: &const byte) !HttpRemotePath {
+    var out: HttpRemotePath = http_remote_path_empty();
+    try http_remote_path_append_bytes(&out, (&base.bytes[0] as &byte)[0: base.len]);
+    if out.len > 0 as usize {
+        const last_index: usize = out.len - 1 as usize;
+        if last_index < HTTP_REMOTE_PATH_MAX && out.bytes[last_index] != '/' as byte {
+            try http_remote_path_append_byte(&out, '/' as byte);
+        }
+    }
+    try http_remote_path_append_literal(&out, text);
+    return out;
+}
+
+fn http_remote_errno_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn http_remote_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.HttpRemoteAlloc;
+    }
+    return raw[0: len];
+}
+
+fn http_remote_arena_copy_bytes(arena: &Arena, src: &[byte]) !ByteList {
+    const out: &[byte] = try http_remote_arena_bytes(arena, src.len);
+    var i: usize = 0;
+    while i < src.len {
+        out.ptr[i] = src.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn http_remote_arena_copy_byte_list(arena: &Arena, value: &ByteList) !ByteList {
+    return try http_remote_arena_copy_bytes(arena, value.ptr[0: value.len]);
+}
+
+fn http_remote_literal_len(text: &const byte) usize {
+    var len: usize = 0;
+    while text[len] != 0 as byte {
+        len = len + 1 as usize;
+    }
+    return len;
+}
+
+fn http_remote_literal_slice(text: &const byte) &[byte] {
+    return (text as &byte)[0: http_remote_literal_len(text)];
+}
+
+fn http_remote_append_bytes(buf: &[byte], offset: &usize, src: &[byte]) !void {
+    if *offset + src.len > buf.len {
+        return error.HttpRemoteAlloc;
+    }
+    var i: usize = 0;
+    while i < src.len {
+        buf.ptr[*offset + i] = src.ptr[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + src.len;
+}
+
+fn http_remote_append_literal(buf: &[byte], offset: &usize, text: &const byte) !void {
+    return http_remote_append_bytes(buf, offset, (text as &byte)[0: http_remote_literal_len(text)]);
+}
+
+fn http_remote_append_u64_dec(buf: &[byte], offset: &usize, value: u64) !void {
+    var digits: [byte: 20] = [];
+    var count: usize = 0;
+    var current: u64 = value;
+    if current == 0u64 {
+        digits[0] = '0' as byte;
+        count = 1 as usize;
+    } else {
+        while current > 0u64 {
+            digits[count] = ('0' as byte) + (current % 10u64) as byte;
+            current = current / 10u64;
+            count = count + 1 as usize;
+        }
+    }
+    while count > 0 as usize {
+        count = count - 1 as usize;
+        try http_remote_append_bytes(buf, offset, (&digits[count] as &byte)[0: 1]);
+    }
+}
+
+fn http_remote_append_json_string_bytes(buf: &[byte], offset: &usize, src: &[byte]) !void {
+    try http_remote_append_bytes(buf, offset, &"\""[0: 1]);
+    var i: usize = 0;
+    while i < src.len {
+        const ch: byte = src.ptr[i];
+        if ch == '"' as byte || ch == '\\' as byte {
+            try http_remote_append_bytes(buf, offset, &"\\"[0: 1]);
+        }
+        try http_remote_append_bytes(buf, offset, (&src.ptr[i] as &byte)[0: 1]);
+        i = i + 1 as usize;
+    }
+    try http_remote_append_bytes(buf, offset, &"\""[0: 1]);
+}
+
+fn http_remote_hash_copy(output: &[byte], offset: &usize, hash: &Hash32) !void {
+    if *offset + HASH32_BYTES > output.len {
+        return error.HttpRemoteInvalidBinaryRequest;
+    }
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        output.ptr[*offset + i] = hash.bytes[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+}
+
+fn http_remote_hash_read(input: &[byte], offset: &usize) !Hash32 {
+    if *offset + HASH32_BYTES > input.len {
+        return error.HttpRemoteInvalidBinaryRequest;
+    }
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = input.ptr[*offset + i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+    return hash;
+}
+
+fn http_remote_encode_object_id(output: &[byte], offset: &usize, object_id: &ObjectId) !void {
+    return http_remote_hash_copy(output, offset, &object_id.hash);
+}
+
+fn http_remote_decode_object_id(input: &[byte], offset: &usize) !ObjectId {
+    return ObjectId{ hash: try http_remote_hash_read(input, offset) };
+}
+
+fn http_remote_encode_commit_id(output: &[byte], offset: &usize, commit_id: &CommitId) !void {
+    return http_remote_encode_object_id(output, offset, &commit_id.id);
+}
+
+fn http_remote_decode_commit_id(input: &[byte], offset: &usize) !CommitId {
+    return CommitId{ id: try http_remote_decode_object_id(input, offset) };
+}
+
+fn http_remote_encode_manifest_id(output: &[byte], offset: &usize, manifest_id: &ManifestId) !void {
+    return http_remote_encode_object_id(output, offset, &manifest_id.id);
+}
+
+fn http_remote_decode_manifest_id(input: &[byte], offset: &usize) !ManifestId {
+    return ManifestId{ id: try http_remote_decode_object_id(input, offset) };
+}
+
+fn http_remote_entry_kind_to_u16(kind: EntryKind) u16 {
+    if kind == EntryKind.File {
+        return 0 as u16;
+    }
+    if kind == EntryKind.Executable {
+        return 1 as u16;
+    }
+    return 2 as u16;
+}
+
+fn http_remote_content_type_to_u16(kind: ContentType) u16 {
+    if kind == ContentType.Unknown {
+        return 0 as u16;
+    }
+    if kind == ContentType.Utf8Text {
+        return 1 as u16;
+    }
+    return 2 as u16;
+}
+
+fn http_remote_decode_entry_kind(input: &[byte], offset: &usize) !EntryKind {
+    const value: u16 = try codec_decode_enum_u16(input, offset, 2 as u16);
+    if value == 0 as u16 {
+        return EntryKind.File;
+    }
+    if value == 1 as u16 {
+        return EntryKind.Executable;
+    }
+    return EntryKind.Symlink;
+}
+
+fn http_remote_decode_content_type(input: &[byte], offset: &usize) !ContentType {
+    const value: u16 = try codec_decode_enum_u16(input, offset, 2 as u16);
+    if value == 0 as u16 {
+        return ContentType.Unknown;
+    }
+    if value == 1 as u16 {
+        return ContentType.Utf8Text;
+    }
+    return ContentType.Binary;
+}
+
+fn http_remote_entry_encoded_len(entry: &ManifestEntry) usize {
+    return 1 as usize +
+        entry.name.len +
+        2 as usize +
+        4 as usize +
+        HASH32_BYTES +
+        8 as usize +
+        2 as usize +
+        HASH32_BYTES;
+}
+
+fn http_remote_encode_entry(output: &[byte], offset: &usize, entry: &ManifestEntry) !void {
+    try codec_encode_bytes(output, offset, entry.name.ptr[0: entry.name.len]);
+    try codec_encode_enum_u16(output, offset, http_remote_entry_kind_to_u16(entry.kind));
+    try codec_encode_u32(output, offset, entry.mode);
+    try http_remote_encode_object_id(output, offset, &entry.object_id);
+    try codec_encode_u64(output, offset, entry.logical_size);
+    try codec_encode_enum_u16(output, offset, http_remote_content_type_to_u16(entry.content_type));
+    try http_remote_encode_object_id(output, offset, &entry.policy_id.id);
+}
+
+fn http_remote_decode_entry(arena: &Arena, input: &[byte], offset: &usize) !ManifestEntry {
+    const name_span: ByteSpan = try codec_decode_bytes(input, offset);
+    return ManifestEntry{
+        name: try http_remote_arena_copy_bytes(arena, name_span.ptr[0: name_span.len]),
+        kind: try http_remote_decode_entry_kind(input, offset),
+        mode: try codec_decode_u32(input, offset),
+        object_id: try http_remote_decode_object_id(input, offset),
+        logical_size: try codec_decode_u64(input, offset),
+        content_type: try http_remote_decode_content_type(input, offset),
+        policy_id: PolicyId{ id: try http_remote_decode_object_id(input, offset) },
+    };
+}
+
+fn http_remote_child_encoded_len(child: &ManifestChild) usize {
+    return 1 as usize +
+        child.min_name.len +
+        1 as usize +
+        child.max_name.len +
+        HASH32_BYTES +
+        HASH32_BYTES;
+}
+
+fn http_remote_encode_child(output: &[byte], offset: &usize, child: &ManifestChild) !void {
+    try codec_encode_bytes(output, offset, child.min_name.ptr[0: child.min_name.len]);
+    try codec_encode_bytes(output, offset, child.max_name.ptr[0: child.max_name.len]);
+    try http_remote_encode_manifest_id(output, offset, &child.child_id);
+    try http_remote_hash_copy(output, offset, &child.child_hash);
+}
+
+fn http_remote_decode_child(arena: &Arena, input: &[byte], offset: &usize) !ManifestChild {
+    const min_name: ByteSpan = try codec_decode_bytes(input, offset);
+    const max_name: ByteSpan = try codec_decode_bytes(input, offset);
+    return ManifestChild{
+        min_name: try http_remote_arena_copy_bytes(arena, min_name.ptr[0: min_name.len]),
+        max_name: try http_remote_arena_copy_bytes(arena, max_name.ptr[0: max_name.len]),
+        child_id: try http_remote_decode_manifest_id(input, offset),
+        child_hash: try http_remote_hash_read(input, offset),
+    };
+}
+
+export fn http_remote_object_batch_request_encoded_len(request: &HttpRemoteObjectBatchRequest) usize {
+    return 1 as usize + request.object_ids.len * HASH32_BYTES;
+}
+
+export fn encode_http_remote_object_batch_request(output: &[byte], offset: &usize, request: &HttpRemoteObjectBatchRequest) !void {
+    try codec_encode_varuint(output, offset, request.object_ids.len as u64);
+    var i: usize = 0;
+    while i < request.object_ids.len {
+        try http_remote_encode_object_id(output, offset, &request.object_ids.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+export fn decode_http_remote_object_batch_request(arena: &Arena, input: &[byte], offset: &usize) !HttpRemoteObjectBatchRequest {
+    const count: usize = (try codec_decode_varuint(input, offset)) as usize;
+    var raw: &ObjectId = null;
+    if count > 0 as usize {
+        raw = arena_alloc(arena, @size_of(ObjectId) as usize * count) as &ObjectId;
+        if raw == null {
+            return error.HttpRemoteAlloc;
+        }
+        var i: usize = 0;
+        while i < count {
+            raw[i] = try http_remote_decode_object_id(input, offset);
+            i = i + 1 as usize;
+        }
+    }
+    return HttpRemoteObjectBatchRequest{
+        object_ids: HttpRemoteObjectIdList{ ptr: raw, len: count },
+    };
+}
+
+export fn http_remote_object_batch_response_encoded_len(response: &HttpRemoteObjectBatchResponse) usize {
+    var total: usize = 1 as usize;
+    var i: usize = 0;
+    while i < response.objects.len {
+        total = total + HASH32_BYTES + 1 as usize;
+        if response.objects.ptr[i].present {
+            total = total +
+                2 as usize +
+                1 as usize +
+                response.objects.ptr[i].object_bytes.len;
+        }
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+export fn encode_http_remote_object_batch_response(output: &[byte], offset: &usize, response: &HttpRemoteObjectBatchResponse) !void {
+    try codec_encode_varuint(output, offset, response.objects.len as u64);
+    var i: usize = 0;
+    while i < response.objects.len {
+        const record: &HttpRemoteObjectBatchRecord = &response.objects.ptr[i];
+        try http_remote_encode_object_id(output, offset, &record.object_id);
+        var present: byte = 0 as byte;
+        if record.present {
+            present = 1 as byte;
+        }
+        try codec_encode_u8(output, offset, present);
+        if record.present {
+            try codec_encode_enum_u16(output, offset, object_kind_to_u16(record.kind));
+            try codec_encode_bytes(output, offset, record.object_bytes.ptr[0: record.object_bytes.len]);
+        }
+        i = i + 1 as usize;
+    }
+}
+
+export fn decode_http_remote_object_batch_response(arena: &Arena, input: &[byte], offset: &usize) !HttpRemoteObjectBatchResponse {
+    const count: usize = (try codec_decode_varuint(input, offset)) as usize;
+    var raw: &HttpRemoteObjectBatchRecord = null;
+    if count > 0 as usize {
+        raw = arena_alloc(arena, @size_of(HttpRemoteObjectBatchRecord) as usize * count) as &HttpRemoteObjectBatchRecord;
+        if raw == null {
+            return error.HttpRemoteAlloc;
+        }
+        var i: usize = 0;
+        while i < count {
+            raw[i].object_id = try http_remote_decode_object_id(input, offset);
+            raw[i].present = (try codec_decode_u8(input, offset)) != 0 as byte;
+            raw[i].kind = ObjectKind.Commit;
+            raw[i].object_bytes = ByteList{ ptr: null, len: 0 };
+            if raw[i].present {
+                raw[i].kind = try object_kind_from_u16(try codec_decode_enum_u16(input, offset, object_kind_to_u16(ObjectKind.PublishedView)));
+                const span: ByteSpan = try codec_decode_bytes(input, offset);
+                raw[i].object_bytes = try http_remote_arena_copy_bytes(arena, span.ptr[0: span.len]);
+            }
+            i = i + 1 as usize;
+        }
+    }
+    return HttpRemoteObjectBatchResponse{
+        objects: HttpRemoteObjectBatchRecordList{ ptr: raw, len: count },
+    };
+}
+
+export fn http_remote_manifest_query_request_encoded_len(request: &HttpRemoteManifestQueryRequest) usize {
+    var total: usize = HASH32_BYTES + 1 as usize;
+    var i: usize = 0;
+    while i < request.pathspecs.len {
+        total = total + 1 as usize + request.pathspecs.ptr[i].len;
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+export fn encode_http_remote_manifest_query_request(output: &[byte], offset: &usize, request: &HttpRemoteManifestQueryRequest) !void {
+    try http_remote_encode_manifest_id(output, offset, &request.manifest_id);
+    try codec_encode_varuint(output, offset, request.pathspecs.len as u64);
+    var i: usize = 0;
+    while i < request.pathspecs.len {
+        try codec_encode_bytes(output, offset, request.pathspecs.ptr[i].ptr[0: request.pathspecs.ptr[i].len]);
+        i = i + 1 as usize;
+    }
+}
+
+export fn decode_http_remote_manifest_query_request(arena: &Arena, input: &[byte], offset: &usize) !HttpRemoteManifestQueryRequest {
+    const manifest_id: ManifestId = try http_remote_decode_manifest_id(input, offset);
+    const count: usize = (try codec_decode_varuint(input, offset)) as usize;
+    var raw: &ByteList = null;
+    if count > 0 as usize {
+        raw = arena_alloc(arena, @size_of(ByteList) as usize * count) as &ByteList;
+        if raw == null {
+            return error.HttpRemoteAlloc;
+        }
+        var i: usize = 0;
+        while i < count {
+            const span: ByteSpan = try codec_decode_bytes(input, offset);
+            raw[i] = try http_remote_arena_copy_bytes(arena, span.ptr[0: span.len]);
+            i = i + 1 as usize;
+        }
+    }
+    return HttpRemoteManifestQueryRequest{
+        manifest_id: manifest_id,
+        pathspecs: HttpRemoteByteListList{ ptr: raw, len: count },
+    };
+}
+
+export fn http_remote_manifest_query_response_encoded_len(response: &HttpRemoteManifestQueryResponse) usize {
+    var total: usize = HASH32_BYTES +
+        1 as usize +
+        response.prefix.len +
+        2 as usize +
+        1 as usize +
+        1 as usize;
+    var i: usize = 0;
+    while i < response.entries.len {
+        total = total + http_remote_entry_encoded_len(&response.entries.ptr[i]);
+        i = i + 1 as usize;
+    }
+    i = 0;
+    while i < response.children.len {
+        total = total + http_remote_child_encoded_len(&response.children.ptr[i]);
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+export fn encode_http_remote_manifest_query_response(output: &[byte], offset: &usize, response: &HttpRemoteManifestQueryResponse) !void {
+    try http_remote_encode_manifest_id(output, offset, &response.manifest_id);
+    try codec_encode_bytes(output, offset, response.prefix.ptr[0: response.prefix.len]);
+    try codec_encode_u16(output, offset, response.level);
+    try codec_encode_varuint(output, offset, response.entries.len as u64);
+    var i: usize = 0;
+    while i < response.entries.len {
+        try http_remote_encode_entry(output, offset, &response.entries.ptr[i]);
+        i = i + 1 as usize;
+    }
+    try codec_encode_varuint(output, offset, response.children.len as u64);
+    i = 0;
+    while i < response.children.len {
+        try http_remote_encode_child(output, offset, &response.children.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+export fn decode_http_remote_manifest_query_response(arena: &Arena, input: &[byte], offset: &usize) !HttpRemoteManifestQueryResponse {
+    const manifest_id: ManifestId = try http_remote_decode_manifest_id(input, offset);
+    const prefix_span: ByteSpan = try codec_decode_bytes(input, offset);
+    const level: u16 = try codec_decode_u16(input, offset);
+
+    const entry_count: usize = (try codec_decode_varuint(input, offset)) as usize;
+    var raw_entries: &ManifestEntry = null;
+    if entry_count > 0 as usize {
+        raw_entries = arena_alloc(arena, @size_of(ManifestEntry) as usize * entry_count) as &ManifestEntry;
+        if raw_entries == null {
+            return error.HttpRemoteAlloc;
+        }
+        var entry_index: usize = 0;
+        while entry_index < entry_count {
+            raw_entries[entry_index] = try http_remote_decode_entry(arena, input, offset);
+            entry_index = entry_index + 1 as usize;
+        }
+    }
+
+    const child_count: usize = (try codec_decode_varuint(input, offset)) as usize;
+    var raw_children: &ManifestChild = null;
+    if child_count > 0 as usize {
+        raw_children = arena_alloc(arena, @size_of(ManifestChild) as usize * child_count) as &ManifestChild;
+        if raw_children == null {
+            return error.HttpRemoteAlloc;
+        }
+        var child_index: usize = 0;
+        while child_index < child_count {
+            raw_children[child_index] = try http_remote_decode_child(arena, input, offset);
+            child_index = child_index + 1 as usize;
+        }
+    }
+
+    return HttpRemoteManifestQueryResponse{
+        manifest_id: manifest_id,
+        prefix: try http_remote_arena_copy_bytes(arena, prefix_span.ptr[0: prefix_span.len]),
+        level: level,
+        entries: ManifestEntryList{ ptr: raw_entries, len: entry_count },
+        children: ManifestChildList{ ptr: raw_children, len: child_count },
+    };
+}
+
+fn http_remote_ref_name(arena: &Arena, runtime: &HttpRemoteRuntime) !ByteList {
+    const prefix: &[byte] = &"refs/heads/"[0: 11];
+    const total_len: usize = prefix.len + runtime.default_branch_len;
+    const out: &[byte] = try http_remote_arena_bytes(arena, total_len);
+    var i: usize = 0;
+    while i < prefix.len {
+        out.ptr[i] = prefix.ptr[i];
+        i = i + 1 as usize;
+    }
+    i = 0;
+    while i < runtime.default_branch_len {
+        out.ptr[prefix.len + i] = runtime.default_branch[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: total_len };
+}
+
+fn http_remote_head_ref_path(runtime: &HttpRemoteRuntime) !HttpRemotePath {
+    const repo_root: HttpRemotePath = http_remote_path_from_runtime_root(runtime);
+    const head_root: HttpRemotePath = try http_remote_path_join_literal(&repo_root, ".hgit/refs/heads");
+    var path: HttpRemotePath = head_root;
+    if path.len > 0 as usize {
+        const last_index: usize = path.len - 1 as usize;
+        if last_index < HTTP_REMOTE_PATH_MAX && path.bytes[last_index] != '/' as byte {
+            try http_remote_path_append_byte(&path, '/' as byte);
+        }
+    }
+    try http_remote_path_append_bytes(&path, (&runtime.default_branch[0] as &byte)[0: runtime.default_branch_len]);
+    return path;
+}
+
+fn http_remote_head_ref_exists(runtime: &HttpRemoteRuntime) !bool {
+    const path: HttpRemotePath = try http_remote_head_ref_path(runtime);
+    var st: Stat = Stat{};
+    if stat(http_remote_path_cstr(&path) as &const byte, &st) == 0 {
+        return true;
+    }
+    if http_remote_errno_permission() {
+        return error.StorePermissionDenied;
+    }
+    return false;
+}
+
+fn http_remote_read_head_commit(runtime: &HttpRemoteRuntime) !CommitId {
+    const path: HttpRemotePath = try http_remote_head_ref_path(runtime);
+    const stream: &FILE = fopen(http_remote_path_cstr(&path) as &const byte, "r");
+    if stream == null {
+        if http_remote_errno_permission() {
+            return error.StorePermissionDenied;
+        }
+        return error.HttpRemoteHeadNotFound;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+    var data: [byte: HTTP_REMOTE_HEAD_REF_BYTES_MAX] = [];
+    const count: usize = fread(&data[0], 1 as usize, HTTP_REMOTE_HEAD_REF_BYTES_MAX, stream);
+    if count < HASH32_HEX_BYTES {
+        return error.HttpRemoteHeadNotFound;
+    }
+    if count > HASH32_HEX_BYTES + 1 as usize {
+        return error.HttpRemoteInvalidBinaryRequest;
+    }
+    return try commit_id_decode_hex(data[0: HASH32_HEX_BYTES]);
+}
+
+fn http_remote_write_head_commit(runtime: &HttpRemoteRuntime, commit_id: &CommitId) !void {
+    const path: HttpRemotePath = try http_remote_head_ref_path(runtime);
+    const stream: &FILE = fopen(http_remote_path_cstr(&path) as &const byte, "w");
+    if stream == null {
+        if http_remote_errno_permission() {
+            return error.StorePermissionDenied;
+        }
+        return error.HttpRemoteAlloc;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+    var data: [byte: HTTP_REMOTE_HEAD_REF_BYTES_MAX] = [];
+    _ = try commit_id_encode_hex(commit_id, data[0: HASH32_HEX_BYTES]);
+    data[HASH32_HEX_BYTES] = '\n' as byte;
+    const total: usize = HASH32_HEX_BYTES + 1 as usize;
+    if fwrite(&data[0] as &const byte, 1 as usize, total, stream) != total {
+        return error.HttpRemoteAlloc;
+    }
+}
+
+fn http_remote_store_open(runtime: &HttpRemoteRuntime) !LooseObjectStore {
+    const repo_root: HttpRemotePath = http_remote_path_from_runtime_root(runtime);
+    const object_root: HttpRemotePath = try http_remote_path_join_literal(&repo_root, ".hgit/objects/loose");
+    return loose_store_open(http_remote_path_cstr(&object_root));
+}
+
+fn http_remote_fetch_view_for_head(arena: &Arena, store: &LooseObjectStore, head_commit: &CommitId) !PublishedView {
+    const object_bytes: ObjectBytes = try store.get(head_commit.id, arena);
+    var offset: usize = 0;
+    const payload: CommitPayload = try decode_commit_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    if offset != object_bytes.bytes.len {
+        return error.HttpRemoteObjectDecodeFailed;
+    }
+    const created_at_ms: i64 = now_ms() catch {
+        return error.HttpRemoteObjectDecodeFailed;
+    };
+    return PublishedView{
+        head_commit: head_commit[0],
+        manifest_root: payload.manifest_root,
+        serving_index_snapshot: ObjectId{ hash: Hash32{ bytes: [] } },
+        lineage_watermark: 0u64,
+        dependency_watermark: 0u64,
+        created_at_ms: created_at_ms,
+    };
+}
+
+fn http_remote_store_view(arena: &Arena, store: &LooseObjectStore, view: &PublishedView) !PublishedViewId {
+    const payload: ByteList = try published_view_payload_to_canonical(arena, view);
+    const stored_id: ObjectId = try store.put(ObjectKind.PublishedView, payload.ptr[0: payload.len]);
+    const view_id: PublishedViewId = try hash_published_view(arena, view);
+    if published_view_id_compare(&view_id, &PublishedViewId{ hash: stored_id.hash }) != 0 {
+        return error.HttpRemoteObjectDecodeFailed;
+    }
+    return view_id;
+}
+
+export fn http_remote_capabilities_json(arena: &Arena, runtime: &HttpRemoteRuntime) !ByteList {
+    const default_branch: &[byte] = (&runtime.default_branch[0] as &byte)[0: runtime.default_branch_len];
+    const total_len: usize = 320 as usize + default_branch.len;
+    const out: &[byte] = try http_remote_arena_bytes(arena, total_len);
+    var offset: usize = 0;
+    try http_remote_append_literal(out, &offset, "{\"service\":");
+    try http_remote_append_json_string_bytes(out, &offset, (HTTP_REMOTE_SERVICE_NAME as &byte)[0: http_remote_literal_len(HTTP_REMOTE_SERVICE_NAME)]);
+    try http_remote_append_literal(out, &offset, ",\"version\":1,\"default_branch\":");
+    try http_remote_append_json_string_bytes(out, &offset, default_branch);
+    try http_remote_append_literal(out, &offset, ",\"max_body_bytes\":");
+    try http_remote_append_u64_dec(out, &offset, runtime.max_body_bytes as u64);
+    try http_remote_append_literal(out, &offset, ",\"auth_required\":");
+    if http_remote_runtime_auth_required(runtime) {
+        try http_remote_append_literal(out, &offset, "true");
+    } else {
+        try http_remote_append_literal(out, &offset, "false");
+    }
+    try http_remote_append_literal(out, &offset, ",\"routes\":{\"capabilities\":\"/capabilities\",\"object_batch\":\"/objects/batch\",\"manifest_query\":\"/manifest/query\",\"fetch\":\"/fetch\",\"push\":\"/push\"}}\n");
+    return ByteList{ ptr: out.ptr, len: offset };
+}
+
+export fn http_remote_handle_object_batch(arena: &Arena, runtime: &HttpRemoteRuntime, request: &HttpRemoteObjectBatchRequest) !HttpRemoteObjectBatchResponse {
+    const store: LooseObjectStore = try http_remote_store_open(runtime);
+    if request.object_ids.len == 0 as usize {
+        return HttpRemoteObjectBatchResponse{
+            objects: HttpRemoteObjectBatchRecordList{ ptr: null, len: 0 },
+        };
+    }
+    var raw: &HttpRemoteObjectBatchRecord = null;
+    raw = arena_alloc(arena, @size_of(HttpRemoteObjectBatchRecord) as usize * request.object_ids.len) as &HttpRemoteObjectBatchRecord;
+    if raw == null {
+        return error.HttpRemoteAlloc;
+    }
+    const records: &HttpRemoteObjectBatchRecord = raw;
+
+    var i: usize = 0;
+    while i < request.object_ids.len {
+        records[i].object_id = request.object_ids.ptr[i];
+        records[i].present = false;
+        records[i].kind = ObjectKind.Commit;
+        records[i].object_bytes = ByteList{ ptr: null, len: 0 };
+
+        const present: bool = try store.has(request.object_ids.ptr[i]);
+        if present {
+            const object_bytes: ObjectBytes = try store.get(request.object_ids.ptr[i], arena);
+            var offset: usize = 0;
+            const decoded: DecodedObject = try codec_decode_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+            if offset != object_bytes.bytes.len {
+                return error.HttpRemoteObjectDecodeFailed;
+            }
+            records[i].present = true;
+            records[i].kind = try object_kind_from_u16(decoded.envelope.kind);
+            records[i].object_bytes = object_bytes.bytes;
+        }
+        i = i + 1 as usize;
+    }
+
+    return HttpRemoteObjectBatchResponse{
+        objects: HttpRemoteObjectBatchRecordList{ ptr: records, len: request.object_ids.len },
+    };
+}
+
+export fn http_remote_handle_manifest_query(arena: &Arena, runtime: &HttpRemoteRuntime, request: &HttpRemoteManifestQueryRequest) !HttpRemoteManifestQueryResponse {
+    const store: LooseObjectStore = try http_remote_store_open(runtime);
+    const present: bool = try store.has(request.manifest_id.id);
+    if !present {
+        return error.HttpRemoteManifestNotFound;
+    }
+
+    const object_bytes: ObjectBytes = try store.get(request.manifest_id.id, arena);
+    var offset: usize = 0;
+    const payload: ManifestNodePayload = decode_manifest_node_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.HttpRemoteManifestDecodeFailed;
+    };
+    if offset != object_bytes.bytes.len {
+        return error.HttpRemoteManifestDecodeFailed;
+    }
+
+    const result: ManifestRangeQueryResult = try manifest_range_query(
+        arena,
+        &payload,
+        ManifestPathspecList{ ptr: request.pathspecs.ptr, len: request.pathspecs.len },
+    );
+
+    var raw_entries: &ManifestEntry = null;
+    if result.entry_indexes.len > 0 as usize {
+        raw_entries = arena_alloc(arena, @size_of(ManifestEntry) as usize * result.entry_indexes.len) as &ManifestEntry;
+        if raw_entries == null {
+            return error.HttpRemoteAlloc;
+        }
+        var entry_index: usize = 0;
+        while entry_index < result.entry_indexes.len {
+            raw_entries[entry_index] = payload.entries.ptr[result.entry_indexes.ptr[entry_index]];
+            entry_index = entry_index + 1 as usize;
+        }
+    }
+
+    var raw_children: &ManifestChild = null;
+    if result.child_indexes.len > 0 as usize {
+        raw_children = arena_alloc(arena, @size_of(ManifestChild) as usize * result.child_indexes.len) as &ManifestChild;
+        if raw_children == null {
+            return error.HttpRemoteAlloc;
+        }
+        var child_index: usize = 0;
+        while child_index < result.child_indexes.len {
+            raw_children[child_index] = payload.children.ptr[result.child_indexes.ptr[child_index]];
+            child_index = child_index + 1 as usize;
+        }
+    }
+
+    return HttpRemoteManifestQueryResponse{
+        manifest_id: request.manifest_id,
+        prefix: payload.prefix.bytes,
+        level: payload.level,
+        entries: ManifestEntryList{ ptr: raw_entries, len: result.entry_indexes.len },
+        children: ManifestChildList{ ptr: raw_children, len: result.child_indexes.len },
+    };
+}
+
+export fn http_remote_handle_fetch_request(arena: &Arena, runtime: &HttpRemoteRuntime, request: &FetchViewRequest) !FetchViewResponse {
+    const expected_ref: ByteList = try http_remote_ref_name(arena, runtime);
+    if request.want_ref.len > 0 as usize && !http_remote_byte_list_eq(&request.want_ref, &expected_ref) {
+        return error.HttpRemoteInvalidTargetRef;
+    }
+
+    const has_head: bool = try http_remote_head_ref_exists(runtime);
+    if !has_head {
+        return error.HttpRemoteHeadNotFound;
+    }
+
+    const store: LooseObjectStore = try http_remote_store_open(runtime);
+    const head_commit: CommitId = try http_remote_read_head_commit(runtime);
+    const view: PublishedView = try http_remote_fetch_view_for_head(arena, &store, &head_commit);
+    const view_id: PublishedViewId = try http_remote_store_view(arena, &store, &view);
+    return FetchViewResponse{
+        view_id: view_id,
+        view: view,
+    };
+}
+
+export fn http_remote_handle_push_request(arena: &Arena, runtime: &HttpRemoteRuntime, request: &PushObjectsRequest, expected_head: &CommitId) !PushObjectsResponse {
+    const expected_ref: ByteList = try http_remote_ref_name(arena, runtime);
+    if !http_remote_byte_list_eq(&request.target_ref, &expected_ref) {
+        return error.HttpRemoteInvalidTargetRef;
+    }
+
+    const store: LooseObjectStore = try http_remote_store_open(runtime);
+    const has_head: bool = try http_remote_head_ref_exists(runtime);
+    var current_head: CommitId = CommitId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    if has_head {
+        current_head = try http_remote_read_head_commit(runtime);
+    }
+    if expected_head != null {
+        if has_head {
+            if commit_id_compare(&current_head, expected_head) != 0 {
+                return error.HttpRemoteRefConflict;
+            }
+        } else if commit_id_compare(&current_head, expected_head) != 0 {
+            return error.HttpRemoteRefConflict;
+        }
+    }
+
+    var i: usize = 0;
+    while i < request.objects.len {
+        var offset: usize = 0;
+        const record: &PushObjectRecord = &request.objects.ptr[i];
+        const decoded: DecodedObject = codec_decode_object(record.object_bytes.ptr[0: record.object_bytes.len], &offset) catch {
+            return error.HttpRemoteObjectDecodeFailed;
+        };
+        if offset != record.object_bytes.len {
+            return error.HttpRemoteObjectDecodeFailed;
+        }
+        const kind: ObjectKind = object_kind_from_u16(decoded.envelope.kind) catch {
+            return error.HttpRemoteObjectDecodeFailed;
+        };
+        const stored_id: ObjectId = try store.put(kind, decoded.payload.ptr[0: decoded.payload.len]);
+        if object_id_compare(&stored_id, &record.object_id) != 0 {
+            return error.HttpRemoteObjectDecodeFailed;
+        }
+        i = i + 1 as usize;
+    }
+
+    if !(try store.has(request.new_commit.id)) {
+        return error.HttpRemoteObjectMissing;
+    }
+    try http_remote_write_head_commit(runtime, &request.new_commit);
+    return PushObjectsResponse{
+        accepted_objects: request.objects.len as u64,
+    };
+}
+
+fn http_remote_expected_head_from_query(ctx: &GinContext) !CommitId {
+    const query_name: &[byte] = http_remote_literal_slice(HTTP_REMOTE_EXPECTED_HEAD_QUERY);
+    const text: &[const byte] = ctx.query(query_name) catch {
+        return CommitId{ id: ObjectId{ hash: Hash32{ bytes: [] } } };
+    };
+    if text.len != HASH32_HEX_BYTES {
+        return error.HttpRemoteInvalidBinaryRequest;
+    }
+    return try commit_id_decode_hex(text[0: HASH32_HEX_BYTES]);
+}
+
+fn http_remote_ctx_alloc(ctx: &GinContext, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw: &byte = try ctx.arena_alloc(want);
+    return raw[0: len];
+}
+
+fn http_remote_auth_matches(runtime: &HttpRemoteRuntime, value: &[const byte]) bool {
+    const prefix_len: usize = http_remote_literal_len(HTTP_REMOTE_BEARER_PREFIX);
+    if value.len != prefix_len + runtime.auth_token_len {
+        return false;
+    }
+    if !http_remote_slice_eq(value[0: prefix_len], (HTTP_REMOTE_BEARER_PREFIX as &byte)[0: prefix_len]) {
+        return false;
+    }
+    const token_slice: &[byte] = (&runtime.auth_token[0] as &byte)[0: runtime.auth_token_len];
+    return http_remote_slice_eq(value[prefix_len: runtime.auth_token_len], token_slice);
+}
+
+fn http_remote_auth_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future<!i32> {
+    if !http_remote_runtime_auth_required(runtime) {
+        return future_ready_ok<i32>(0);
+    }
+    const header_name: &[byte] = http_remote_literal_slice(HTTP_REMOTE_AUTHORIZATION_HEADER);
+    const header_value: &[const byte] = ctx.header(header_name) catch {
+        ctx.abort();
+        return ctx.string(Status.Unauthorized, "unauthorized\n");
+    };
+    if !http_remote_auth_matches(runtime, header_value) {
+        ctx.abort();
+        return ctx.string(Status.Unauthorized, "unauthorized\n");
+    }
+    return future_ready_ok<i32>(0);
+}
+
+fn http_remote_capabilities_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future<!i32> {
+    if http_remote_runtime_auth_required(runtime) {
+        return ctx.bytes(Status.OK, http_remote_literal_slice(HTTP_REMOTE_JSON_CONTENT_TYPE), http_remote_literal_slice("{\"service\":\"hypergit-http-remote\",\"default_branch\":\"main\",\"auth_required\":true}\n"));
+    }
+    return ctx.bytes(Status.OK, http_remote_literal_slice(HTTP_REMOTE_JSON_CONTENT_TYPE), http_remote_literal_slice("{\"service\":\"hypergit-http-remote\",\"default_branch\":\"main\",\"auth_required\":false}\n"));
+}
+
+fn http_remote_object_batch_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future<!i32> {
+    var offset: usize = 0;
+    const request: HttpRemoteObjectBatchRequest = decode_http_remote_object_batch_request(&ctx.request_arena.arena, ctx.request.body, &offset) catch {
+        return ctx.string(Status.BadRequest, "bad request\n");
+    };
+    if offset != ctx.request.body.len {
+        return ctx.string(Status.BadRequest, "bad request\n");
+    }
+    const response: HttpRemoteObjectBatchResponse = http_remote_handle_object_batch(&ctx.request_arena.arena, runtime, &request) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    const out: &[byte] = http_remote_ctx_alloc(ctx, http_remote_object_batch_response_encoded_len(&response)) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    offset = 0;
+    encode_http_remote_object_batch_response(out, &offset, &response) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    return ctx.bytes(Status.OK, http_remote_literal_slice(HTTP_REMOTE_BINARY_CONTENT_TYPE), out[0: offset]);
+}
+
+fn http_remote_manifest_query_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future<!i32> {
+    var offset: usize = 0;
+    const request: HttpRemoteManifestQueryRequest = decode_http_remote_manifest_query_request(&ctx.request_arena.arena, ctx.request.body, &offset) catch {
+        return ctx.string(Status.BadRequest, "bad request\n");
+    };
+    if offset != ctx.request.body.len {
+        return ctx.string(Status.BadRequest, "bad request\n");
+    }
+    const response: HttpRemoteManifestQueryResponse = http_remote_handle_manifest_query(&ctx.request_arena.arena, runtime, &request) catch |err| {
+        if @error_id(err) == @error_id(error.HttpRemoteManifestNotFound) {
+            return ctx.string(Status.NotFound, "not found\n");
+        }
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    const out: &[byte] = http_remote_ctx_alloc(ctx, http_remote_manifest_query_response_encoded_len(&response)) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    offset = 0;
+    encode_http_remote_manifest_query_response(out, &offset, &response) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    return ctx.bytes(Status.OK, http_remote_literal_slice(HTTP_REMOTE_BINARY_CONTENT_TYPE), out[0: offset]);
+}
+
+fn http_remote_fetch_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future<!i32> {
+    var offset: usize = 0;
+    const request: FetchViewRequest = decode_fetch_view_request(&ctx.request_arena.arena, ctx.request.body, &offset) catch {
+        return ctx.string(Status.BadRequest, "bad request\n");
+    };
+    if offset != ctx.request.body.len {
+        return ctx.string(Status.BadRequest, "bad request\n");
+    }
+    const response: FetchViewResponse = http_remote_handle_fetch_request(&ctx.request_arena.arena, runtime, &request) catch |err| {
+        if @error_id(err) == @error_id(error.HttpRemoteInvalidTargetRef) {
+            return ctx.string(Status.BadRequest, "bad request\n");
+        }
+        if @error_id(err) == @error_id(error.HttpRemoteHeadNotFound) {
+            return ctx.string(Status.NotFound, "not found\n");
+        }
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    const out: &[byte] = http_remote_ctx_alloc(ctx, fetch_view_response_encoded_len(&response)) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    offset = 0;
+    encode_fetch_view_response(out, &offset, &response) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    return ctx.bytes(Status.OK, http_remote_literal_slice(HTTP_REMOTE_BINARY_CONTENT_TYPE), out[0: offset]);
+}
+
+fn http_remote_push_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future<!i32> {
+    var offset: usize = 0;
+    const request: PushObjectsRequest = decode_push_objects_request(&ctx.request_arena.arena, ctx.request.body, &offset) catch {
+        return ctx.string(Status.BadRequest, "bad request\n");
+    };
+    if offset != ctx.request.body.len {
+        return ctx.string(Status.BadRequest, "bad request\n");
+    }
+    const expected_head: CommitId = http_remote_expected_head_from_query(ctx) catch {
+        return ctx.string(Status.BadRequest, "bad request\n");
+    };
+    const response: PushObjectsResponse = http_remote_handle_push_request(&ctx.request_arena.arena, runtime, &request, &expected_head) catch |err| {
+        if @error_id(err) == @error_id(error.HttpRemoteInvalidTargetRef) {
+            return ctx.string(Status.BadRequest, "bad request\n");
+        }
+        if @error_id(err) == @error_id(error.HttpRemoteRefConflict) {
+            return ctx.string(Status.Conflict, "conflict\n");
+        }
+        if @error_id(err) == @error_id(error.HttpRemoteObjectMissing) {
+            return ctx.string(Status.BadRequest, "bad request\n");
+        }
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    const out: &[byte] = http_remote_ctx_alloc(ctx, push_objects_response_encoded_len(&response)) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    offset = 0;
+    encode_push_objects_response(out, &offset, &response) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    return ctx.bytes(Status.OK, http_remote_literal_slice(HTTP_REMOTE_BINARY_CONTENT_TYPE), out[0: offset]);
+}
+
+struct HttpRemoteAuthHandler : AsyncHandler {
+    runtime: &HttpRemoteRuntime,
+
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        return try @await http_remote_auth_future(self.runtime, ctx);
+    }
+}
+
+struct HttpRemoteCapabilitiesHandler : AsyncHandler {
+    runtime: &HttpRemoteRuntime,
+
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        return try @await http_remote_capabilities_future(self.runtime, ctx);
+    }
+}
+
+struct HttpRemoteObjectBatchHandler : AsyncHandler {
+    runtime: &HttpRemoteRuntime,
+
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        return try @await http_remote_object_batch_future(self.runtime, ctx);
+    }
+}
+
+struct HttpRemoteManifestQueryHandler : AsyncHandler {
+    runtime: &HttpRemoteRuntime,
+
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        return try @await http_remote_manifest_query_future(self.runtime, ctx);
+    }
+}
+
+struct HttpRemoteFetchHandler : AsyncHandler {
+    runtime: &HttpRemoteRuntime,
+
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        return try @await http_remote_fetch_future(self.runtime, ctx);
+    }
+}
+
+struct HttpRemotePushHandler : AsyncHandler {
+    runtime: &HttpRemoteRuntime,
+
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        return try @await http_remote_push_future(self.runtime, ctx);
+    }
 }
 
 export fn http_remote_default_run_options() EngineRunOptions {
@@ -31,10 +1294,18 @@ export fn http_remote_default_run_options() EngineRunOptions {
     return options;
 }
 
-export fn http_remote_default_limits() UyaginLimits {
+export fn http_remote_limits_with_max_body_bytes(max_body_bytes: usize) UyaginLimits {
     var limits: UyaginLimits = uyagin_limits_default();
-    limits.max_body_bytes = MAX_BODY_SIZE as usize;
+    var applied: usize = max_body_bytes;
+    if applied == 0 as usize {
+        applied = MAX_BODY_SIZE as usize;
+    }
+    limits.max_body_bytes = applied;
     return limits;
+}
+
+export fn http_remote_default_limits() UyaginLimits {
+    return http_remote_limits_with_max_body_bytes(MAX_BODY_SIZE as usize);
 }
 
 export fn http_remote_engine_new() Engine {
@@ -46,12 +1317,92 @@ export fn http_remote_engine_new() Engine {
     return engine;
 }
 
+fn http_remote_runtime_new(repo_root: &[byte], default_branch: &[byte], auth_token: &[byte], max_body_bytes: usize) !&HttpRemoteRuntime {
+    const raw: &HttpRemoteRuntime = malloc(@size_of(HttpRemoteRuntime) as usize) as &HttpRemoteRuntime;
+    if raw == null {
+        return error.HttpRemoteAlloc;
+    }
+    if repo_root.len >= HTTP_REMOTE_PATH_MAX || default_branch.len > 64 as usize {
+        free(raw as &void);
+        return error.HttpRemoteInvalidBinaryRequest;
+    }
+    raw.repo_root_len = repo_root.len;
+    var i: usize = 0;
+    while i < repo_root.len {
+        raw.repo_root[i] = repo_root.ptr[i];
+        i = i + 1 as usize;
+    }
+    raw.repo_root[repo_root.len] = 0 as byte;
+    raw.default_branch_len = default_branch.len;
+    i = 0;
+    while i < default_branch.len {
+        raw.default_branch[i] = default_branch.ptr[i];
+        i = i + 1 as usize;
+    }
+    raw.max_body_bytes = max_body_bytes;
+    raw.auth_token_len = 0 as usize;
+    i = 0;
+    while i < HTTP_REMOTE_AUTH_TOKEN_MAX {
+        raw.auth_token[i] = 0 as byte;
+        i = i + 1 as usize;
+    }
+    if auth_token.len > HTTP_REMOTE_AUTH_TOKEN_MAX {
+        free(raw as &void);
+        return error.HttpRemoteInvalidBinaryRequest;
+    }
+    i = 0;
+    while i < auth_token.len {
+        raw.auth_token[i] = auth_token.ptr[i];
+        i = i + 1 as usize;
+    }
+    raw.auth_token_len = auth_token.len;
+    return raw;
+}
+
+fn http_remote_register_routes(engine: &Engine, runtime: &HttpRemoteRuntime) !void {
+    engine.UseRecovery();
+    const auth_handler: AsyncHandler = HttpRemoteAuthHandler{ runtime: runtime };
+    const capabilities_handler: AsyncHandler = HttpRemoteCapabilitiesHandler{ runtime: runtime };
+    const object_batch_handler: AsyncHandler = HttpRemoteObjectBatchHandler{ runtime: runtime };
+    const manifest_query_handler: AsyncHandler = HttpRemoteManifestQueryHandler{ runtime: runtime };
+    const fetch_handler: AsyncHandler = HttpRemoteFetchHandler{ runtime: runtime };
+    const push_handler: AsyncHandler = HttpRemotePushHandler{ runtime: runtime };
+    try engine.Use(auth_handler);
+    try engine.GET(http_remote_literal_slice(HTTP_REMOTE_CAPABILITIES_ROUTE), capabilities_handler);
+    try engine.POST(http_remote_literal_slice(HTTP_REMOTE_OBJECT_BATCH_ROUTE), object_batch_handler);
+    try engine.POST(http_remote_literal_slice(HTTP_REMOTE_MANIFEST_QUERY_ROUTE), manifest_query_handler);
+    try engine.POST(http_remote_literal_slice(HTTP_REMOTE_FETCH_ROUTE), fetch_handler);
+    try engine.POST(http_remote_literal_slice(HTTP_REMOTE_PUSH_ROUTE), push_handler);
+}
+
 export fn http_remote_server_listen_loopback(port: u16) !HttpRemoteServer {
     var engine: Engine = http_remote_engine_new();
     const listener: GinListener = try uyagin_listen_loopback_with_options(port, &engine.run_options);
     return HttpRemoteServer{
         engine: engine,
         listener: listener,
+        runtime: null,
+    };
+}
+
+export fn http_remote_server_listen_loopback_repo(port: u16, repo_root: &[byte], default_branch: &[byte], auth_token: &[byte], max_body_bytes: usize) !HttpRemoteServer {
+    var engine: Engine = uyagin_new();
+    const options: EngineRunOptions = http_remote_default_run_options();
+    const limits: UyaginLimits = http_remote_limits_with_max_body_bytes(max_body_bytes);
+    const limit_body_bytes: usize = limits.max_body_bytes;
+    uyagin_set_run_options(&engine, options);
+    uyagin_set_limits(&engine, limits);
+
+    const runtime: &HttpRemoteRuntime = try http_remote_runtime_new(repo_root, default_branch, auth_token, limit_body_bytes);
+    http_remote_register_routes(&engine, runtime) catch |err| {
+        free(runtime as &void);
+        return err;
+    };
+    const listener: GinListener = try uyagin_listen_loopback_with_options(port, &engine.run_options);
+    return HttpRemoteServer{
+        engine: engine,
+        listener: listener,
+        runtime: runtime,
     };
 }
 
@@ -61,6 +1412,10 @@ export fn http_remote_server_close(server: &HttpRemoteServer) void {
     }
     var http_server: HttpServer = server.listener.server;
     http_server_close(&http_server);
+    if server.runtime != null {
+        free(server.runtime as &void);
+        server.runtime = null;
+    }
 }
 
 export fn http_remote_server_port(server: &HttpRemoteServer) u16 {

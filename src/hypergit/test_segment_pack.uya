@@ -15,7 +15,9 @@ use std.io.file.FILE;
 use std.io.file.fclose;
 use std.io.file.fopen;
 use std.io.file.fread;
+use std.io.file.fwrite;
 use core.codec.codec_decode_hash32;
+use core.codec.codec_hash_payload;
 use core.codec.codec_decode_i64;
 use core.codec.codec_decode_u16;
 use core.codec.codec_decode_u32;
@@ -102,6 +104,42 @@ fn segment_pack_test_expect_zero_hash(hash: Hash32) !void {
     try expect(hash32_compare(&hash, &zero) == 0);
 }
 
+fn segment_pack_test_hash_with_zero_region(arena: &Arena, input: &[byte], zero_offset: usize, zero_len: usize) !Hash32 {
+    const copy: &[byte] = try segment_pack_test_arena_bytes(arena, input.len);
+    var i: usize = 0 as usize;
+    while i < input.len {
+        copy.ptr[i] = input.ptr[i];
+        i = i + 1 as usize;
+    }
+    i = 0 as usize;
+    while i < zero_len {
+        copy.ptr[zero_offset + i] = 0 as byte;
+        i = i + 1 as usize;
+    }
+    return codec_hash_payload(copy);
+}
+
+fn segment_pack_test_hash_footer_cross_ref(arena: &Arena, input: &[byte], zero_offset: usize) !Hash32 {
+    const copy: &[byte] = try segment_pack_test_arena_bytes(arena, input.len);
+    var i: usize = 0 as usize;
+    while i < input.len {
+        copy.ptr[i] = input.ptr[i];
+        i = i + 1 as usize;
+    }
+    i = 0 as usize;
+    while i < 32 as usize {
+        copy.ptr[zero_offset + i] = 0 as byte;
+        i = i + 1 as usize;
+    }
+    const footer_crc_offset: usize = input.len - 4 as usize;
+    i = 0 as usize;
+    while i < 4 as usize {
+        copy.ptr[footer_crc_offset + i] = 0 as byte;
+        i = i + 1 as usize;
+    }
+    return codec_hash_payload(copy);
+}
+
 fn segment_pack_test_expected_record_bytes(record: &SegmentPackWriteInput) u32 {
     return (SEGMENT_PACK_RECORD_HEADER_BYTES + record.object_bytes.len + SEGMENT_PACK_RECORD_TRAILER_BYTES) as u32;
 }
@@ -178,6 +216,17 @@ fn test_segment_pack_writer_roundtrip_layout() !void {
     arena_init(&file_arena, &file_arena_buf[0], 32768 as usize);
     const pack_bytes: ByteList = try segment_pack_test_load_file_bytes("build/segment-pack-test/packs/seg-000001.hgp", &file_arena);
     const index_bytes: ByteList = try segment_pack_test_load_file_bytes("build/segment-pack-test/packs/seg-000001.hgi", &file_arena);
+    const expected_pack_hash: Hash32 = try segment_pack_test_hash_footer_cross_ref(
+        &file_arena,
+        pack_bytes.ptr[0: pack_bytes.len],
+        result.pack_footer_offset as usize + 8 as usize,
+    );
+    const expected_index_hash: Hash32 = try segment_pack_test_hash_footer_cross_ref(
+        &file_arena,
+        index_bytes.ptr[0: index_bytes.len],
+        result.index_footer_offset as usize,
+    );
+    const expected_entries_hash: Hash32 = codec_hash_payload(index_bytes.ptr[PACK_INDEX_HEADER_BYTES: result.index_footer_offset as usize - PACK_INDEX_HEADER_BYTES]);
 
     try expect(pack_bytes.len == result.pack_bytes as usize);
     try expect(index_bytes.len == result.index_bytes as usize);
@@ -221,7 +270,8 @@ fn test_segment_pack_writer_roundtrip_layout() !void {
 
     try expect(pack_offset == result.pack_footer_offset as usize);
     try expect(try codec_decode_u64(pack_bytes.ptr[0: pack_bytes.len], &pack_offset) == 1u64);
-    try segment_pack_test_expect_zero_hash(try codec_decode_hash32(pack_bytes.ptr[0: pack_bytes.len], &pack_offset));
+    const pack_footer_index_hash: Hash32 = try codec_decode_hash32(pack_bytes.ptr[0: pack_bytes.len], &pack_offset);
+    try expect(hash32_compare(&pack_footer_index_hash, &expected_index_hash) == 0);
     try expect(try codec_decode_u32(pack_bytes.ptr[0: pack_bytes.len], &pack_offset) == 0u32);
     try expect(try codec_decode_u32(pack_bytes.ptr[0: pack_bytes.len], &pack_offset) == crc32_compute(pack_bytes.ptr[result.pack_footer_offset as usize: SEGMENT_PACK_FOOTER_BYTES - 4 as usize]));
     try expect(pack_offset == pack_bytes.len);
@@ -278,8 +328,10 @@ fn test_segment_pack_writer_roundtrip_layout() !void {
     }
 
     try expect(index_offset == result.index_footer_offset as usize);
-    try segment_pack_test_expect_zero_hash(try codec_decode_hash32(index_bytes.ptr[0: index_bytes.len], &index_offset));
-    try segment_pack_test_expect_zero_hash(try codec_decode_hash32(index_bytes.ptr[0: index_bytes.len], &index_offset));
+    const index_footer_pack_hash: Hash32 = try codec_decode_hash32(index_bytes.ptr[0: index_bytes.len], &index_offset);
+    try expect(hash32_compare(&index_footer_pack_hash, &expected_pack_hash) == 0);
+    const index_footer_entries_hash: Hash32 = try codec_decode_hash32(index_bytes.ptr[0: index_bytes.len], &index_offset);
+    try expect(hash32_compare(&index_footer_entries_hash, &expected_entries_hash) == 0);
     try expect(try codec_decode_u32(index_bytes.ptr[0: index_bytes.len], &index_offset) == 0u32);
     try expect(try codec_decode_u32(index_bytes.ptr[0: index_bytes.len], &index_offset) == crc32_compute(index_bytes.ptr[result.index_footer_offset as usize: PACK_INDEX_FOOTER_BYTES - 4 as usize]));
     try expect(index_offset == index_bytes.len);
@@ -293,6 +345,8 @@ fn test_segment_pack_writer_roundtrip_layout() !void {
     try expect(index_snapshot.header.entries_offset == PACK_INDEX_HEADER_BYTES as u64);
     try expect(index_snapshot.header.bloom_offset == result.index_footer_offset);
     try expect(index_snapshot.bloom_block.len == 0 as usize);
+    try expect(hash32_compare(&index_snapshot.footer.pack_hash, &expected_pack_hash) == 0);
+    try expect(hash32_compare(&index_snapshot.footer.entries_hash, &expected_entries_hash) == 0);
     try expect(index_snapshot.footer.footer_crc32 == crc32_compute(index_bytes.ptr[result.index_footer_offset as usize: PACK_INDEX_FOOTER_BYTES - 4 as usize]));
 
     var read_arena_buf: [byte: 32768] = [];
@@ -323,7 +377,7 @@ fn test_segment_pack_writer_roundtrip_layout() !void {
     try expect(snapshot.records.ptr[1].trailer_crc32 == crc32_compute(pack_bytes.ptr[second_record_offset: second_record_bytes as usize - SEGMENT_PACK_RECORD_TRAILER_BYTES]));
     try segment_pack_test_expect_bytes_eq(snapshot.records.ptr[1].object_bytes.ptr[0: snapshot.records.ptr[1].object_bytes.len], inputs[1].object_bytes);
     try expect(snapshot.footer.segment_seq == 1u64);
-    try segment_pack_test_expect_zero_hash(snapshot.footer.index_hash);
+    try expect(hash32_compare(&snapshot.footer.index_hash, &expected_index_hash) == 0);
     try expect(snapshot.footer.footer_crc32 == crc32_compute(pack_bytes.ptr[result.pack_footer_offset as usize: SEGMENT_PACK_FOOTER_BYTES - 4 as usize]));
 
     var lookup_arena_buf: [byte: 32768] = [];
@@ -465,6 +519,92 @@ fn test_segment_pack_reader_rejects_corrupt_footer_bytes() !void {
     return error.AssertionFailed;
 }
 
+fn test_segment_pack_reader_rejects_object_hash_mismatch_with_valid_crcs() !void {
+    try expect(system("rm -rf build/segment-pack-object-hash && mkdir -p build/segment-pack-object-hash/objects/loose build/segment-pack-object-hash/packs") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/segment-pack-object-hash/objects/loose");
+    var payload: [byte: 5] = ['h' as byte, 'a' as byte, 's' as byte, 'h' as byte, '!' as byte];
+    const id: ObjectId = try store.put(ObjectKind.Commit, payload[0: 5]);
+
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+    const bytes: ObjectBytes = try store.get(ObjectId{ hash: id.hash }, &arena);
+
+    var inputs: [SegmentPackWriteInput: 1] = [
+        SegmentPackWriteInput{
+            object_id: ObjectId{ hash: id.hash },
+            kind: ObjectKind.Commit,
+            flags: 0u16,
+            logical_size: bytes.bytes.len as u64,
+            object_bytes: ByteList{ ptr: bytes.bytes.ptr, len: bytes.bytes.len },
+        },
+    ];
+    _ = try segment_pack_write(
+        "build/segment-pack-object-hash/packs/seg-000001.hgp",
+        "build/segment-pack-object-hash/packs/seg-000001.hgi",
+        1u64,
+        0i64,
+        0u64,
+        inputs[0: 1],
+    );
+
+    try expect(system("python3 -c \"from pathlib import Path; import zlib; p = Path('build/segment-pack-object-hash/packs/seg-000001.hgp'); data = bytearray(p.read_bytes()); record_start = 64; record_bytes = int.from_bytes(data[record_start:record_start+4], 'little'); payload_crc_offset = record_start + 40; object_offset = record_start + 44; object_len = record_bytes - 44 - 4; data[object_offset + object_len - 1] ^= 0x01; payload_crc = zlib.crc32(data[object_offset:object_offset+object_len]) & 0xffffffff; data[payload_crc_offset:payload_crc_offset+4] = payload_crc.to_bytes(4, 'little'); trailer_offset = record_start + record_bytes - 4; trailer_crc = zlib.crc32(data[record_start:trailer_offset]) & 0xffffffff; data[trailer_offset:trailer_offset+4] = trailer_crc.to_bytes(4, 'little'); p.write_bytes(data)\"") == 0);
+
+    var read_arena_buf: [byte: 8192] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 8192 as usize);
+    const snapshot: SegmentPackSnapshot = segment_pack_read("build/segment-pack-object-hash/packs/seg-000001.hgp", &read_arena) catch |err| {
+        try expect(@error_id(err) == @error_id(error.SegmentPackInvalid));
+        return;
+    };
+    _ = snapshot;
+    return error.AssertionFailed;
+}
+
+fn test_segment_pack_index_reader_rejects_pack_hash_mismatch_with_valid_footer_crc() !void {
+    try expect(system("rm -rf build/segment-pack-pack-hash && mkdir -p build/segment-pack-pack-hash/objects/loose build/segment-pack-pack-hash/packs") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/segment-pack-pack-hash/objects/loose");
+    var payload: [byte: 4] = ['p' as byte, 'a' as byte, 'c' as byte, 'k' as byte];
+    const id: ObjectId = try store.put(ObjectKind.Commit, payload[0: 4]);
+
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+    const bytes: ObjectBytes = try store.get(ObjectId{ hash: id.hash }, &arena);
+
+    var inputs: [SegmentPackWriteInput: 1] = [
+        SegmentPackWriteInput{
+            object_id: ObjectId{ hash: id.hash },
+            kind: ObjectKind.Commit,
+            flags: 0u16,
+            logical_size: bytes.bytes.len as u64,
+            object_bytes: ByteList{ ptr: bytes.bytes.ptr, len: bytes.bytes.len },
+        },
+    ];
+    _ = try segment_pack_write(
+        "build/segment-pack-pack-hash/packs/seg-000001.hgp",
+        "build/segment-pack-pack-hash/packs/seg-000001.hgi",
+        1u64,
+        0i64,
+        0u64,
+        inputs[0: 1],
+    );
+
+    try expect(system("python3 -c \"from pathlib import Path; import zlib; p = Path('build/segment-pack-pack-hash/packs/seg-000001.hgi'); data = bytearray(p.read_bytes()); footer_start = len(data) - 72; data[footer_start] ^= 0x01; footer_crc = zlib.crc32(data[footer_start:len(data)-4]) & 0xffffffff; data[-4:] = footer_crc.to_bytes(4, 'little'); p.write_bytes(data)\"") == 0);
+
+    var read_arena_buf: [byte: 8192] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 8192 as usize);
+    const snapshot: SegmentPackIndexSnapshot = segment_pack_index_read("build/segment-pack-pack-hash/packs/seg-000001.hgi", &read_arena) catch |err| {
+        try expect(@error_id(err) == @error_id(error.SegmentPackInvalid));
+        return;
+    };
+    _ = snapshot;
+    return error.AssertionFailed;
+}
+
 fn test_loose_pack_compact() !void {
     try expect(system("rm -rf build/segment-pack-compact && mkdir -p build/segment-pack-compact/objects/loose build/segment-pack-compact/packs") == 0);
 
@@ -572,6 +712,8 @@ export fn main() i32 {
     run_test("segment pack writer rejects duplicate object ids", test_segment_pack_writer_rejects_duplicate_object_ids);
     run_test("segment pack reader rejects corrupt record bytes", test_segment_pack_reader_rejects_corrupt_record_bytes);
     run_test("segment pack reader rejects corrupt footer bytes", test_segment_pack_reader_rejects_corrupt_footer_bytes);
+    run_test("segment pack reader rejects object hash mismatch with valid crcs", test_segment_pack_reader_rejects_object_hash_mismatch_with_valid_crcs);
+    run_test("segment pack index reader rejects pack hash mismatch with valid footer crc", test_segment_pack_index_reader_rejects_pack_hash_mismatch_with_valid_footer_crc);
     run_test("loose pack compact produces valid pack", test_loose_pack_compact);
     run_test("loose pack compact handles large objects", test_loose_pack_compact_large_object);
     return test_suite_end();

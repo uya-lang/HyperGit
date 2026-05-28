@@ -94,3 +94,92 @@ export fn main() i32 {
     return 0;
 }
 ```
+
+## External `uyagin` `AsyncHandler` can segfault on the first real request
+
+- Trigger command: `~/uya/uya/bin/uya build docs/repros/uya_uyagin_async_handler_request_crash.uya -o /tmp/uya_uyagin_async_handler_request_crash && /tmp/uya_uyagin_async_handler_request_crash >/tmp/uya_uyagin_async_handler_request_crash.log 2>&1 & pid=$!; sleep 0.3; curl -sv http://127.0.0.1:48129/ok; wait $pid`
+- Expected behavior: `curl` receives `HTTP/1.1 200 OK` with body `ok\n`, and the server exits cleanly after serving one request in `UyaginMode.Debug`.
+- Actual behavior: `curl` reports `Empty reply from server`, and the generated server process exits with `Segmentation fault (core dumped)`.
+
+Observed behavior excerpt:
+
+```text
+curl: (52) Empty reply from server
+Segmentation fault
+```
+
+Minimal reproduction file: [docs/repros/uya_uyagin_async_handler_request_crash.uya](/media/winger/_dde_data/winger/uya/HyperGit/docs/repros/uya_uyagin_async_handler_request_crash.uya)
+
+```uya
+use std.runtime.entry;
+use std.http.types.Status;
+use std.http.uyagin.AsyncHandler;
+use std.http.uyagin.Engine;
+use std.http.uyagin.EngineRunOptions;
+use std.http.uyagin.GinContext;
+use std.http.uyagin.GinListener;
+use std.http.uyagin.UyaginMode;
+use std.http.uyagin.uyagin_listen_loopback_with_options;
+use std.http.uyagin.uyagin_new;
+use std.http.uyagin.uyagin_run_options_default;
+use std.async.Future;
+use std.string.strlen;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn ok_future(ctx: &GinContext) Future<!i32> {
+    return ctx.string(Status.OK, "ok\n");
+}
+
+struct OkHandler : AsyncHandler {
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        return try @await ok_future(ctx);
+    }
+}
+
+export fn main() i32 {
+    var engine: Engine = uyagin_new();
+    var options: EngineRunOptions = uyagin_run_options_default();
+    options.mode = UyaginMode.Debug;
+    engine.run_options = options;
+
+    const handler: AsyncHandler = OkHandler{};
+    engine.GET(literal_bytes("/ok"), handler) catch {
+        return 1;
+    };
+
+    const listener: GinListener = uyagin_listen_loopback_with_options(48129 as u16, &engine.run_options) catch {
+        return 1;
+    };
+    _ = engine.run_shards(&listener) catch {
+        return 1;
+    };
+    return 0;
+}
+```
+
+## Git interop test compilation can segfault the compiler
+
+- Trigger command: `~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya`
+- Expected behavior: compile succeeds and runs the Git interop prototype tests.
+- Actual behavior: the compiler process exits with `Segmentation fault (core dumped)` before producing a runnable binary.
+
+Observed shell output:
+
+```text
+/bin/bash: line 1: <pid> Segmentation fault ~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya
+STATUS=139
+```
+
+Current smallest known reproduction inputs:
+
+- [src/hypergit/test_git_interop.uya](/media/winger/_dde_data/winger/uya/HyperGit/src/hypergit/test_git_interop.uya:1)
+- [src/hypergit/git/interop.uya](/media/winger/_dde_data/winger/uya/HyperGit/src/hypergit/git/interop.uya:1)
+
+Notes:
+
+- 同一批 Git interop 代码在更早一次编译中曾成功通过，当前表现疑似 codegen/优化阶段的不稳定崩溃。
+- 在把 `git interop` 测试接入默认 `Makefile test` 前，需要先把这个编译器崩溃独立缩小并稳定复现。

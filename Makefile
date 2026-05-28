@@ -20,6 +20,7 @@ c99:
 
 test:
 	$(UYA) test src/hypergit/test_object_model.uya
+	$(UYA) test src/hypergit/test_policy_placeholder.uya
 	$(UYA) test src/hypergit/test_object_codec.uya
 	$(UYA) test src/hypergit/test_large_chunker.uya
 	$(UYA) test src/hypergit/test_large_chunk_hash.uya
@@ -39,6 +40,7 @@ test:
 	$(UYA) test src/hypergit/test_protocol_ref_cas.uya
 	$(UYA) test src/hypergit/test_protocol_published_view.uya
 	$(UYA) test src/hypergit/test_protocol_http_remote.uya
+	chmod +x tests/test_http_remote_smoke.sh
 	$(UYA) test src/hypergit/test_merge_planner.uya
 	$(UYA) test src/hypergit/test_merge_text_merge.uya
 	$(UYA) test src/hypergit/test_merge_result_manifest.uya
@@ -68,6 +70,7 @@ test:
 	$(UYA) test src/hgx/test_file_remote.uya
 	$(UYA) test src/hgx/test_hydrate_missing_object.uya
 	$(UYA) test src/hgx/test_commit_partial_stage.uya
+	$(UYA) test src/hgx/test_checkout_security.uya
 	$(UYA) test src/hgx/test_cli_args.uya
 	./tests/test_cli_golden.sh
 	./tests/test_add_stage.sh
@@ -98,6 +101,7 @@ test:
 	./tests/test_file_remote_clone.sh
 	./tests/test_push_cas_failure.sh
 	./tests/test_fetch_sparse_profile.sh
+	./tests/test_http_remote_smoke.sh
 	./tests/test_status_empty.sh
 	./tests/test_status_clean.sh
 	./tests/test_status_split.sh

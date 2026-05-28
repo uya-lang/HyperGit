@@ -1,0 +1,220 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.io.file.File;
+use std.io.file.file_close;
+use std.io.file.file_open;
+use std.io.file.file_write;
+
+use libc.chdir;
+use libc.stat;
+use libc.system;
+use libc.O_WRONLY;
+use libc.Stat;
+use commands.checkout.checkout_apply_plan;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.object_id_from_hash;
+use object.codec.small_blob_payload_to_canonical;
+use object.small_blob.small_blob_payload_from_bytes;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use object.types.SmallBlobPayload;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_object_path;
+use store.loose_store.loose_store_open;
+use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.RepoInitResult;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_current_dir;
+use store.repo_layout.repo_init_current_dir;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_join_literal;
+use workspace.checkout_plan.CheckoutAction;
+use workspace.checkout_plan.CheckoutActionKind;
+use workspace.checkout_plan.CheckoutActionList;
+use workspace.checkout_plan.CheckoutPathList;
+use workspace.checkout_plan.CheckoutPlan;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    var len: usize = 0;
+    while text[len] != 0 as byte {
+        len = len + 1 as usize;
+    }
+    return (text as &byte)[0: len];
+}
+
+fn byte_list_from_literal(text: &const byte) ByteList {
+    const slice: &[byte] = literal_bytes(text);
+    return ByteList{ ptr: slice.ptr, len: slice.len };
+}
+
+fn make_object_id(seed: byte) ObjectId {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return object_id_from_hash(hash);
+}
+
+fn checkout_test_plan_for_delete(path: &ByteList) CheckoutPlan {
+    var actions: [CheckoutAction: 1] = [
+        CheckoutAction{
+            kind: CheckoutActionKind.DeleteFile,
+            path: ByteList{ ptr: path.ptr, len: path.len },
+            object_id: make_object_id(1 as byte),
+            file_mode: 0u32,
+        },
+    ];
+    return CheckoutPlan{
+        actions: CheckoutActionList{ ptr: &actions[0], len: 1 as usize },
+        blocked_paths: CheckoutPathList{ ptr: null, len: 0 },
+    };
+}
+
+fn checkout_test_plan_for_write(path: &ByteList, object_id: &ObjectId) CheckoutPlan {
+    var actions: [CheckoutAction: 1] = [
+        CheckoutAction{
+            kind: CheckoutActionKind.WriteFile,
+            path: ByteList{ ptr: path.ptr, len: path.len },
+            object_id: object_id[0],
+            file_mode: 0o100644u32,
+        },
+    ];
+    return CheckoutPlan{
+        actions: CheckoutActionList{ ptr: &actions[0], len: 1 as usize },
+        blocked_paths: CheckoutPathList{ ptr: null, len: 0 },
+    };
+}
+
+fn checkout_test_store(root: &RepoPath) !LooseObjectStore {
+    const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
+    return loose_store_open(repo_path_cstr(&objects_root));
+}
+
+fn test_checkout_rejects_path_traversal() !void {
+    const original_cwd: RepoPath = try repo_current_dir();
+    defer {
+        _ = chdir(repo_path_cstr(&original_cwd) as &const byte);
+    }
+
+    try expect(system("rm -rf build/checkout-security-traversal && mkdir -p build/checkout-security-traversal/repo") == 0);
+    try expect(chdir("build/checkout-security-traversal/repo") == 0);
+    const init_result: RepoInitResult = try repo_init_current_dir();
+    const store: LooseObjectStore = try checkout_test_store(&init_result.repo_root);
+
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+
+    const malicious: ByteList = byte_list_from_literal("../escape.txt");
+    const plan: CheckoutPlan = checkout_test_plan_for_delete(&malicious);
+    checkout_apply_plan(&arena, &store, &init_result.repo_root, &plan) catch |err| {
+        try expect(@error_id(err) == @error_id(error.CheckoutUnsafePath));
+        return;
+    };
+    return error.AssertionFailed;
+}
+
+fn test_checkout_rejects_absolute_path() !void {
+    const original_cwd: RepoPath = try repo_current_dir();
+    defer {
+        _ = chdir(repo_path_cstr(&original_cwd) as &const byte);
+    }
+
+    try expect(system("rm -rf build/checkout-security-absolute && mkdir -p build/checkout-security-absolute/repo") == 0);
+    try expect(chdir("build/checkout-security-absolute/repo") == 0);
+    const init_result: RepoInitResult = try repo_init_current_dir();
+    const store: LooseObjectStore = try checkout_test_store(&init_result.repo_root);
+
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+
+    const malicious: ByteList = byte_list_from_literal("/tmp/escape.txt");
+    const plan: CheckoutPlan = checkout_test_plan_for_delete(&malicious);
+    checkout_apply_plan(&arena, &store, &init_result.repo_root, &plan) catch |err| {
+        try expect(@error_id(err) == @error_id(error.CheckoutUnsafePath));
+        return;
+    };
+    return error.AssertionFailed;
+}
+
+fn test_checkout_rejects_symlink_escape() !void {
+    const original_cwd: RepoPath = try repo_current_dir();
+    defer {
+        _ = chdir(repo_path_cstr(&original_cwd) as &const byte);
+    }
+
+    try expect(system("rm -rf build/checkout-security-symlink && mkdir -p build/checkout-security-symlink/repo build/checkout-security-symlink/outside && printf keep > build/checkout-security-symlink/outside/escape.txt") == 0);
+    try expect(chdir("build/checkout-security-symlink/repo") == 0);
+    const init_result: RepoInitResult = try repo_init_current_dir();
+    try expect(system("ln -s ../outside link") == 0);
+    const store: LooseObjectStore = try checkout_test_store(&init_result.repo_root);
+
+    var arena_buf: [byte: 8192] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 8192 as usize);
+
+    const malicious: ByteList = byte_list_from_literal("link/escape.txt");
+    const plan: CheckoutPlan = checkout_test_plan_for_delete(&malicious);
+    checkout_apply_plan(&arena, &store, &init_result.repo_root, &plan) catch |err| {
+        _ = err;
+        try expect(system("test -f ../outside/escape.txt") == 0);
+        return;
+    };
+    return error.AssertionFailed;
+}
+
+fn test_checkout_rejects_corrupt_object_bytes() !void {
+    const original_cwd: RepoPath = try repo_current_dir();
+    defer {
+        _ = chdir(repo_path_cstr(&original_cwd) as &const byte);
+    }
+
+    try expect(system("rm -rf build/checkout-security-corrupt && mkdir -p build/checkout-security-corrupt/repo") == 0);
+    try expect(chdir("build/checkout-security-corrupt/repo") == 0);
+    const init_result: RepoInitResult = try repo_init_current_dir();
+    const store: LooseObjectStore = try checkout_test_store(&init_result.repo_root);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    var content: [byte: 6] = ['b' as byte, 'r' as byte, 'o' as byte, 'k' as byte, 'e' as byte, 'n' as byte];
+    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(&arena, content[0: 6]);
+    const encoded: ByteList = try small_blob_payload_to_canonical(&arena, &payload);
+    const object_id: ObjectId = try store.put(ObjectKind.SmallBlob, encoded.ptr[0: encoded.len]);
+
+    var object_path: [byte: 4096] = [];
+    _ = try loose_store_object_path(&store, &object_id, object_path[0: 4096]);
+    const file: File = try file_open(&object_path[0] as &const byte, O_WRONLY as i32, 0u32);
+    var bang: [byte: 1] = ['!' as byte];
+    try expect(try file_write(&file, &bang[0] as &const byte, 1 as usize) == 1 as usize);
+    file_close(&file) catch {};
+
+    const safe_path: ByteList = byte_list_from_literal("main.txt");
+    const plan: CheckoutPlan = checkout_test_plan_for_write(&safe_path, &object_id);
+    checkout_apply_plan(&arena, &store, &init_result.repo_root, &plan) catch |err| {
+        _ = err;
+        var st: Stat = Stat{};
+        try expect(stat("main.txt", &st) != 0);
+        return;
+    };
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Checkout Security Tests");
+    run_test("checkout rejects path traversal", test_checkout_rejects_path_traversal);
+    run_test("checkout rejects absolute path", test_checkout_rejects_absolute_path);
+    run_test("checkout rejects symlink escape", test_checkout_rejects_symlink_escape);
+    run_test("checkout rejects corrupt object bytes", test_checkout_rejects_corrupt_object_bytes);
+    return test_suite_end();
+}

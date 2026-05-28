@@ -1,0 +1,39 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use core.ids.PolicyId;
+use core.policy.AuditEventKind;
+use core.policy.AuditEventPlaceholder;
+use core.policy.audit_event_placeholder;
+use core.policy.placeholder_dedupe_scope;
+use core.policy.placeholder_policy_id;
+use core.policy.policy_id_is_placeholder;
+use object.types.DedupeScope;
+
+fn test_placeholder_policy_id_is_stable() !void {
+    const policy_id: PolicyId = placeholder_policy_id();
+    try expect(policy_id_is_placeholder(&policy_id));
+}
+
+fn test_placeholder_dedupe_scope_defaults_to_repository() !void {
+    try expect(placeholder_dedupe_scope() == DedupeScope.Repository);
+}
+
+fn test_audit_event_placeholder_is_disabled() !void {
+    const event: AuditEventPlaceholder = audit_event_placeholder(AuditEventKind.Commit);
+    try expect(event.kind == AuditEventKind.Commit);
+    try expect(!event.enabled);
+    try expect(policy_id_is_placeholder(&event.policy_id));
+    try expect(event.dedupe_scope == DedupeScope.Repository);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Policy Placeholder Tests");
+    run_test("placeholder policy id is stable", test_placeholder_policy_id_is_stable);
+    run_test("placeholder dedupe scope defaults to repository", test_placeholder_dedupe_scope_defaults_to_repository);
+    run_test("audit event placeholder is disabled", test_audit_event_placeholder_is_disabled);
+    return test_suite_end();
+}

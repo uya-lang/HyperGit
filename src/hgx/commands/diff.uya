@@ -20,12 +20,11 @@ use core.codec.codec_hash_payload;
 use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.ObjectId;
-use core.ids.PolicyId;
 use core.ids.HASH32_HEX_BYTES;
 use core.ids.commit_id_decode_hex;
 use core.ids.hash32_compare;
 use core.ids.object_id_from_hash;
-use core.ids.policy_id_from_object;
+use core.policy.placeholder_policy_id;
 use large.config.large_file_uses_small_blob;
 use large.prepare.LargePreparedChunkedBlob;
 use large.prepare.large_prepare_recommended_arena_bytes;
@@ -180,10 +179,6 @@ fn diff_same_arg(actual: &byte, expected: &const byte) bool {
         return false;
     }
     return strcmp(actual as &const byte, expected) == 0;
-}
-
-fn diff_zero_policy_id() PolicyId {
-    return policy_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
 }
 
 fn diff_stats_zero() DiffStats {
@@ -578,7 +573,7 @@ fn diff_workspace_inputs(arena: &Arena, root: &RepoPath) !ManifestLeafInputList 
             object_id: try diff_hash_workspace_object_id(entry.logical_size, &file_bytes),
             logical_size: entry.logical_size,
             content_type: ContentType.Unknown,
-            policy_id: diff_zero_policy_id(),
+            policy_id: placeholder_policy_id(),
         };
         i = i + 1 as usize;
     }
