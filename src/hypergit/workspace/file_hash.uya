@@ -18,6 +18,7 @@ use object.hash.hash_object_payload_bytes;
 use large.config.large_file_uses_small_blob;
 use large.prepare.large_prepare_recommended_arena_bytes;
 use large.prepare.prepare_chunked_blob_object_id_default;
+use large.prepare.prepare_chunked_blob_object_id_parallel_default;
 use object.types.ByteList;
 use object.types.FileType;
 use object.types.ObjectKind;
@@ -167,7 +168,7 @@ export fn workspace_file_object_id(root_path: &const byte, path: &ByteList, logi
         }
         var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
         arena_init(&arena, scratch, scratch_len);
-        return try prepare_chunked_blob_object_id_default(&arena, workspace_owned_bytes_slice(&file_bytes), FileType.Binary);
+        return try prepare_chunked_blob_object_id_parallel_default(&arena, workspace_owned_bytes_slice(&file_bytes), FileType.Binary);
     }
 
     const payload: SmallBlobPayload = SmallBlobPayload{

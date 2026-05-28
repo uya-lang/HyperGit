@@ -301,9 +301,9 @@
 - [x] 接入 parallel manifest diff。
 - [x] 接入 parallel checkout。
 - [x] 接入 parallel pack read。
-- [ ] 接入 parallel large file hash（覆盖 `hgx add` / worktree hash 路径）。
-- [ ] 约束 parallel `hgx add` 只并行对象计算，最终 stage publish 保持单 writer。
-- [ ] 测试单 worker 和多 worker 结果一致。
+- [x] 接入 parallel large file hash（覆盖 `hgx add` / worktree hash 路径）。
+- [x] 约束 parallel `hgx add` 只并行对象计算，最终 stage publish 保持单 writer。
+- [x] 测试单 worker 和多 worker 结果一致。
 - [ ] 测试任务失败能正确取消后续任务。
 
 ## 18. Remote / Protocol

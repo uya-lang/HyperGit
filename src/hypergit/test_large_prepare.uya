@@ -1,0 +1,270 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+
+use libc.fprintf;
+use libc.free;
+use libc.malloc;
+use libc.stderr;
+use core.ids.Hash32;
+use core.ids.hash32_compare;
+use large.chunk_hash.ChunkHashes;
+use large.chunk_hash.chunk_hash_plain;
+use large.chunker.LargeChunkList;
+use large.chunker.cdc_chunk_bytes_default;
+use large.prepare.LargePreparedChunkedBlob;
+use large.prepare.large_prepare_recommended_arena_bytes;
+use large.prepare.prepare_chunked_blob_repository_parallel_default;
+use large.prepare.prepare_chunked_blob_repository_default;
+use object.types.ChunkRef;
+use object.types.FileType;
+use object.types.StorageTier;
+
+const REPRO_BYTES: usize = 10485760 as usize;
+const REPRO_BYTES_U32: u32 = 10485760u32;
+
+fn fill_payload_randomish(payload: &byte, len: usize) void {
+    var state: u64 = 0x123456789abcdef0u64;
+    var i: usize = 0 as usize;
+    while i < len {
+        state = state ^ (state << 13);
+        state = state ^ (state >> 7);
+        state = state ^ (state << 17);
+        payload[i] = (state & 255u64) as byte;
+        i = i + 1 as usize;
+    }
+}
+
+fn fill_payload_repetitive(payload: &byte, len: usize) void {
+    var pattern: [byte: 8] = [
+        'a' as byte,
+        'b' as byte,
+        'c' as byte,
+        'd' as byte,
+        '1' as byte,
+        '2' as byte,
+        '3' as byte,
+        '4' as byte,
+    ];
+    var i: usize = 0 as usize;
+    while i < len {
+        payload[i] = pattern[i % 8 as usize];
+        i = i + 1 as usize;
+    }
+}
+
+fn hash_copy(dst: &Hash32, src: &Hash32) void {
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        dst.bytes[i] = src.bytes[i];
+        i = i + 1 as usize;
+    }
+}
+
+fn expect_hash_equal(left: &Hash32, right: &Hash32) !void {
+    try expect(hash32_compare(left, right) == 0);
+}
+
+fn print_prepare_error(prefix: &const byte, err_id: u32) void {
+    if err_id == @error_id(error.LargePrepareAlloc) {
+        fprintf(stderr, "%sLargePrepareAlloc\n" as *byte, prefix as *byte);
+        return;
+    }
+    if err_id == @error_id(error.LargePrepareAsyncFailed) {
+        fprintf(stderr, "%sLargePrepareAsyncFailed\n" as *byte, prefix as *byte);
+        return;
+    }
+    if err_id == @error_id(error.ObjectInvalidChunkRef) {
+        fprintf(stderr, "%sObjectInvalidChunkRef\n" as *byte, prefix as *byte);
+        return;
+    }
+    if err_id == @error_id(error.ObjectChunkCountMismatch) {
+        fprintf(stderr, "%sObjectChunkCountMismatch\n" as *byte, prefix as *byte);
+        return;
+    }
+    if err_id == @error_id(error.ObjectChunkSizeMismatch) {
+        fprintf(stderr, "%sObjectChunkSizeMismatch\n" as *byte, prefix as *byte);
+        return;
+    }
+    fprintf(stderr, "%s%u\n" as *byte, prefix as *byte, err_id);
+}
+
+fn write_ref(refs: &[ChunkRef], index: usize, hashes: &ChunkHashes, size: u32) void {
+    hash_copy(&refs.ptr[index].logical_chunk_id, &hashes.logical_chunk_id);
+    hash_copy(&refs.ptr[index].storage_id, &hashes.stored_checksum);
+    refs.ptr[index].offset = 0u64;
+    refs.ptr[index].logical_size = size;
+    refs.ptr[index].stored_size = size;
+    hash_copy(&refs.ptr[index].checksum, &hashes.stored_checksum);
+    refs.ptr[index].storage_tier = StorageTier.Hot;
+}
+
+fn test_large_hash_can_roundtrip_into_chunk_ref() !void {
+    const payload_ptr: &byte = malloc(REPRO_BYTES) as &byte;
+    try expect(payload_ptr != null);
+    defer {
+        free(payload_ptr as &void);
+    }
+
+    fill_payload_randomish(payload_ptr, REPRO_BYTES);
+
+    const scratch_ptr: &byte = malloc(REPRO_BYTES + 256 as usize) as &byte;
+    try expect(scratch_ptr != null);
+    defer {
+        free(scratch_ptr as &void);
+    }
+    var hash_arena: Arena = Arena{ buffer: scratch_ptr, size: 0, used: 0 };
+    arena_init(&hash_arena, scratch_ptr, REPRO_BYTES + 256 as usize);
+    const hashes: ChunkHashes = try chunk_hash_plain(&hash_arena, payload_ptr[0: REPRO_BYTES]);
+
+    var ref_arena_buf: [byte: 1024] = [];
+    var ref_arena: Arena = Arena{ buffer: &ref_arena_buf[0], size: 0, used: 0 };
+    arena_init(&ref_arena, &ref_arena_buf[0], 1024 as usize);
+    const raw_refs: &ChunkRef = arena_alloc(&ref_arena, @size_of(ChunkRef) as usize) as &ChunkRef;
+    try expect(raw_refs != null);
+    const refs: &[ChunkRef] = raw_refs[0: 1];
+
+    write_ref(refs, 0 as usize, &hashes, REPRO_BYTES_U32);
+
+    try expect(refs.ptr[0].logical_size == REPRO_BYTES_U32);
+    try expect(refs.ptr[0].stored_size == REPRO_BYTES_U32);
+}
+
+fn test_serial_multi_chunk_prepare_roundtrip() !void {
+    const payload_ptr: &byte = malloc(REPRO_BYTES) as &byte;
+    try expect(payload_ptr != null);
+    defer {
+        free(payload_ptr as &void);
+    }
+
+    fill_payload_randomish(payload_ptr, REPRO_BYTES);
+
+    const chunker_scratch: &byte = malloc(REPRO_BYTES + 65536 as usize) as &byte;
+    try expect(chunker_scratch != null);
+    defer {
+        free(chunker_scratch as &void);
+    }
+    var chunker_arena: Arena = Arena{ buffer: chunker_scratch, size: 0, used: 0 };
+    arena_init(&chunker_arena, chunker_scratch, REPRO_BYTES + 65536 as usize);
+    const chunks: LargeChunkList = try cdc_chunk_bytes_default(&chunker_arena, payload_ptr[0: REPRO_BYTES]);
+    try expect(chunks.len > 1 as usize);
+
+    const prepare_bytes: usize = try large_prepare_recommended_arena_bytes(REPRO_BYTES as u64);
+    const prepare_scratch: &byte = malloc(prepare_bytes) as &byte;
+    try expect(prepare_scratch != null);
+    defer {
+        free(prepare_scratch as &void);
+    }
+    var prepare_arena: Arena = Arena{ buffer: prepare_scratch, size: 0, used: 0 };
+    arena_init(&prepare_arena, prepare_scratch, prepare_bytes);
+    const serial_prepared: LargePreparedChunkedBlob = prepare_chunked_blob_repository_default(
+        &prepare_arena,
+        payload_ptr[0: REPRO_BYTES],
+        FileType.Binary,
+    ) catch |err| {
+        print_prepare_error("serial prepare failed: ", @error_id(err));
+        return err;
+    };
+
+    try expect(serial_prepared.chunks.len == chunks.len);
+    try expect(serial_prepared.parts.len == chunks.len);
+    try expect(serial_prepared.payload.chunk_count == chunks.len as u32);
+
+    const parallel_prepare_scratch: &byte = malloc(prepare_bytes) as &byte;
+    try expect(parallel_prepare_scratch != null);
+    defer {
+        free(parallel_prepare_scratch as &void);
+    }
+    var parallel_prepare_arena: Arena = Arena{ buffer: parallel_prepare_scratch, size: 0, used: 0 };
+    arena_init(&parallel_prepare_arena, parallel_prepare_scratch, prepare_bytes);
+    const parallel_prepared: LargePreparedChunkedBlob = prepare_chunked_blob_repository_parallel_default(
+        &parallel_prepare_arena,
+        payload_ptr[0: REPRO_BYTES],
+        FileType.Binary,
+    ) catch |err| {
+        print_prepare_error("parallel prepare failed: ", @error_id(err));
+        return err;
+    };
+    try expect(parallel_prepared.parts.len == chunks.len);
+    try expect(parallel_prepared.payload.chunk_count == chunks.len as u32);
+
+    var part_index: usize = 0 as usize;
+    while part_index < chunks.len {
+        try expect(serial_prepared.parts.ptr[part_index].logical_size == parallel_prepared.parts.ptr[part_index].logical_size);
+        try expect(serial_prepared.parts.ptr[part_index].stored_size == parallel_prepared.parts.ptr[part_index].stored_size);
+        try expect(serial_prepared.parts.ptr[part_index].offset == parallel_prepared.parts.ptr[part_index].offset);
+        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].logical_chunk_id, &parallel_prepared.parts.ptr[part_index].logical_chunk_id);
+        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].storage_id, &parallel_prepared.parts.ptr[part_index].storage_id);
+        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].checksum, &parallel_prepared.parts.ptr[part_index].checksum);
+        part_index = part_index + 1 as usize;
+    }
+}
+
+fn test_repetitive_large_prepare_serial_and_parallel() !void {
+    const payload_ptr: &byte = malloc(REPRO_BYTES) as &byte;
+    try expect(payload_ptr != null);
+    defer {
+        free(payload_ptr as &void);
+    }
+    fill_payload_repetitive(payload_ptr, REPRO_BYTES);
+
+    const prepare_bytes: usize = try large_prepare_recommended_arena_bytes(REPRO_BYTES as u64);
+
+    const serial_scratch: &byte = malloc(prepare_bytes) as &byte;
+    try expect(serial_scratch != null);
+    defer {
+        free(serial_scratch as &void);
+    }
+    var serial_arena: Arena = Arena{ buffer: serial_scratch, size: 0, used: 0 };
+    arena_init(&serial_arena, serial_scratch, prepare_bytes);
+    const serial_prepared: LargePreparedChunkedBlob = prepare_chunked_blob_repository_default(
+        &serial_arena,
+        payload_ptr[0: REPRO_BYTES],
+        FileType.Binary,
+    ) catch |err| {
+        print_prepare_error("repetitive serial prepare failed: ", @error_id(err));
+        return err;
+    };
+
+    const parallel_scratch: &byte = malloc(prepare_bytes) as &byte;
+    try expect(parallel_scratch != null);
+    defer {
+        free(parallel_scratch as &void);
+    }
+    var parallel_arena: Arena = Arena{ buffer: parallel_scratch, size: 0, used: 0 };
+    arena_init(&parallel_arena, parallel_scratch, prepare_bytes);
+    const parallel_prepared: LargePreparedChunkedBlob = prepare_chunked_blob_repository_parallel_default(
+        &parallel_arena,
+        payload_ptr[0: REPRO_BYTES],
+        FileType.Binary,
+    ) catch |err| {
+        print_prepare_error("repetitive parallel prepare failed: ", @error_id(err));
+        return err;
+    };
+
+    try expect(serial_prepared.parts.len == parallel_prepared.parts.len);
+    try expect(serial_prepared.payload.chunk_count == parallel_prepared.payload.chunk_count);
+    var part_index: usize = 0 as usize;
+    while part_index < serial_prepared.parts.len {
+        try expect(serial_prepared.parts.ptr[part_index].logical_size == parallel_prepared.parts.ptr[part_index].logical_size);
+        try expect(serial_prepared.parts.ptr[part_index].stored_size == parallel_prepared.parts.ptr[part_index].stored_size);
+        try expect(serial_prepared.parts.ptr[part_index].offset == parallel_prepared.parts.ptr[part_index].offset);
+        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].logical_chunk_id, &parallel_prepared.parts.ptr[part_index].logical_chunk_id);
+        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].storage_id, &parallel_prepared.parts.ptr[part_index].storage_id);
+        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].checksum, &parallel_prepared.parts.ptr[part_index].checksum);
+        part_index = part_index + 1 as usize;
+    }
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Large Prepare Tests");
+    run_test("large hash can roundtrip into chunk ref", test_large_hash_can_roundtrip_into_chunk_ref);
+    run_test("serial multi chunk prepare roundtrip", test_serial_multi_chunk_prepare_roundtrip);
+    run_test("repetitive large prepare serial and parallel", test_repetitive_large_prepare_serial_and_parallel);
+    return test_suite_end();
+}

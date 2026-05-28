@@ -36,6 +36,8 @@ use large.prepare.LargePreparedChunkedBlob;
 use large.prepare.large_prepare_recommended_arena_bytes;
 use large.prepare.prepare_chunked_blob_object_id_default;
 use large.prepare.prepare_chunked_blob_repository_default;
+use large.prepare.prepare_chunked_blob_object_id_parallel_default;
+use large.prepare.prepare_chunked_blob_repository_parallel_default;
 use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_path_compare;
 use manifest.path.manifest_path_normalize;
@@ -279,7 +281,7 @@ export fn add_worktree_small_blob_id(root: &RepoPath, path: &ByteList, logical_s
         }
         var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
         arena_init(&arena, scratch, scratch_len);
-        return try prepare_chunked_blob_object_id_default(&arena, add_owned_bytes_slice(&file_bytes), FileType.Binary);
+        return try prepare_chunked_blob_object_id_parallel_default(&arena, add_owned_bytes_slice(&file_bytes), FileType.Binary);
     }
 
     const payload: SmallBlobPayload = SmallBlobPayload{
@@ -742,7 +744,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 var large_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
                 arena_init(&large_arena, scratch, scratch_len);
 
-                const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_default(&large_arena, add_owned_bytes_slice(&file_bytes), FileType.Binary);
+                const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_parallel_default(&large_arena, add_owned_bytes_slice(&file_bytes), FileType.Binary);
                 var part_index: usize = 0 as usize;
                 while part_index < prepared.parts.len {
                     const chunk: &LargeChunk = &prepared.chunks.ptr[part_index];

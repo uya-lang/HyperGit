@@ -26,6 +26,7 @@ test:
 	$(UYA) test src/hypergit/test_large_chunk_store.uya
 	$(UYA) test src/hypergit/test_large_chunk_manifest.uya
 	$(UYA) test src/hypergit/test_large_config.uya
+	$(UYA) test src/hypergit/test_large_prepare.uya
 	$(UYA) test src/hypergit/test_large_range_read.uya
 	$(UYA) test src/hypergit/test_exec_task.uya
 	$(UYA) test src/hypergit/test_exec_queue.uya
