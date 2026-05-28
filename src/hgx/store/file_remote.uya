@@ -1,0 +1,93 @@
+use std.string.strlen;
+
+use store.repo_layout.REPO_PATH_MAX;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_find_root;
+use store.repo_layout.repo_path_is_dir;
+use store.repo_layout.repo_read_config;
+
+const FILE_REMOTE_SCHEME: &const byte = "file://";
+const FILE_REMOTE_SCHEME_LEN: usize = 7;
+const FILE_REMOTE_LOCALHOST: &const byte = "localhost";
+const FILE_REMOTE_LOCALHOST_LEN: usize = 9;
+
+error FileRemoteInvalidUri;
+error FileRemoteUnsupportedHost;
+error FileRemotePathNotDirectory;
+
+export struct FileRemote {
+    repo_root: RepoPath,
+    config: RepoConfig
+}
+
+fn literal_equal(text: &const byte, literal: &const byte, len: usize) bool {
+    var i: usize = 0;
+    while i < len {
+        if text[i] != literal[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn file_remote_path_from_uri(uri: &const byte) !RepoPath {
+    if uri == null {
+        return error.FileRemoteInvalidUri;
+    }
+    if !literal_equal(uri, FILE_REMOTE_SCHEME, FILE_REMOTE_SCHEME_LEN) {
+        return error.FileRemoteInvalidUri;
+    }
+
+    var cursor: usize = FILE_REMOTE_SCHEME_LEN;
+    if uri[cursor] != '/' as byte {
+        const host_start: usize = cursor;
+        while uri[cursor] != 0 as byte && uri[cursor] != '/' as byte {
+            cursor = cursor + 1 as usize;
+        }
+        if uri[cursor] != '/' as byte {
+            return error.FileRemoteInvalidUri;
+        }
+        const host_len: usize = cursor - host_start;
+        if host_len != FILE_REMOTE_LOCALHOST_LEN ||
+            !literal_equal(&uri[host_start], FILE_REMOTE_LOCALHOST, FILE_REMOTE_LOCALHOST_LEN) {
+            return error.FileRemoteUnsupportedHost;
+        }
+    }
+
+    if uri[cursor] != '/' as byte {
+        return error.FileRemoteInvalidUri;
+    }
+
+    const path_len: usize = strlen(&uri[cursor] as &const byte);
+    if path_len == 0 as usize {
+        return error.FileRemoteInvalidUri;
+    }
+    if path_len >= REPO_PATH_MAX {
+        return error.RepoPathTooLong;
+    }
+
+    var path: RepoPath = RepoPath{ bytes: [], len: 0 };
+    var i: usize = 0;
+    while i < path_len {
+        path.bytes[i] = uri[cursor + i];
+        i = i + 1 as usize;
+    }
+    path.bytes[path_len] = 0 as byte;
+    path.len = path_len;
+    return path;
+}
+
+export fn file_remote_open(uri: &const byte) !FileRemote {
+    const path: RepoPath = try file_remote_path_from_uri(uri);
+    if !repo_path_is_dir(&path) {
+        return error.FileRemotePathNotDirectory;
+    }
+
+    const repo_root: RepoPath = try repo_find_root(&path);
+    return FileRemote{
+        repo_root: repo_root,
+        config: try repo_read_config(&repo_root),
+    };
+}

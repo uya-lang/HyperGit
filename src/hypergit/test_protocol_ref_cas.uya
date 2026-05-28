@@ -1,0 +1,91 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
+use core.ids.commit_id_compare;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use object.types.ByteList;
+use protocol.ref_cas.RemoteRefCasRequest;
+use protocol.ref_cas.RemoteRefCasResponse;
+use protocol.ref_cas.decode_remote_ref_cas_request;
+use protocol.ref_cas.decode_remote_ref_cas_response;
+use protocol.ref_cas.encode_remote_ref_cas_request;
+use protocol.ref_cas.encode_remote_ref_cas_response;
+use protocol.ref_cas.remote_ref_cas_request_encoded_len;
+use protocol.ref_cas.remote_ref_cas_response_encoded_len;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn bytes_equal(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn test_remote_ref_cas_request_roundtrip() !void {
+    var ref_name_buf: [byte: 9] = ['r' as byte, 'e' as byte, 'f' as byte, 's' as byte, '/' as byte, 'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte];
+    const request: RemoteRefCasRequest = RemoteRefCasRequest{
+        ref_name: ByteList{ ptr: &ref_name_buf[0], len: 9 as usize },
+        expected_commit: commit_id_from_object(object_id_from_hash(make_hash(1 as byte))),
+        next_commit: commit_id_from_object(object_id_from_hash(make_hash(2 as byte))),
+    };
+
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+    try encode_remote_ref_cas_request(buf[0: 128], &offset, &request);
+    try expect(offset == remote_ref_cas_request_encoded_len(&request));
+
+    var read_offset: usize = 0;
+    const decoded: RemoteRefCasRequest = try decode_remote_ref_cas_request(buf[0: offset], &read_offset);
+    try expect(read_offset == offset);
+    try expect(bytes_equal(&decoded.ref_name, &request.ref_name));
+    try expect(commit_id_compare(&decoded.expected_commit, &request.expected_commit) == 0);
+    try expect(commit_id_compare(&decoded.next_commit, &request.next_commit) == 0);
+}
+
+fn test_remote_ref_cas_response_roundtrip() !void {
+    const response: RemoteRefCasResponse = RemoteRefCasResponse{
+        applied: true,
+        current_commit: commit_id_from_object(object_id_from_hash(make_hash(7 as byte))),
+    };
+
+    var buf: [byte: 64] = [];
+    var offset: usize = 0;
+    try encode_remote_ref_cas_response(buf[0: 64], &offset, &response);
+    try expect(offset == remote_ref_cas_response_encoded_len());
+
+    var read_offset: usize = 0;
+    const decoded: RemoteRefCasResponse = try decode_remote_ref_cas_response(buf[0: offset], &read_offset);
+    try expect(read_offset == offset);
+    try expect(decoded.applied);
+    try expect(commit_id_compare(&decoded.current_commit, &response.current_commit) == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Protocol Ref CAS Tests");
+    run_test("remote ref cas request roundtrip", test_remote_ref_cas_request_roundtrip);
+    run_test("remote ref cas response roundtrip", test_remote_ref_cas_response_roundtrip);
+    return test_suite_end();
+}

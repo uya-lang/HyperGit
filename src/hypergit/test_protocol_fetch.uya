@@ -1,0 +1,133 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PublishedViewId;
+use core.ids.HASH32_BYTES;
+use core.ids.commit_id_compare;
+use core.ids.manifest_id_compare;
+use core.ids.object_id_compare;
+use core.ids.published_view_id_compare;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use core.ids.manifest_id_from_object;
+use core.ids.published_view_id_from_hash;
+use object.types.ByteList;
+use object.types.CommitIdList;
+use object.types.PublishedView;
+use protocol.fetch.FetchBlobFilter;
+use protocol.fetch.FetchViewRequest;
+use protocol.fetch.FetchViewResponse;
+use protocol.fetch.decode_fetch_view_request;
+use protocol.fetch.decode_fetch_view_response;
+use protocol.fetch.encode_fetch_view_request;
+use protocol.fetch.encode_fetch_view_response;
+use protocol.fetch.fetch_view_request_encoded_len;
+use protocol.fetch.fetch_view_response_encoded_len;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn bytes_equal(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn test_fetch_view_request_roundtrip() !void {
+    var frontier: [CommitId: 2] = [
+        commit_id_from_object(object_id_from_hash(make_hash(1 as byte))),
+        commit_id_from_object(object_id_from_hash(make_hash(2 as byte))),
+    ];
+    var want_ref_buf: [byte: 4] = ['m' as byte, 'a' as byte, 'i' as byte, 'n' as byte];
+    var sparse_profile_buf: [byte: 12] = ['{' as byte, '}' as byte, '\n' as byte, 's' as byte, 'p' as byte, 'a' as byte, 'r' as byte, 's' as byte, 'e' as byte, '\n' as byte, '[' as byte, ']' as byte];
+    const request: FetchViewRequest = FetchViewRequest{
+        have_frontier: CommitIdList{ ptr: &frontier[0], len: 2 as usize },
+        want_ref: ByteList{ ptr: &want_ref_buf[0], len: 4 as usize },
+        sparse_profile: ByteList{ ptr: &sparse_profile_buf[0], len: 12 as usize },
+        blob_filter: FetchBlobFilter{
+            max_inline_blob_bytes: 8192u64,
+            allow_chunked_blobs: true,
+        },
+    };
+
+    var buf: [byte: 256] = [];
+    var offset: usize = 0;
+    try encode_fetch_view_request(buf[0: 256], &offset, &request);
+    try expect(offset == fetch_view_request_encoded_len(&request));
+
+    var arena_buf: [byte: 1024] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1024 as usize);
+
+    var read_offset: usize = 0;
+    const decoded: FetchViewRequest = try decode_fetch_view_request(&arena, buf[0: offset], &read_offset);
+    try expect(read_offset == offset);
+    try expect(decoded.have_frontier.len == 2 as usize);
+    try expect(commit_id_compare(&decoded.have_frontier.ptr[0], &frontier[0]) == 0);
+    try expect(commit_id_compare(&decoded.have_frontier.ptr[1], &frontier[1]) == 0);
+    try expect(bytes_equal(&decoded.want_ref, &request.want_ref));
+    try expect(bytes_equal(&decoded.sparse_profile, &request.sparse_profile));
+    try expect(decoded.blob_filter.max_inline_blob_bytes == 8192u64);
+    try expect(decoded.blob_filter.allow_chunked_blobs);
+}
+
+fn test_fetch_view_response_roundtrip() !void {
+    const response: FetchViewResponse = FetchViewResponse{
+        view_id: published_view_id_from_hash(make_hash(7 as byte)),
+        view: PublishedView{
+            head_commit: commit_id_from_object(object_id_from_hash(make_hash(10 as byte))),
+            manifest_root: manifest_id_from_object(object_id_from_hash(make_hash(11 as byte))),
+            serving_index_snapshot: object_id_from_hash(make_hash(12 as byte)),
+            lineage_watermark: 55u64,
+            dependency_watermark: 89u64,
+            created_at_ms: 1234567,
+        },
+    };
+
+    var buf: [byte: 256] = [];
+    var offset: usize = 0;
+    try encode_fetch_view_response(buf[0: 256], &offset, &response);
+    try expect(offset == fetch_view_response_encoded_len(&response));
+
+    var read_offset: usize = 0;
+    const decoded: FetchViewResponse = try decode_fetch_view_response(buf[0: offset], &read_offset);
+    try expect(read_offset == offset);
+    try expect(published_view_id_compare(&decoded.view_id, &response.view_id) == 0);
+    try expect(commit_id_compare(&decoded.view.head_commit, &response.view.head_commit) == 0);
+    try expect(manifest_id_compare(&decoded.view.manifest_root, &response.view.manifest_root) == 0);
+    try expect(object_id_compare(&decoded.view.serving_index_snapshot, &response.view.serving_index_snapshot) == 0);
+    try expect(decoded.view.lineage_watermark == 55u64);
+    try expect(decoded.view.dependency_watermark == 89u64);
+    try expect(decoded.view.created_at_ms == 1234567);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Protocol Fetch Tests");
+    run_test("fetch view request roundtrip", test_fetch_view_request_roundtrip);
+    run_test("fetch view response roundtrip", test_fetch_view_response_roundtrip);
+    return test_suite_end();
+}

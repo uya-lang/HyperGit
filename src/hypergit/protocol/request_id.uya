@@ -1,0 +1,37 @@
+export struct ProtocolRequestId {
+    value: u64
+}
+
+export struct ProtocolRequestIdAllocator {
+    next: atomic u64
+}
+
+export fn protocol_request_id_from_u64(value: u64) ProtocolRequestId {
+    return ProtocolRequestId{ value: value };
+}
+
+export fn protocol_request_id_raw(id: &ProtocolRequestId) u64 {
+    return id.value;
+}
+
+export fn protocol_request_id_compare(left: &ProtocolRequestId, right: &ProtocolRequestId) i32 {
+    if left.value < right.value {
+        return -1;
+    }
+    if left.value > right.value {
+        return 1;
+    }
+    return 0;
+}
+
+export fn protocol_request_id_allocator_init(seed: u64) ProtocolRequestIdAllocator {
+    return ProtocolRequestIdAllocator{
+        next: seed,
+    };
+}
+
+export fn protocol_request_id_allocator_next(allocator: &ProtocolRequestIdAllocator) ProtocolRequestId {
+    const current: u64 = allocator.next as u64;
+    allocator.next = current + 1u64;
+    return protocol_request_id_from_u64(current);
+}

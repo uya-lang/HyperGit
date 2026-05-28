@@ -1,0 +1,67 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
+use core.ids.commit_id_compare;
+use core.ids.manifest_id_compare;
+use core.ids.object_id_compare;
+use core.ids.published_view_id_compare;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use core.ids.manifest_id_from_object;
+use core.ids.published_view_id_from_hash;
+use object.types.PublishedView;
+use protocol.published_view.ProtocolPublishedView;
+use protocol.published_view.decode_protocol_published_view;
+use protocol.published_view.encode_protocol_published_view;
+use protocol.published_view.protocol_published_view_encoded_len;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn test_protocol_published_view_roundtrip() !void {
+    const value: ProtocolPublishedView = ProtocolPublishedView{
+        view_id: published_view_id_from_hash(make_hash(3 as byte)),
+        view: PublishedView{
+            head_commit: commit_id_from_object(object_id_from_hash(make_hash(4 as byte))),
+            manifest_root: manifest_id_from_object(object_id_from_hash(make_hash(5 as byte))),
+            serving_index_snapshot: object_id_from_hash(make_hash(6 as byte)),
+            lineage_watermark: 77u64,
+            dependency_watermark: 88u64,
+            created_at_ms: 999,
+        },
+    };
+
+    var buf: [byte: 256] = [];
+    var offset: usize = 0;
+    try encode_protocol_published_view(buf[0: 256], &offset, &value);
+    try expect(offset == protocol_published_view_encoded_len(&value));
+
+    var read_offset: usize = 0;
+    const decoded: ProtocolPublishedView = try decode_protocol_published_view(buf[0: offset], &read_offset);
+    try expect(read_offset == offset);
+    try expect(published_view_id_compare(&decoded.view_id, &value.view_id) == 0);
+    try expect(commit_id_compare(&decoded.view.head_commit, &value.view.head_commit) == 0);
+    try expect(manifest_id_compare(&decoded.view.manifest_root, &value.view.manifest_root) == 0);
+    try expect(object_id_compare(&decoded.view.serving_index_snapshot, &value.view.serving_index_snapshot) == 0);
+    try expect(decoded.view.lineage_watermark == 77u64);
+    try expect(decoded.view.dependency_watermark == 88u64);
+    try expect(decoded.view.created_at_ms == 999);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Protocol Published View Tests");
+    run_test("protocol published view roundtrip", test_protocol_published_view_roundtrip);
+    return test_suite_end();
+}

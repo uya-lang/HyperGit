@@ -1,0 +1,112 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.HASH32_BYTES;
+use core.ids.commit_id_compare;
+use core.ids.object_id_compare;
+use core.ids.object_id_from_hash;
+use core.ids.commit_id_from_object;
+use object.types.ByteList;
+use protocol.push.PushObjectRecord;
+use protocol.push.PushObjectRecordList;
+use protocol.push.PushObjectsRequest;
+use protocol.push.PushObjectsResponse;
+use protocol.push.decode_push_objects_request;
+use protocol.push.decode_push_objects_response;
+use protocol.push.encode_push_objects_request;
+use protocol.push.encode_push_objects_response;
+use protocol.push.push_objects_request_encoded_len;
+use protocol.push.push_objects_response_encoded_len;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn bytes_equal(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn test_push_objects_request_roundtrip() !void {
+    var bytes_a: [byte: 3] = ['a' as byte, '1' as byte, '\n' as byte];
+    var bytes_b: [byte: 4] = ['b' as byte, '2' as byte, '3' as byte, '\n' as byte];
+    var records: [PushObjectRecord: 2] = [
+        PushObjectRecord{
+            object_id: object_id_from_hash(make_hash(1 as byte)),
+            object_bytes: ByteList{ ptr: &bytes_a[0], len: 3 as usize },
+        },
+        PushObjectRecord{
+            object_id: object_id_from_hash(make_hash(2 as byte)),
+            object_bytes: ByteList{ ptr: &bytes_b[0], len: 4 as usize },
+        },
+    ];
+    var target_ref_buf: [byte: 10] = ['r' as byte, 'e' as byte, 'f' as byte, 's' as byte, '/' as byte, 'm' as byte, 'a' as byte, 'i' as byte, 'n' as byte, '\n' as byte];
+    const request: PushObjectsRequest = PushObjectsRequest{
+        objects: PushObjectRecordList{ ptr: &records[0], len: 2 as usize },
+        target_ref: ByteList{ ptr: &target_ref_buf[0], len: 10 as usize },
+        new_commit: commit_id_from_object(object_id_from_hash(make_hash(9 as byte))),
+    };
+
+    var buf: [byte: 256] = [];
+    var offset: usize = 0;
+    try encode_push_objects_request(buf[0: 256], &offset, &request);
+    try expect(offset == push_objects_request_encoded_len(&request));
+
+    var arena_buf: [byte: 1024] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1024 as usize);
+
+    var read_offset: usize = 0;
+    const decoded: PushObjectsRequest = try decode_push_objects_request(&arena, buf[0: offset], &read_offset);
+    try expect(read_offset == offset);
+    try expect(decoded.objects.len == 2 as usize);
+    try expect(object_id_compare(&decoded.objects.ptr[0].object_id, &records[0].object_id) == 0);
+    try expect(object_id_compare(&decoded.objects.ptr[1].object_id, &records[1].object_id) == 0);
+    try expect(bytes_equal(&decoded.objects.ptr[0].object_bytes, &records[0].object_bytes));
+    try expect(bytes_equal(&decoded.objects.ptr[1].object_bytes, &records[1].object_bytes));
+    try expect(bytes_equal(&decoded.target_ref, &request.target_ref));
+    try expect(commit_id_compare(&decoded.new_commit, &request.new_commit) == 0);
+}
+
+fn test_push_objects_response_roundtrip() !void {
+    const response: PushObjectsResponse = PushObjectsResponse{ accepted_objects: 2u64 };
+    var buf: [byte: 16] = [];
+    var offset: usize = 0;
+    try encode_push_objects_response(buf[0: 16], &offset, &response);
+    try expect(offset == push_objects_response_encoded_len(&response));
+
+    var read_offset: usize = 0;
+    const decoded: PushObjectsResponse = try decode_push_objects_response(buf[0: offset], &read_offset);
+    try expect(read_offset == offset);
+    try expect(decoded.accepted_objects == 2u64);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Protocol Push Tests");
+    run_test("push objects request roundtrip", test_push_objects_request_roundtrip);
+    run_test("push objects response roundtrip", test_push_objects_response_roundtrip);
+    return test_suite_end();
+}

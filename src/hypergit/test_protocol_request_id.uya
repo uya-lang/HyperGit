@@ -1,0 +1,38 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use protocol.request_id.ProtocolRequestId;
+use protocol.request_id.ProtocolRequestIdAllocator;
+use protocol.request_id.protocol_request_id_allocator_init;
+use protocol.request_id.protocol_request_id_allocator_next;
+use protocol.request_id.protocol_request_id_compare;
+use protocol.request_id.protocol_request_id_from_u64;
+use protocol.request_id.protocol_request_id_raw;
+
+fn test_protocol_request_id_roundtrip() !void {
+    const request_id: ProtocolRequestId = protocol_request_id_from_u64(4096u64);
+    try expect(protocol_request_id_raw(&request_id) == 4096u64);
+}
+
+fn test_protocol_request_id_allocator_is_monotonic() !void {
+    var allocator: ProtocolRequestIdAllocator = protocol_request_id_allocator_init(100u64);
+    const first: ProtocolRequestId = protocol_request_id_allocator_next(&allocator);
+    const second: ProtocolRequestId = protocol_request_id_allocator_next(&allocator);
+    const third: ProtocolRequestId = protocol_request_id_allocator_next(&allocator);
+
+    try expect(protocol_request_id_raw(&first) == 100u64);
+    try expect(protocol_request_id_raw(&second) == 101u64);
+    try expect(protocol_request_id_raw(&third) == 102u64);
+    try expect(protocol_request_id_compare(&first, &second) < 0);
+    try expect(protocol_request_id_compare(&second, &third) < 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Protocol Request ID Tests");
+    run_test("protocol request id roundtrip", test_protocol_request_id_roundtrip);
+    run_test("protocol request id allocator is monotonic", test_protocol_request_id_allocator_is_monotonic);
+    return test_suite_end();
+}

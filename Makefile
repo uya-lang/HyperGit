@@ -32,6 +32,12 @@ test:
 	$(UYA) test src/hypergit/test_exec_queue.uya
 	$(UYA) test src/hypergit/test_exec_control.uya
 	$(UYA) test src/hypergit/test_exec_worker_pool.uya
+	$(UYA) test src/hypergit/test_protocol_frame.uya
+	$(UYA) test src/hypergit/test_protocol_request_id.uya
+	$(UYA) test src/hypergit/test_protocol_fetch.uya
+	$(UYA) test src/hypergit/test_protocol_push.uya
+	$(UYA) test src/hypergit/test_protocol_ref_cas.uya
+	$(UYA) test src/hypergit/test_protocol_published_view.uya
 	$(UYA) test src/hypergit/test_merge_planner.uya
 	$(UYA) test src/hypergit/test_merge_text_merge.uya
 	$(UYA) test src/hypergit/test_merge_result_manifest.uya
@@ -58,6 +64,7 @@ test:
 	$(UYA) test src/hypergit/test_checkout_plan.uya
 	$(UYA) test src/hgx/test_repo_layout.uya
 	$(UYA) test src/hgx/test_head_ref.uya
+	$(UYA) test src/hgx/test_file_remote.uya
 	$(UYA) test src/hgx/test_hydrate_missing_object.uya
 	$(UYA) test src/hgx/test_commit_partial_stage.uya
 	$(UYA) test src/hgx/test_cli_args.uya

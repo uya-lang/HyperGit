@@ -1,0 +1,172 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.codec.ByteSpan;
+use core.codec.codec_decode_bytes;
+use core.codec.codec_decode_u8;
+use core.codec.codec_decode_varuint;
+use core.codec.codec_encode_bytes;
+use core.codec.codec_encode_u8;
+use core.codec.codec_encode_varuint;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.PublishedViewId;
+use core.ids.HASH32_BYTES;
+use object.codec.decode_published_view_payload;
+use object.codec.encode_published_view_payload;
+use object.codec.published_view_payload_encoded_len;
+use object.types.ByteList;
+use object.types.CommitIdList;
+use object.types.PublishedView;
+
+error FetchProtocolAlloc;
+error FetchProtocolUnexpectedEof;
+
+export struct FetchBlobFilter {
+    max_inline_blob_bytes: u64,
+    allow_chunked_blobs: bool
+}
+
+export struct FetchViewRequest {
+    have_frontier: CommitIdList,
+    want_ref: ByteList,
+    sparse_profile: ByteList,
+    blob_filter: FetchBlobFilter
+}
+
+export struct FetchViewResponse {
+    view_id: PublishedViewId,
+    view: PublishedView
+}
+
+fn fetch_varuint_encoded_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1;
+    while temp >= 128u64 {
+        temp = temp >> 7;
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn fetch_encode_hash32(output: &[byte], offset: &usize, hash: &Hash32) !void {
+    if *offset + HASH32_BYTES > output.len {
+        return error.FetchProtocolUnexpectedEof;
+    }
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        output.ptr[*offset + i] = hash.bytes[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+}
+
+fn fetch_decode_hash32(input: &[byte], offset: &usize) !Hash32 {
+    if *offset + HASH32_BYTES > input.len {
+        return error.FetchProtocolUnexpectedEof;
+    }
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = input.ptr[*offset + i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+    return hash;
+}
+
+fn fetch_encode_commit_id(output: &[byte], offset: &usize, commit_id: &CommitId) !void {
+    return fetch_encode_hash32(output, offset, &commit_id.id.hash);
+}
+
+fn fetch_decode_commit_id(input: &[byte], offset: &usize) !CommitId {
+    return CommitId{
+        id: ObjectId{
+            hash: try fetch_decode_hash32(input, offset),
+        },
+    };
+}
+
+fn fetch_encode_published_view_id(output: &[byte], offset: &usize, view_id: &PublishedViewId) !void {
+    return fetch_encode_hash32(output, offset, &view_id.hash);
+}
+
+fn fetch_decode_published_view_id(input: &[byte], offset: &usize) !PublishedViewId {
+    return PublishedViewId{
+        hash: try fetch_decode_hash32(input, offset),
+    };
+}
+
+export fn fetch_view_request_encoded_len(request: &FetchViewRequest) usize {
+    return fetch_varuint_encoded_len(request.have_frontier.len as u64) +
+        request.have_frontier.len * HASH32_BYTES +
+        fetch_varuint_encoded_len(request.want_ref.len as u64) +
+        request.want_ref.len +
+        fetch_varuint_encoded_len(request.sparse_profile.len as u64) +
+        request.sparse_profile.len +
+        fetch_varuint_encoded_len(request.blob_filter.max_inline_blob_bytes) +
+        1 as usize;
+}
+
+export fn encode_fetch_view_request(output: &[byte], offset: &usize, request: &FetchViewRequest) !void {
+    try codec_encode_varuint(output, offset, request.have_frontier.len as u64);
+    var i: usize = 0;
+    while i < request.have_frontier.len {
+        try fetch_encode_commit_id(output, offset, &request.have_frontier.ptr[i]);
+        i = i + 1 as usize;
+    }
+
+    try codec_encode_bytes(output, offset, request.want_ref.ptr[0: request.want_ref.len]);
+    try codec_encode_bytes(output, offset, request.sparse_profile.ptr[0: request.sparse_profile.len]);
+    try codec_encode_varuint(output, offset, request.blob_filter.max_inline_blob_bytes);
+    var allow_chunked: byte = 0 as byte;
+    if request.blob_filter.allow_chunked_blobs {
+        allow_chunked = 1 as byte;
+    }
+    try codec_encode_u8(output, offset, allow_chunked);
+}
+
+export fn decode_fetch_view_request(arena: &Arena, input: &[byte], offset: &usize) !FetchViewRequest {
+    const frontier_len: usize = (try codec_decode_varuint(input, offset)) as usize;
+    var raw_frontier: &CommitId = null;
+    if frontier_len > 0 as usize {
+        raw_frontier = arena_alloc(arena, @size_of(CommitId) as usize * frontier_len) as &CommitId;
+        if raw_frontier == null {
+            return error.FetchProtocolAlloc;
+        }
+        var i: usize = 0;
+        while i < frontier_len {
+            raw_frontier[i] = try fetch_decode_commit_id(input, offset);
+            i = i + 1 as usize;
+        }
+    }
+
+    const want_ref: ByteSpan = try codec_decode_bytes(input, offset);
+    const sparse_profile: ByteSpan = try codec_decode_bytes(input, offset);
+    return FetchViewRequest{
+        have_frontier: CommitIdList{ ptr: raw_frontier, len: frontier_len },
+        want_ref: ByteList{ ptr: want_ref.ptr, len: want_ref.len },
+        sparse_profile: ByteList{ ptr: sparse_profile.ptr, len: sparse_profile.len },
+        blob_filter: FetchBlobFilter{
+            max_inline_blob_bytes: try codec_decode_varuint(input, offset),
+            allow_chunked_blobs: (try codec_decode_u8(input, offset)) != 0 as byte,
+        },
+    };
+}
+
+export fn fetch_view_response_encoded_len(response: &FetchViewResponse) usize {
+    return HASH32_BYTES + published_view_payload_encoded_len(&response.view);
+}
+
+export fn encode_fetch_view_response(output: &[byte], offset: &usize, response: &FetchViewResponse) !void {
+    try fetch_encode_published_view_id(output, offset, &response.view_id);
+    try encode_published_view_payload(output, offset, &response.view);
+}
+
+export fn decode_fetch_view_response(input: &[byte], offset: &usize) !FetchViewResponse {
+    return FetchViewResponse{
+        view_id: try fetch_decode_published_view_id(input, offset),
+        view: try decode_published_view_payload(input, offset),
+    };
+}

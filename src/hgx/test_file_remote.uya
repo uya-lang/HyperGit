@@ -1,0 +1,108 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use libc.chdir;
+use libc.system;
+use store.file_remote.FileRemote;
+use store.file_remote.file_remote_open;
+use store.repo_layout.REPO_PATH_MAX;
+use store.repo_layout.RepoInitResult;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_current_dir;
+use store.repo_layout.repo_init_current_dir;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_equal;
+
+const FILE_URI_EXTRA_MAX: usize = 64;
+
+struct UriBuffer {
+    bytes: [byte: REPO_PATH_MAX + FILE_URI_EXTRA_MAX] = [],
+    len: usize = 0
+}
+
+fn uri_buffer_from_root(root: &RepoPath, prefix: &const byte, suffix: &const byte) UriBuffer {
+    var uri: UriBuffer = UriBuffer{ bytes: [], len: 0 };
+
+    var i: usize = 0;
+    while prefix[i] != 0 as byte {
+        uri.bytes[uri.len] = prefix[i];
+        uri.len = uri.len + 1 as usize;
+        i = i + 1 as usize;
+    }
+
+    i = 0;
+    while i < root.len {
+        uri.bytes[uri.len] = root.bytes[i];
+        uri.len = uri.len + 1 as usize;
+        i = i + 1 as usize;
+    }
+
+    i = 0;
+    while suffix[i] != 0 as byte {
+        uri.bytes[uri.len] = suffix[i];
+        uri.len = uri.len + 1 as usize;
+        i = i + 1 as usize;
+    }
+
+    uri.bytes[uri.len] = 0 as byte;
+    return uri;
+}
+
+fn test_file_remote_open_accepts_repo_root_and_nested_dir() !void {
+    const setup_status: i32 = system("rm -rf build/file-remote-test && mkdir -p build/file-remote-test/repo");
+    try expect(setup_status == 0);
+
+    const original_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("build/file-remote-test/repo") == 0);
+    const init_result: RepoInitResult = try repo_init_current_dir();
+    try expect(system("mkdir -p nested/inside") == 0);
+
+    const direct_uri: UriBuffer = uri_buffer_from_root(&init_result.repo_root, "file://", "");
+    const direct_remote: FileRemote = try file_remote_open(&direct_uri.bytes[0] as &const byte);
+    try expect(repo_path_equal(&direct_remote.repo_root, &init_result.repo_root));
+    try expect(direct_remote.config.default_branch_len == 4 as usize);
+
+    const nested_uri: UriBuffer = uri_buffer_from_root(&init_result.repo_root, "file://localhost", "/nested/inside");
+    const nested_remote: FileRemote = try file_remote_open(&nested_uri.bytes[0] as &const byte);
+    try expect(repo_path_equal(&nested_remote.repo_root, &init_result.repo_root));
+
+    try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
+}
+
+fn test_file_remote_rejects_invalid_scheme() !void {
+    const remote: FileRemote = file_remote_open("https://example.com/repo") catch |err| {
+        try expect(@error_id(err) == @error_id(error.FileRemoteInvalidUri));
+        return;
+    };
+    _ = remote;
+    return error.AssertionFailed;
+}
+
+fn test_file_remote_rejects_non_directory_path() !void {
+    const setup_status: i32 = system("rm -rf build/file-remote-missing && mkdir -p build/file-remote-missing");
+    try expect(setup_status == 0);
+
+    const original_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("build/file-remote-missing") == 0);
+    const cwd: RepoPath = try repo_current_dir();
+    const missing_uri: UriBuffer = uri_buffer_from_root(&cwd, "file://", "/missing");
+
+    const remote: FileRemote = file_remote_open(&missing_uri.bytes[0] as &const byte) catch |err| {
+        try expect(@error_id(err) == @error_id(error.FileRemotePathNotDirectory));
+        try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
+        return;
+    };
+    _ = remote;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit File Remote Tests");
+    run_test("file remote open accepts repo root and nested dir", test_file_remote_open_accepts_repo_root_and_nested_dir);
+    run_test("file remote rejects invalid scheme", test_file_remote_rejects_invalid_scheme);
+    run_test("file remote rejects non-directory path", test_file_remote_rejects_non_directory_path);
+    return test_suite_end();
+}

@@ -1,0 +1,161 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use core.codec.ByteSpan;
+use core.codec.codec_decode_bytes;
+use core.codec.codec_decode_varuint;
+use core.codec.codec_encode_bytes;
+use core.codec.codec_encode_varuint;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.HASH32_BYTES;
+use object.types.ByteList;
+
+error PushProtocolAlloc;
+error PushProtocolUnexpectedEof;
+
+export struct PushObjectRecord {
+    object_id: ObjectId,
+    object_bytes: ByteList
+}
+
+export struct PushObjectRecordList {
+    ptr: &PushObjectRecord,
+    len: usize
+}
+
+export struct PushObjectsRequest {
+    objects: PushObjectRecordList,
+    target_ref: ByteList,
+    new_commit: CommitId
+}
+
+export struct PushObjectsResponse {
+    accepted_objects: u64
+}
+
+fn push_varuint_encoded_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1;
+    while temp >= 128u64 {
+        temp = temp >> 7;
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn push_encode_hash32(output: &[byte], offset: &usize, hash: &Hash32) !void {
+    if *offset + HASH32_BYTES > output.len {
+        return error.PushProtocolUnexpectedEof;
+    }
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        output.ptr[*offset + i] = hash.bytes[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+}
+
+fn push_decode_hash32(input: &[byte], offset: &usize) !Hash32 {
+    if *offset + HASH32_BYTES > input.len {
+        return error.PushProtocolUnexpectedEof;
+    }
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = input.ptr[*offset + i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+    return hash;
+}
+
+fn push_encode_object_id(output: &[byte], offset: &usize, object_id: &ObjectId) !void {
+    return push_encode_hash32(output, offset, &object_id.hash);
+}
+
+fn push_decode_object_id(input: &[byte], offset: &usize) !ObjectId {
+    return ObjectId{
+        hash: try push_decode_hash32(input, offset),
+    };
+}
+
+fn push_encode_commit_id(output: &[byte], offset: &usize, commit_id: &CommitId) !void {
+    return push_encode_object_id(output, offset, &commit_id.id);
+}
+
+fn push_decode_commit_id(input: &[byte], offset: &usize) !CommitId {
+    return CommitId{
+        id: try push_decode_object_id(input, offset),
+    };
+}
+
+export fn push_objects_request_encoded_len(request: &PushObjectsRequest) usize {
+    var total: usize = push_varuint_encoded_len(request.objects.len as u64);
+    var i: usize = 0;
+    while i < request.objects.len {
+        total = total +
+            HASH32_BYTES +
+            push_varuint_encoded_len(request.objects.ptr[i].object_bytes.len as u64) +
+            request.objects.ptr[i].object_bytes.len;
+        i = i + 1 as usize;
+    }
+    return total +
+        push_varuint_encoded_len(request.target_ref.len as u64) +
+        request.target_ref.len +
+        HASH32_BYTES;
+}
+
+export fn encode_push_objects_request(output: &[byte], offset: &usize, request: &PushObjectsRequest) !void {
+    try codec_encode_varuint(output, offset, request.objects.len as u64);
+    var i: usize = 0;
+    while i < request.objects.len {
+        const record: &PushObjectRecord = &request.objects.ptr[i];
+        try push_encode_object_id(output, offset, &record.object_id);
+        try codec_encode_bytes(output, offset, record.object_bytes.ptr[0: record.object_bytes.len]);
+        i = i + 1 as usize;
+    }
+    try codec_encode_bytes(output, offset, request.target_ref.ptr[0: request.target_ref.len]);
+    try push_encode_commit_id(output, offset, &request.new_commit);
+}
+
+export fn decode_push_objects_request(arena: &Arena, input: &[byte], offset: &usize) !PushObjectsRequest {
+    const object_len: usize = (try codec_decode_varuint(input, offset)) as usize;
+    var raw_records: &PushObjectRecord = null;
+    if object_len > 0 as usize {
+        raw_records = arena_alloc(arena, @size_of(PushObjectRecord) as usize * object_len) as &PushObjectRecord;
+        if raw_records == null {
+            return error.PushProtocolAlloc;
+        }
+
+        var i: usize = 0;
+        while i < object_len {
+            raw_records[i].object_id = try push_decode_object_id(input, offset);
+            const object_bytes: ByteSpan = try codec_decode_bytes(input, offset);
+            raw_records[i].object_bytes = ByteList{ ptr: object_bytes.ptr, len: object_bytes.len };
+            i = i + 1 as usize;
+        }
+    }
+
+    const target_ref: ByteSpan = try codec_decode_bytes(input, offset);
+    return PushObjectsRequest{
+        objects: PushObjectRecordList{ ptr: raw_records, len: object_len },
+        target_ref: ByteList{ ptr: target_ref.ptr, len: target_ref.len },
+        new_commit: try push_decode_commit_id(input, offset),
+    };
+}
+
+export fn push_objects_response_encoded_len(response: &PushObjectsResponse) usize {
+    return push_varuint_encoded_len(response.accepted_objects);
+}
+
+export fn encode_push_objects_response(output: &[byte], offset: &usize, response: &PushObjectsResponse) !void {
+    try codec_encode_varuint(output, offset, response.accepted_objects);
+}
+
+export fn decode_push_objects_response(input: &[byte], offset: &usize) !PushObjectsResponse {
+    return PushObjectsResponse{
+        accepted_objects: try codec_decode_varuint(input, offset),
+    };
+}

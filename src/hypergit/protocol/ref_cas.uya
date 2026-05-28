@@ -1,0 +1,100 @@
+use core.codec.ByteSpan;
+use core.codec.codec_decode_bytes;
+use core.codec.codec_decode_u8;
+use core.codec.codec_encode_bytes;
+use core.codec.codec_encode_u8;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.HASH32_BYTES;
+use object.types.ByteList;
+
+error RemoteRefCasUnexpectedEof;
+
+export struct RemoteRefCasRequest {
+    ref_name: ByteList,
+    expected_commit: CommitId,
+    next_commit: CommitId
+}
+
+export struct RemoteRefCasResponse {
+    applied: bool,
+    current_commit: CommitId
+}
+
+fn ref_cas_encode_hash32(output: &[byte], offset: &usize, hash: &Hash32) !void {
+    if *offset + HASH32_BYTES > output.len {
+        return error.RemoteRefCasUnexpectedEof;
+    }
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        output.ptr[*offset + i] = hash.bytes[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+}
+
+fn ref_cas_decode_hash32(input: &[byte], offset: &usize) !Hash32 {
+    if *offset + HASH32_BYTES > input.len {
+        return error.RemoteRefCasUnexpectedEof;
+    }
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        hash.bytes[i] = input.ptr[*offset + i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+    return hash;
+}
+
+fn ref_cas_encode_commit_id(output: &[byte], offset: &usize, commit_id: &CommitId) !void {
+    return ref_cas_encode_hash32(output, offset, &commit_id.id.hash);
+}
+
+fn ref_cas_decode_commit_id(input: &[byte], offset: &usize) !CommitId {
+    return CommitId{
+        id: ObjectId{
+            hash: try ref_cas_decode_hash32(input, offset),
+        },
+    };
+}
+
+export fn remote_ref_cas_request_encoded_len(request: &RemoteRefCasRequest) usize {
+    return 1 as usize + request.ref_name.len + HASH32_BYTES + HASH32_BYTES;
+}
+
+export fn encode_remote_ref_cas_request(output: &[byte], offset: &usize, request: &RemoteRefCasRequest) !void {
+    try codec_encode_bytes(output, offset, request.ref_name.ptr[0: request.ref_name.len]);
+    try ref_cas_encode_commit_id(output, offset, &request.expected_commit);
+    try ref_cas_encode_commit_id(output, offset, &request.next_commit);
+}
+
+export fn decode_remote_ref_cas_request(input: &[byte], offset: &usize) !RemoteRefCasRequest {
+    const ref_name: ByteSpan = try codec_decode_bytes(input, offset);
+    return RemoteRefCasRequest{
+        ref_name: ByteList{ ptr: ref_name.ptr, len: ref_name.len },
+        expected_commit: try ref_cas_decode_commit_id(input, offset),
+        next_commit: try ref_cas_decode_commit_id(input, offset),
+    };
+}
+
+export fn remote_ref_cas_response_encoded_len() usize {
+    return 1 as usize + HASH32_BYTES;
+}
+
+export fn encode_remote_ref_cas_response(output: &[byte], offset: &usize, response: &RemoteRefCasResponse) !void {
+    var applied: byte = 0 as byte;
+    if response.applied {
+        applied = 1 as byte;
+    }
+    try codec_encode_u8(output, offset, applied);
+    try ref_cas_encode_commit_id(output, offset, &response.current_commit);
+}
+
+export fn decode_remote_ref_cas_response(input: &[byte], offset: &usize) !RemoteRefCasResponse {
+    return RemoteRefCasResponse{
+        applied: (try codec_decode_u8(input, offset)) != 0 as byte,
+        current_commit: try ref_cas_decode_commit_id(input, offset),
+    };
+}

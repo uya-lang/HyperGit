@@ -1,0 +1,161 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use core.codec.ByteSpan;
+use core.codec.byte_span_from_slice;
+use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
+use core.ids.hash32_compare;
+use protocol.frame.ProtocolFrame;
+use protocol.frame.PROTOCOL_FRAME_MAGIC;
+use protocol.frame.PROTOCOL_FRAME_VERSION;
+use protocol.frame.PROTOCOL_FRAME_CHECKSUM_BYTES;
+use protocol.frame.PROTOCOL_FRAME_MAGIC_OFFSET;
+use protocol.frame.PROTOCOL_FRAME_VERSION_OFFSET;
+use protocol.frame.PROTOCOL_FRAME_KIND_OFFSET;
+use protocol.frame.PROTOCOL_FRAME_REQUEST_ID_OFFSET;
+use protocol.frame.PROTOCOL_FRAME_PAYLOAD_LEN_OFFSET;
+use protocol.frame.PROTOCOL_FRAME_CHECKSUM_OFFSET;
+use protocol.frame.PROTOCOL_FRAME_HEADER_BYTES;
+use protocol.frame.ProtocolFrameHeader;
+use protocol.frame.protocol_frame_decode;
+use protocol.frame.protocol_frame_encode;
+use protocol.frame.protocol_frame_encoded_len;
+use protocol.frame.protocol_frame_checksum;
+use protocol.frame.protocol_frame_header_init;
+use protocol.request_id.protocol_request_id_from_u64;
+use protocol.request_id.protocol_request_id_raw;
+
+fn make_checksum() Hash32 {
+    var checksum: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        checksum.bytes[i] = (i as byte) + 1 as byte;
+        i = i + 1 as usize;
+    }
+    return checksum;
+}
+
+fn bytes_equal(left: ByteSpan, right: ByteSpan) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn test_protocol_frame_header_init_sets_stable_defaults() !void {
+    const checksum: Hash32 = make_checksum();
+    const header: ProtocolFrameHeader = protocol_frame_header_init(7 as u16, protocol_request_id_from_u64(42u64), 8192u64, checksum);
+
+    try expect(header.magic == PROTOCOL_FRAME_MAGIC);
+    try expect(header.version == PROTOCOL_FRAME_VERSION);
+    try expect(header.kind == 7 as u16);
+    try expect(protocol_request_id_raw(&header.request_id) == 42u64);
+    try expect(header.payload_len == 8192u64);
+    try expect(hash32_compare(&header.checksum, &checksum) == 0);
+}
+
+fn test_protocol_frame_header_layout_offsets_are_frozen() !void {
+    try expect(PROTOCOL_FRAME_MAGIC_OFFSET == 0 as usize);
+    try expect(PROTOCOL_FRAME_VERSION_OFFSET == 4 as usize);
+    try expect(PROTOCOL_FRAME_KIND_OFFSET == 6 as usize);
+    try expect(PROTOCOL_FRAME_REQUEST_ID_OFFSET == 8 as usize);
+    try expect(PROTOCOL_FRAME_PAYLOAD_LEN_OFFSET == 16 as usize);
+    try expect(PROTOCOL_FRAME_CHECKSUM_OFFSET == 24 as usize);
+    try expect(PROTOCOL_FRAME_CHECKSUM_BYTES == HASH32_BYTES);
+    try expect(PROTOCOL_FRAME_HEADER_BYTES == 56 as usize);
+}
+
+fn test_protocol_frame_encode_decode_roundtrip() !void {
+    var payload: [byte: 5] = ['f' as byte, 'e' as byte, 't' as byte, 'c' as byte, 'h' as byte];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+
+    try protocol_frame_encode(buf[0: 128], &offset, 3 as u16, protocol_request_id_from_u64(77u64), payload[0: 5]);
+    try expect(offset == protocol_frame_encoded_len(5 as usize));
+
+    var read_offset: usize = 0;
+    const decoded: ProtocolFrame = try protocol_frame_decode(buf[0: offset], &read_offset);
+    const checksum: Hash32 = protocol_frame_checksum(payload[0: 5]);
+    try expect(read_offset == offset);
+    try expect(decoded.header.kind == 3 as u16);
+    try expect(protocol_request_id_raw(&decoded.header.request_id) == 77u64);
+    try expect(decoded.header.payload_len == 5u64);
+    try expect(hash32_compare(&decoded.header.checksum, &checksum) == 0);
+    try expect(bytes_equal(decoded.payload, byte_span_from_slice(payload[0: 5])));
+}
+
+fn test_protocol_frame_decode_rejects_bad_magic() !void {
+    var payload: [byte: 4] = ['p' as byte, 'u' as byte, 's' as byte, 'h' as byte];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+    try protocol_frame_encode(buf[0: 128], &offset, 9 as u16, protocol_request_id_from_u64(5u64), payload[0: 4]);
+
+    buf[0] = buf[0] ^ 1 as byte;
+    var read_offset: usize = 0;
+    const decoded: ProtocolFrame = protocol_frame_decode(buf[0: offset], &read_offset) catch |err| {
+        try expect(@error_id(err) == @error_id(error.ProtocolFrameInvalidMagic));
+        return;
+    };
+    _ = decoded;
+    return error.AssertionFailed;
+}
+
+fn test_protocol_frame_decode_rejects_truncated_payload() !void {
+    var payload: [byte: 6] = ['o' as byte, 'b' as byte, 'j' as byte, 'e' as byte, 'c' as byte, 't' as byte];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+    try protocol_frame_encode(buf[0: 128], &offset, 11 as u16, protocol_request_id_from_u64(6u64), payload[0: 6]);
+
+    var read_offset: usize = 0;
+    const decoded: ProtocolFrame = protocol_frame_decode(buf[0: offset - 1 as usize], &read_offset) catch |err| {
+        try expect(@error_id(err) == @error_id(error.ProtocolFrameUnexpectedEof));
+        return;
+    };
+    _ = decoded;
+    return error.AssertionFailed;
+}
+
+fn test_protocol_frame_decode_rejects_checksum_mismatch() !void {
+    var payload: [byte: 6] = ['r' as byte, 'e' as byte, 'm' as byte, 'o' as byte, 't' as byte, 'e' as byte];
+    var buf: [byte: 128] = [];
+    var offset: usize = 0;
+    try protocol_frame_encode(buf[0: 128], &offset, 13 as u16, protocol_request_id_from_u64(8u64), payload[0: 6]);
+
+    if offset == 0 as usize || offset > 128 as usize {
+        return error.AssertionFailed;
+    }
+    const last_index: usize = offset - 1 as usize;
+    if last_index >= 128 as usize {
+        return error.AssertionFailed;
+    }
+    buf[last_index] = buf[last_index] ^ 1 as byte;
+    var read_offset: usize = 0;
+    const decoded: ProtocolFrame = protocol_frame_decode(buf[0: offset], &read_offset) catch |err| {
+        try expect(@error_id(err) == @error_id(error.ProtocolFrameChecksumMismatch));
+        return;
+    };
+    _ = decoded;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Protocol Frame Tests");
+    run_test("protocol frame header init sets stable defaults", test_protocol_frame_header_init_sets_stable_defaults);
+    run_test("protocol frame header layout offsets are frozen", test_protocol_frame_header_layout_offsets_are_frozen);
+    run_test("protocol frame encode decode roundtrip", test_protocol_frame_encode_decode_roundtrip);
+    run_test("protocol frame decode rejects bad magic", test_protocol_frame_decode_rejects_bad_magic);
+    run_test("protocol frame decode rejects truncated payload", test_protocol_frame_decode_rejects_truncated_payload);
+    run_test("protocol frame decode rejects checksum mismatch", test_protocol_frame_decode_rejects_checksum_mismatch);
+    return test_suite_end();
+}

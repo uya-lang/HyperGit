@@ -1,0 +1,181 @@
+use std.crypto.blake3.blake3_digest;
+
+use core.codec.ByteSpan;
+use core.codec.codec_decode_u16;
+use core.codec.codec_decode_u32;
+use core.codec.codec_decode_u64;
+use core.codec.codec_encode_u16;
+use core.codec.codec_encode_u32;
+use core.codec.codec_encode_u64;
+use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
+use core.ids.hash32_compare;
+use protocol.request_id.ProtocolRequestId;
+use protocol.request_id.protocol_request_id_from_u64;
+use protocol.request_id.protocol_request_id_raw;
+
+export error ProtocolFrameUnexpectedEof;
+export error ProtocolFrameInvalidMagic;
+export error ProtocolFrameUnsupportedVersion;
+export error ProtocolFrameBufferTooSmall;
+export error ProtocolFrameChecksumMismatch;
+
+export const PROTOCOL_FRAME_MAGIC: u32 = 0x31464748u32;
+export const PROTOCOL_FRAME_VERSION: u16 = 1u16;
+export const PROTOCOL_FRAME_MAGIC_BYTES: usize = 4;
+export const PROTOCOL_FRAME_VERSION_BYTES: usize = 2;
+export const PROTOCOL_FRAME_KIND_BYTES: usize = 2;
+export const PROTOCOL_FRAME_REQUEST_ID_BYTES: usize = 8;
+export const PROTOCOL_FRAME_PAYLOAD_LEN_BYTES: usize = 8;
+export const PROTOCOL_FRAME_CHECKSUM_BYTES: usize = HASH32_BYTES;
+
+export const PROTOCOL_FRAME_MAGIC_OFFSET: usize = 0;
+export const PROTOCOL_FRAME_VERSION_OFFSET: usize = PROTOCOL_FRAME_MAGIC_OFFSET + PROTOCOL_FRAME_MAGIC_BYTES;
+export const PROTOCOL_FRAME_KIND_OFFSET: usize = PROTOCOL_FRAME_VERSION_OFFSET + PROTOCOL_FRAME_VERSION_BYTES;
+export const PROTOCOL_FRAME_REQUEST_ID_OFFSET: usize = PROTOCOL_FRAME_KIND_OFFSET + PROTOCOL_FRAME_KIND_BYTES;
+export const PROTOCOL_FRAME_PAYLOAD_LEN_OFFSET: usize = PROTOCOL_FRAME_REQUEST_ID_OFFSET + PROTOCOL_FRAME_REQUEST_ID_BYTES;
+export const PROTOCOL_FRAME_CHECKSUM_OFFSET: usize = PROTOCOL_FRAME_PAYLOAD_LEN_OFFSET + PROTOCOL_FRAME_PAYLOAD_LEN_BYTES;
+export const PROTOCOL_FRAME_HEADER_BYTES: usize = PROTOCOL_FRAME_CHECKSUM_OFFSET + PROTOCOL_FRAME_CHECKSUM_BYTES;
+
+export struct ProtocolFrameHeader {
+    magic: u32,
+    version: u16,
+    kind: u16,
+    request_id: ProtocolRequestId,
+    payload_len: u64,
+    checksum: Hash32
+}
+
+export struct ProtocolFrame {
+    header: ProtocolFrameHeader,
+    payload: ByteSpan
+}
+
+export fn protocol_frame_header_init(
+    kind: u16,
+    request_id: ProtocolRequestId,
+    payload_len: u64,
+    checksum: Hash32,
+) ProtocolFrameHeader {
+    return ProtocolFrameHeader{
+        magic: PROTOCOL_FRAME_MAGIC,
+        version: PROTOCOL_FRAME_VERSION,
+        kind: kind,
+        request_id: request_id,
+        payload_len: payload_len,
+        checksum: checksum,
+    };
+}
+
+fn protocol_frame_ensure_read(input: &[byte], offset: usize, need: usize) !void {
+    if offset + need > input.len {
+        return error.ProtocolFrameUnexpectedEof;
+    }
+}
+
+fn protocol_frame_ensure_write(output: &[byte], offset: usize, need: usize) !void {
+    if offset + need > output.len {
+        return error.ProtocolFrameBufferTooSmall;
+    }
+}
+
+fn protocol_frame_encode_checksum(output: &[byte], offset: &usize, checksum: &Hash32) !void {
+    try protocol_frame_ensure_write(output, *offset, HASH32_BYTES);
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        output.ptr[*offset + i] = checksum.bytes[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+}
+
+fn protocol_frame_decode_checksum(input: &[byte], offset: &usize) !Hash32 {
+    try protocol_frame_ensure_read(input, *offset, HASH32_BYTES);
+    var checksum: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < HASH32_BYTES {
+        checksum.bytes[i] = input.ptr[*offset + i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + HASH32_BYTES;
+    return checksum;
+}
+
+export fn protocol_frame_encoded_len(payload_len: usize) usize {
+    return PROTOCOL_FRAME_HEADER_BYTES + payload_len;
+}
+
+export fn protocol_frame_checksum(payload: &[byte]) Hash32 {
+    var checksum: Hash32 = Hash32{ bytes: [] };
+    blake3_digest(payload, checksum.bytes[0: HASH32_BYTES]);
+    return checksum;
+}
+
+export fn protocol_frame_verify_checksum(header: &ProtocolFrameHeader, payload: ByteSpan) !void {
+    const actual: Hash32 = protocol_frame_checksum(payload.ptr[0: payload.len]);
+    if hash32_compare(&header.checksum, &actual) != 0 {
+        return error.ProtocolFrameChecksumMismatch;
+    }
+}
+
+export fn protocol_frame_header_encode(output: &[byte], offset: &usize, header: &ProtocolFrameHeader) !void {
+    try codec_encode_u32(output, offset, header.magic);
+    try codec_encode_u16(output, offset, header.version);
+    try codec_encode_u16(output, offset, header.kind);
+    try codec_encode_u64(output, offset, protocol_request_id_raw(&header.request_id));
+    try codec_encode_u64(output, offset, header.payload_len);
+    try protocol_frame_encode_checksum(output, offset, &header.checksum);
+}
+
+export fn protocol_frame_header_decode(input: &[byte], offset: &usize) !ProtocolFrameHeader {
+    const magic: u32 = try codec_decode_u32(input, offset);
+    if magic != PROTOCOL_FRAME_MAGIC {
+        return error.ProtocolFrameInvalidMagic;
+    }
+
+    const version: u16 = try codec_decode_u16(input, offset);
+    if version != PROTOCOL_FRAME_VERSION {
+        return error.ProtocolFrameUnsupportedVersion;
+    }
+
+    return ProtocolFrameHeader{
+        magic: magic,
+        version: version,
+        kind: try codec_decode_u16(input, offset),
+        request_id: protocol_request_id_from_u64(try codec_decode_u64(input, offset)),
+        payload_len: try codec_decode_u64(input, offset),
+        checksum: try protocol_frame_decode_checksum(input, offset),
+    };
+}
+
+export fn protocol_frame_encode(
+    output: &[byte],
+    offset: &usize,
+    kind: u16,
+    request_id: ProtocolRequestId,
+    payload: &[byte],
+) !void {
+    const header: ProtocolFrameHeader = protocol_frame_header_init(kind, request_id, payload.len as u64, protocol_frame_checksum(payload));
+    try protocol_frame_header_encode(output, offset, &header);
+    try protocol_frame_ensure_write(output, *offset, payload.len);
+
+    var i: usize = 0;
+    while i < payload.len {
+        output.ptr[*offset + i] = payload.ptr[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + payload.len;
+}
+
+export fn protocol_frame_decode(input: &[byte], offset: &usize) !ProtocolFrame {
+    const header: ProtocolFrameHeader = try protocol_frame_header_decode(input, offset);
+    const payload_len: usize = header.payload_len as usize;
+    try protocol_frame_ensure_read(input, *offset, payload_len);
+    const payload: ByteSpan = ByteSpan{ ptr: &input.ptr[*offset], len: payload_len };
+    try protocol_frame_verify_checksum(&header, payload);
+    *offset = *offset + payload_len;
+    return ProtocolFrame{
+        header: header,
+        payload: payload,
+    };
+}

@@ -23,6 +23,12 @@ use exec.control.progress_counter_is_finished;
 use exec.control.progress_counter_mark_completed;
 use exec.control.progress_counter_mark_failed;
 use exec.control.progress_counter_remaining;
+use exec.queue.TaskQueue;
+use exec.queue.task_queue_init;
+use exec.queue.task_queue_is_empty;
+use exec.queue.task_queue_len;
+use exec.queue.task_queue_pop;
+use exec.queue.task_queue_push;
 use exec.task.ExecTask;
 use exec.task.TaskKind;
 use exec.task.task_init;
@@ -76,10 +82,51 @@ fn test_exec_control_can_request_shutdown_without_errors() !void {
     try expect(exec_control_is_finished(&control));
 }
 
+fn test_exec_control_failure_stops_followup_dispatch() !void {
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+
+    var control: ExecControl = try exec_control_init(&arena, 3u64, 1 as usize);
+    var queue: TaskQueue = try task_queue_init(&arena, 3 as usize);
+    const first: ExecTask = task_init(1u64, TaskKind.ReadObject, 1 as u16, 0u64, 1u64);
+    const second: ExecTask = task_init(2u64, TaskKind.DiffShard, 1 as u16, 1u64, 1u64);
+    const third: ExecTask = task_init(3u64, TaskKind.FetchSegment, 1 as u16, 2u64, 1u64);
+
+    try task_queue_push(&queue, &first);
+    try task_queue_push(&queue, &second);
+    try task_queue_push(&queue, &third);
+
+    var dispatched: usize = 0 as usize;
+    while exec_control_should_accept(&control) && !task_queue_is_empty(&queue) {
+        const task: ExecTask = try task_queue_pop(&queue);
+        dispatched = dispatched + 1 as usize;
+        if task.id == 2u64 {
+            try exec_control_record_failure(&control, &task, 9001u32);
+        } else {
+            exec_control_record_success(&control);
+        }
+    }
+
+    try expect(dispatched == 2 as usize);
+    try expect(exec_control_is_shutdown_requested(&control));
+    try expect(!exec_control_should_accept(&control));
+    try expect(exec_control_error_count(&control) == 1 as usize);
+    try expect(progress_counter_completed(&control.progress) == 2u64);
+    try expect(progress_counter_failed(&control.progress) == 1u64);
+    try expect(progress_counter_remaining(&control.progress) == 1u64);
+    try expect(!exec_control_is_finished(&control));
+    try expect(task_queue_len(&queue) == 1 as usize);
+
+    const pending: ExecTask = try task_queue_pop(&queue);
+    try expect(pending.id == 3u64);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Exec Control Tests");
     run_test("progress counter tracks success and failure", test_progress_counter_tracks_success_and_failure);
     run_test("exec control records error and requests shutdown", test_exec_control_records_error_and_requests_shutdown);
     run_test("exec control can request shutdown without errors", test_exec_control_can_request_shutdown_without_errors);
+    run_test("exec control failure stops followup dispatch", test_exec_control_failure_stops_followup_dispatch);
     return test_suite_end();
 }

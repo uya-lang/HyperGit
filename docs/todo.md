@@ -304,19 +304,19 @@
 - [x] 接入 parallel large file hash（覆盖 `hgx add` / worktree hash 路径）。
 - [x] 约束 parallel `hgx add` 只并行对象计算，最终 stage publish 保持单 writer。
 - [x] 测试单 worker 和多 worker 结果一致。
-- [ ] 测试任务失败能正确取消后续任务。
+- [x] 测试任务失败能正确取消后续任务。
 
 ## 18. Remote / Protocol
 
-- [ ] 定义 protocol frame header。
-- [ ] 实现 frame encode/decode。
-- [ ] 实现 request id。
-- [ ] 实现 checksum。
-- [ ] 实现 file remote。
-- [ ] 实现 `FetchView`。
-- [ ] 实现 `PushObjects`。
-- [ ] 实现 remote ref CAS。
-- [ ] 实现 published view。
+- [x] 定义 protocol frame header。
+- [x] 实现 frame encode/decode。
+- [x] 实现 request id。
+- [x] 实现 checksum。
+- [x] 实现 file remote。
+- [x] 实现 `FetchView`。
+- [x] 实现 `PushObjects`。
+- [x] 实现 remote ref CAS。
+- [x] 实现 published view。
 - [ ] 实现 `hgx fetch`。
 - [ ] 实现 `hgx push`。
 - [ ] 测试 file remote clone。
