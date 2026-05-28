@@ -317,16 +317,16 @@
 - [x] 实现 `PushObjects`。
 - [x] 实现 remote ref CAS。
 - [x] 实现 published view。
-- [ ] 实现 `hgx fetch`。
-- [ ] 实现 `hgx push`。
-- [ ] 测试 file remote clone。
-- [ ] 测试 push CAS 失败。
-- [ ] 测试 fetch sparse profile。
+- [x] 实现 `hgx fetch`。
+- [x] 实现 `hgx push`。
+- [x] 测试 file remote clone。
+- [x] 测试 push CAS 失败。
+- [x] 测试 fetch sparse profile。
 
 ## 19. HTTP Remote
 
-- [ ] 评估 Uya `std.http` 当前 API。
-- [ ] 实现 HTTP route skeleton。
+- [x] 评估 Uya `std.http` 当前 API。
+- [x] 实现 HTTP route skeleton。
 - [ ] 实现 capabilities endpoint。
 - [ ] 实现 object batch endpoint。
 - [ ] 实现 manifest query endpoint。

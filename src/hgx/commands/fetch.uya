@@ -1,0 +1,711 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.time.now_ms;
+
+use libc.free;
+use libc.fprintf;
+use libc.malloc;
+use libc.stderr;
+use cli.EXIT_OK;
+use cli.EXIT_RUNTIME_ERROR;
+use cli.EXIT_USAGE_ERROR;
+use commands.checkout.checkout_apply_plan;
+use commands.checkout.checkout_current_local_changes;
+use commands.checkout.checkout_current_sparse_profile;
+use commands.checkout.checkout_current_state;
+use commands.checkout.checkout_manifest_inputs_from_commit;
+use commands.checkout.checkout_state_has_base_commit;
+use commands.checkout.checkout_sync_virtual_state;
+use core.codec.DecodedObject;
+use core.codec.codec_decode_object;
+use core.ids.CommitId;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.PublishedViewId;
+use core.ids.commit_id_compare;
+use core.ids.object_id_compare;
+use core.ids.object_id_from_hash;
+use core.ids.published_view_id_compare;
+use large.chunk_store.ChunkStore;
+use large.chunk_store.ChunkStoreBytes;
+use large.chunk_store.ChunkStorePutResult;
+use large.chunk_store.chunk_store_get;
+use large.chunk_store.chunk_store_has;
+use large.chunk_store.chunk_store_open;
+use large.chunk_store.chunk_store_put;
+use manifest.trie.ManifestLeafInputList;
+use object.codec.decode_chunked_blob_object;
+use object.codec.decode_commit_object;
+use object.codec.decode_manifest_node_object;
+use object.codec.decode_published_view_object;
+use object.codec.published_view_payload_to_canonical;
+use object.hash.hash_published_view;
+use object.types.ByteList;
+use object.types.ChunkRef;
+use object.types.ChunkedBlobPayload;
+use object.types.CommitPayload;
+use object.types.ManifestChild;
+use object.types.ManifestNodePayload;
+use object.types.ObjectKind;
+use object.types.PublishedView;
+use object.types.object_kind_from_u16;
+use store.head_ref.repo_head_ref_exists;
+use store.head_ref.repo_read_head_commit;
+use store.head_ref.repo_write_head_commit;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
+use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_join_literal;
+use store.repo_layout.repo_read_config;
+use store.file_remote.FileRemote;
+use store.file_remote.file_remote_open;
+use workspace.checkout_plan.CheckoutPlan;
+use workspace.checkout_plan.checkout_plan_build;
+use workspace.local_view.workspace_local_view_filter_expected_inputs;
+use workspace.local_view.workspace_local_view_filter_target_inputs;
+use workspace.reconcile.workspace_reconcile_scan;
+use workspace.sparse_profile.SparseProfile;
+use workspace.stage.StageEntryList;
+use workspace.stage.StageSnapshot;
+use workspace.stage.StageState;
+use workspace.stage.stage_snapshot_init;
+use workspace.stage.stage_state_with_entry_count;
+use workspace.stage.stage_zero_commit_id;
+use workspace.stage_file.stage_file_read;
+use workspace.stage_file.stage_file_write;
+use workspace.state.LocalChangeList;
+use workspace.state.WorkspaceState;
+
+const FETCH_ARENA_BYTES: usize = 67108864 as usize;
+
+error FetchFailure;
+error FetchRemoteEmpty;
+error FetchDiverged;
+error FetchStagedChanges;
+error FetchDirtyWorkspace;
+
+export const FETCH_USAGE_TEXT: &const byte = "error: fetch requires <file-remote>\n";
+export const FETCH_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
+export const FETCH_PERMISSION_TEXT: &const byte = "error: permission denied while fetching remote data\n";
+export const FETCH_REMOTE_EMPTY_TEXT: &const byte = "error: remote has no commits yet\n";
+export const FETCH_DIVERGED_TEXT: &const byte = "error: fetch requires an empty or fast-forwardable history\n";
+export const FETCH_STAGED_TEXT: &const byte = "error: fetch blocked by staged changes\n";
+export const FETCH_DIRTY_TEXT: &const byte = "error: fetch blocked by dirty workspace\n";
+export const FETCH_FAILURE_TEXT: &const byte = "error: failed to fetch remote data\n";
+
+fn fetch_zero_object_id() ObjectId {
+    return object_id_from_hash(Hash32{ bytes: [] });
+}
+
+fn fetch_load_commit_payload(arena: &Arena, store: &LooseObjectStore, commit_id: &CommitId) !CommitPayload {
+    const object_bytes: ObjectBytes = store.get(commit_id.id, arena) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.FetchFailure;
+    };
+    var offset: usize = 0;
+    const payload: CommitPayload = decode_commit_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.FetchFailure;
+    };
+    if offset != object_bytes.bytes.len {
+        return error.FetchFailure;
+    }
+    return payload;
+}
+
+fn fetch_view_for_head(arena: &Arena, store: &LooseObjectStore, head_commit: &CommitId) !PublishedView {
+    const payload: CommitPayload = try fetch_load_commit_payload(arena, store, head_commit);
+    const created_at_ms: i64 = now_ms() catch {
+        return error.FetchFailure;
+    };
+    return PublishedView{
+        head_commit: head_commit[0],
+        manifest_root: payload.manifest_root,
+        serving_index_snapshot: fetch_zero_object_id(),
+        lineage_watermark: 0u64,
+        dependency_watermark: 0u64,
+        created_at_ms: created_at_ms,
+    };
+}
+
+fn fetch_store_view(arena: &Arena, store: &LooseObjectStore, view: &PublishedView) !PublishedViewId {
+    const payload: ByteList = try published_view_payload_to_canonical(arena, view);
+    const stored_id: ObjectId = store.put(ObjectKind.PublishedView, payload.ptr[0: payload.len]) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.FetchFailure;
+    };
+    const view_id: PublishedViewId = try hash_published_view(arena, view);
+    if published_view_id_compare(&view_id, &PublishedViewId{ hash: stored_id.hash }) != 0 {
+        return error.FetchFailure;
+    }
+    return view_id;
+}
+
+fn fetch_copy_chunk(
+    arena: &Arena,
+    remote_chunk_store: &ChunkStore,
+    local_chunk_store: &ChunkStore,
+    chunk: &ChunkRef,
+) !void {
+    const has_local: bool = chunk_store_has(local_chunk_store, &chunk.storage_id) catch |err| {
+        if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.FetchFailure;
+    };
+    if has_local {
+        return;
+    }
+
+    const stored: ChunkStoreBytes = chunk_store_get(remote_chunk_store, &chunk.storage_id, arena) catch |err| {
+        if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.FetchFailure;
+    };
+    const put_result: ChunkStorePutResult = chunk_store_put(local_chunk_store, stored.bytes.ptr[0: stored.bytes.len]) catch |err| {
+        if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.FetchFailure;
+    };
+    if object_id_compare(&ObjectId{ hash: put_result.storage_id }, &ObjectId{ hash: chunk.storage_id }) != 0 ||
+        object_id_compare(&ObjectId{ hash: put_result.stored_checksum }, &ObjectId{ hash: chunk.checksum }) != 0 ||
+        put_result.stored_size != chunk.stored_size {
+        return error.FetchFailure;
+    }
+}
+
+export fn fetch_copy_object_graph(
+    arena: &Arena,
+    remote_store: &LooseObjectStore,
+    local_store: &LooseObjectStore,
+    remote_chunk_store: &ChunkStore,
+    local_chunk_store: &ChunkStore,
+    object_id: &ObjectId,
+) !void {
+    const has_local: bool = local_store.has(object_id[0]) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.FetchFailure;
+    };
+    if has_local {
+        return;
+    }
+
+    const object_bytes: ObjectBytes = remote_store.get(object_id[0], arena) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.FetchFailure;
+    };
+    var offset: usize = 0;
+    const decoded: DecodedObject = codec_decode_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.FetchFailure;
+    };
+    if offset != object_bytes.bytes.len {
+        return error.FetchFailure;
+    }
+    const kind: ObjectKind = object_kind_from_u16(decoded.envelope.kind) catch {
+        return error.FetchFailure;
+    };
+    const stored_id: ObjectId = local_store.put(kind, decoded.payload.ptr[0: decoded.payload.len]) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.FetchFailure;
+    };
+    if object_id_compare(&stored_id, object_id) != 0 {
+        return error.FetchFailure;
+    }
+
+    if kind == ObjectKind.Commit {
+        var read_offset: usize = 0;
+        const payload: CommitPayload = decode_commit_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &read_offset) catch {
+            return error.FetchFailure;
+        };
+        var i: usize = 0;
+        while i < payload.parents.len {
+            try fetch_copy_object_graph(
+                arena,
+                remote_store,
+                local_store,
+                remote_chunk_store,
+                local_chunk_store,
+                &payload.parents.ptr[i].id,
+            );
+            i = i + 1 as usize;
+        }
+        try fetch_copy_object_graph(
+            arena,
+            remote_store,
+            local_store,
+            remote_chunk_store,
+            local_chunk_store,
+            &payload.manifest_root.id,
+        );
+        return;
+    }
+
+    if kind == ObjectKind.ManifestNode {
+        var read_offset: usize = 0;
+        const payload: ManifestNodePayload = decode_manifest_node_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &read_offset) catch {
+            return error.FetchFailure;
+        };
+        var entry_index: usize = 0;
+        while entry_index < payload.entries.len {
+            try fetch_copy_object_graph(
+                arena,
+                remote_store,
+                local_store,
+                remote_chunk_store,
+                local_chunk_store,
+                &payload.entries.ptr[entry_index].object_id,
+            );
+            entry_index = entry_index + 1 as usize;
+        }
+        var child_index: usize = 0;
+        while child_index < payload.children.len {
+            const child: &ManifestChild = &payload.children.ptr[child_index];
+            try fetch_copy_object_graph(
+                arena,
+                remote_store,
+                local_store,
+                remote_chunk_store,
+                local_chunk_store,
+                &child.child_id.id,
+            );
+            child_index = child_index + 1 as usize;
+        }
+        return;
+    }
+
+    if kind == ObjectKind.ChunkedBlob {
+        var read_offset: usize = 0;
+        const payload: ChunkedBlobPayload = decode_chunked_blob_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &read_offset) catch {
+            return error.FetchFailure;
+        };
+        var i: usize = 0;
+        while i < payload.chunks.len {
+            try fetch_copy_chunk(arena, remote_chunk_store, local_chunk_store, &payload.chunks.ptr[i]);
+            i = i + 1 as usize;
+        }
+        return;
+    }
+
+    if kind == ObjectKind.PublishedView {
+        var read_offset: usize = 0;
+        const payload: PublishedView = decode_published_view_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &read_offset) catch {
+            return error.FetchFailure;
+        };
+        try fetch_copy_object_graph(
+            arena,
+            remote_store,
+            local_store,
+            remote_chunk_store,
+            local_chunk_store,
+            &payload.head_commit.id,
+        );
+        return;
+    }
+}
+
+export fn fetch_commit_contains(arena: &Arena, store: &LooseObjectStore, current: &CommitId, ancestor: &CommitId) !bool {
+    if commit_id_compare(current, ancestor) == 0 {
+        return true;
+    }
+    const payload: CommitPayload = try fetch_load_commit_payload(arena, store, current);
+    var i: usize = 0;
+    while i < payload.parents.len {
+        if try fetch_commit_contains(arena, store, &payload.parents.ptr[i], ancestor) {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn fetch_load_stage_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapshot {
+    return stage_file_read(repo_path_cstr(stage_path) as &const byte, arena) catch |err| {
+        if @error_id(err) == @error_id(error.StageFileNotFound) {
+            const state: StageState = stage_state_with_entry_count(stage_zero_commit_id(), 0u64, 0i64);
+            return stage_snapshot_init(state, StageEntryList{ ptr: null, len: 0 });
+        }
+        return error.FetchFailure;
+    };
+}
+
+fn fetch_write_empty_stage(stage_path: &RepoPath, base_commit: &CommitId) !void {
+    const updated_ms: i64 = now_ms() catch {
+        return error.FetchFailure;
+    };
+    const state: StageState = stage_state_with_entry_count(base_commit[0], 0u64, updated_ms);
+    const snapshot: StageSnapshot = stage_snapshot_init(state, StageEntryList{ ptr: null, len: 0 });
+    stage_file_write(repo_path_cstr(stage_path) as &const byte, &snapshot) catch {
+        return error.FetchFailure;
+    };
+    return;
+}
+
+fn fetch_prepare_target_state(current_state: &WorkspaceState, view_id: &PublishedViewId, profile: &SparseProfile) WorkspaceState {
+    var next_state: WorkspaceState = current_state[0];
+    next_state.view_id = view_id[0];
+    next_state.sparse_profile_id = profile.profile_id;
+    return next_state;
+}
+
+export fn run_fetch() i32 {
+    if get_argc() != 3 {
+        fprintf(stderr, "%s" as *byte, FETCH_USAGE_TEXT);
+        return EXIT_USAGE_ERROR;
+    }
+
+    const root: RepoPath = repo_find_root_from_cwd() catch |err| {
+        if @error_id(err) == @error_id(error.RepoNotFound) {
+            fprintf(stderr, "%s" as *byte, FETCH_NOT_REPO_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const config: RepoConfig = repo_read_config(&root) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const remote_uri: &byte = get_argv(2);
+    const remote: FileRemote = file_remote_open(remote_uri as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const remote_has_head: bool = repo_head_ref_exists(&remote.repo_root, &remote.config) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    if !remote_has_head {
+        fprintf(stderr, "%s" as *byte, FETCH_REMOTE_EMPTY_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    const remote_head: CommitId = repo_read_head_commit(&remote.repo_root, &remote.config) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const stage_read_path: RepoPath = repo_path_join_literal(&root, HGIT_WORKSPACE_STAGE_REL) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const arena_storage: &byte = malloc(FETCH_ARENA_BYTES) as &byte;
+    if arena_storage == null {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    defer {
+        free(arena_storage as &void);
+    }
+    var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+    arena_init(&arena, arena_storage, FETCH_ARENA_BYTES);
+
+    const stage_snapshot: StageSnapshot = fetch_load_stage_snapshot(&stage_read_path, &arena) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    if stage_snapshot.entries.len > 0 {
+        fprintf(stderr, "%s" as *byte, FETCH_STAGED_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+
+    const local_has_head: bool = repo_head_ref_exists(&root, &config) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    var local_head: CommitId = stage_zero_commit_id();
+    if local_has_head {
+        local_head = repo_read_head_commit(&root, &config) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+    }
+
+    const remote_objects_root: RepoPath = repo_path_join_literal(&remote.repo_root, HGIT_OBJECTS_LOOSE_REL) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const local_objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const remote_chunk_root: RepoPath = repo_path_join_literal(&remote.repo_root, HGIT_CACHE_CHUNKS_REL) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const local_chunk_root: RepoPath = repo_path_join_literal(&root, HGIT_CACHE_CHUNKS_REL) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const remote_store: LooseObjectStore = loose_store_open(repo_path_cstr(&remote_objects_root)) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const local_store: LooseObjectStore = loose_store_open(repo_path_cstr(&local_objects_root)) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const remote_chunk_store: ChunkStore = chunk_store_open(repo_path_cstr(&remote_chunk_root)) catch |err| {
+        if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const local_chunk_store: ChunkStore = chunk_store_open(repo_path_cstr(&local_chunk_root)) catch |err| {
+        if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    if local_has_head && commit_id_compare(&local_head, &remote_head) != 0 {
+        const can_fast_forward: bool = fetch_commit_contains(&arena, &remote_store, &remote_head, &local_head) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        if !can_fast_forward {
+            fprintf(stderr, "%s" as *byte, FETCH_DIVERGED_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+    }
+
+    fetch_copy_object_graph(
+        &arena,
+        &remote_store,
+        &local_store,
+        &remote_chunk_store,
+        &local_chunk_store,
+        &remote_head.id,
+    ) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const view: PublishedView = fetch_view_for_head(&arena, &remote_store, &remote_head) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const view_id: PublishedViewId = fetch_store_view(&arena, &local_store, &view) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const current_state: WorkspaceState = checkout_current_state(&arena, &root, &config) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_profile: SparseProfile = checkout_current_sparse_profile(&arena, &root) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_local_changes: LocalChangeList = checkout_current_local_changes(&arena, &root) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    var current_inputs: ManifestLeafInputList = ManifestLeafInputList{ ptr: null, len: 0 };
+    if checkout_state_has_base_commit(&current_state) {
+        current_inputs = checkout_manifest_inputs_from_commit(&arena, &local_store, &current_state.base_commit) catch |err| {
+            if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+    }
+    const target_inputs: ManifestLeafInputList = checkout_manifest_inputs_from_commit(&arena, &local_store, &remote_head) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const current_materialized: ManifestLeafInputList = workspace_local_view_filter_expected_inputs(
+        &arena,
+        &current_inputs,
+        &current_local_changes,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const target_materialized: ManifestLeafInputList = workspace_local_view_filter_target_inputs(
+        &arena,
+        &target_inputs,
+        &current_profile,
+        &current_local_changes,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const local_changes: LocalChangeList = workspace_reconcile_scan(
+        &arena,
+        repo_path_cstr(&root) as &const byte,
+        &current_materialized,
+        current_state.watcher_seq,
+        current_state.watcher_seq + 1u64,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const plan: CheckoutPlan = checkout_plan_build(&arena, &current_materialized, &target_materialized, &local_changes) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    if plan.blocked_paths.len > 0 {
+        checkout_sync_virtual_state(
+            &arena,
+            &root,
+            &current_state.base_commit,
+            &current_inputs,
+            &current_materialized,
+            &local_changes,
+            &current_state,
+            current_state.watcher_seq,
+            current_state.watcher_seq + 1u64,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        fprintf(stderr, "%s" as *byte, FETCH_DIRTY_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+
+    checkout_apply_plan(&arena, &local_store, &root, &plan) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const final_changes: LocalChangeList = workspace_reconcile_scan(
+        &arena,
+        repo_path_cstr(&root) as &const byte,
+        &target_materialized,
+        current_state.watcher_seq + 1u64,
+        current_state.watcher_seq + 2u64,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const target_state: WorkspaceState = fetch_prepare_target_state(&current_state, &view_id, &current_profile);
+    checkout_sync_virtual_state(
+        &arena,
+        &root,
+        &remote_head,
+        &target_inputs,
+        &target_materialized,
+        &final_changes,
+        &target_state,
+        current_state.watcher_seq + 1u64,
+        current_state.watcher_seq + 2u64,
+    ) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    repo_write_head_commit(&root, &config, &remote_head) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const stage_write_path: RepoPath = repo_path_join_literal(&root, HGIT_WORKSPACE_STAGE_REL) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    fetch_write_empty_stage(&stage_write_path, &remote_head) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    return EXIT_OK;
+}

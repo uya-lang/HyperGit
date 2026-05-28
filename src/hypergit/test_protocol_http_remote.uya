@@ -1,0 +1,48 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.assert_eq_i32;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.http.uyagin.EngineRunOptions;
+use std.http.uyagin.UyaginLimits;
+
+use protocol.http_remote.HTTP_REMOTE_DEFAULT_MAX_CONNECTIONS;
+use protocol.http_remote.HTTP_REMOTE_DEFAULT_READ_TIMEOUT_MS;
+use protocol.http_remote.HTTP_REMOTE_DEFAULT_WRITE_TIMEOUT_MS;
+use protocol.http_remote.HTTP_REMOTE_DEFAULT_IDLE_TIMEOUT_MS;
+use protocol.http_remote.HttpRemoteServer;
+use protocol.http_remote.http_remote_default_limits;
+use protocol.http_remote.http_remote_default_run_options;
+use protocol.http_remote.http_remote_server_close;
+use protocol.http_remote.http_remote_server_listen_loopback;
+use protocol.http_remote.http_remote_server_port;
+
+fn test_http_remote_defaults_are_stable() !void {
+    const options: EngineRunOptions = http_remote_default_run_options();
+    try assert_eq_i32(options.max_connections, HTTP_REMOTE_DEFAULT_MAX_CONNECTIONS);
+    try expect(options.read_timeout_ms == HTTP_REMOTE_DEFAULT_READ_TIMEOUT_MS);
+    try expect(options.write_timeout_ms == HTTP_REMOTE_DEFAULT_WRITE_TIMEOUT_MS);
+    try expect(options.idle_timeout_ms == HTTP_REMOTE_DEFAULT_IDLE_TIMEOUT_MS);
+
+    const limits: UyaginLimits = http_remote_default_limits();
+    try expect(limits.max_body_bytes == 65536 as usize);
+}
+
+fn test_http_remote_server_listen_loopback_binds_ephemeral_port() !void {
+    var server: HttpRemoteServer = try http_remote_server_listen_loopback(0 as u16);
+    defer {
+        http_remote_server_close(&server);
+    }
+
+    try expect(http_remote_server_port(&server) > 0 as u16);
+    try assert_eq_i32(server.engine.route_count, 0);
+    try assert_eq_i32(server.engine.run_options.max_connections, HTTP_REMOTE_DEFAULT_MAX_CONNECTIONS);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit HTTP Remote Skeleton Tests");
+    run_test("http remote defaults are stable", test_http_remote_defaults_are_stable);
+    run_test("http remote server listen loopback binds ephemeral port", test_http_remote_server_listen_loopback_binds_ephemeral_port);
+    return test_suite_end();
+}

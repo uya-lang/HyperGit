@@ -44,3 +44,53 @@ export fn main() i32 {
     return 0;
 }
 ```
+
+## `return some_void_call() catch { ... }` can elide the call entirely
+
+- Trigger command: `~/uya/uya/bin/uya build docs/repros/uya_void_return_catch_elides_call.uya -o /tmp/uya_void_return_catch_elides_call && /tmp/uya_void_return_catch_elides_call; echo $?`
+- Expected behavior: process exits `0`, because `wrapper()` should invoke `mark_called()`, set `CALLED = true`, then return success.
+- Actual behavior: process exits `2`. Inspecting generated C showed `wrapper()` returning success immediately without emitting the `mark_called()` call.
+
+Observed generated C excerpt from `.uyacache/.../fetch.c` after compiling `src/hgx/commands/fetch.uya`:
+
+```text
+struct err_union_void fetch_write_empty_stage(...) {
+    ...
+    struct StageSnapshot snapshot = ...;
+    {
+        struct err_union_void _uya_ret = (struct err_union_void){ .error_id = 0 };
+        return _uya_ret;
+    }
+}
+```
+
+Minimal reproduction:
+
+```uya
+use std.runtime.entry;
+
+export var CALLED: bool = false;
+
+error WrapperFailed;
+
+fn mark_called() !void {
+    CALLED = true;
+    return;
+}
+
+fn wrapper() !void {
+    return mark_called() catch {
+        return error.WrapperFailed;
+    };
+}
+
+export fn main() i32 {
+    wrapper() catch {
+        return 1;
+    };
+    if !CALLED {
+        return 2;
+    }
+    return 0;
+}
+```

@@ -44,6 +44,18 @@ fn test_status_command() !void {
     try assert_eq_i32(plan.exit_code, EXIT_OK);
 }
 
+fn test_fetch_command() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "fetch");
+    try expect(plan.action == DispatchAction.Fetch);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
+}
+
+fn test_push_command() !void {
+    const plan: DispatchPlan = plan_from_first_arg(2, "push");
+    try expect(plan.action == DispatchAction.Push);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
+}
+
 fn test_diff_command() !void {
     const plan: DispatchPlan = plan_from_first_arg(2, "diff");
     try expect(plan.action == DispatchAction.Diff);
@@ -112,6 +124,8 @@ export fn main() i32 {
     run_test("version flag", test_version_flag);
     run_test("doctor placeholder", test_doctor_placeholder);
     run_test("status command", test_status_command);
+    run_test("fetch command", test_fetch_command);
+    run_test("push command", test_push_command);
     run_test("diff command", test_diff_command);
     run_test("checkout command", test_checkout_command);
     run_test("hydrate command", test_hydrate_command);

@@ -38,6 +38,7 @@ test:
 	$(UYA) test src/hypergit/test_protocol_push.uya
 	$(UYA) test src/hypergit/test_protocol_ref_cas.uya
 	$(UYA) test src/hypergit/test_protocol_published_view.uya
+	$(UYA) test src/hypergit/test_protocol_http_remote.uya
 	$(UYA) test src/hypergit/test_merge_planner.uya
 	$(UYA) test src/hypergit/test_merge_text_merge.uya
 	$(UYA) test src/hypergit/test_merge_result_manifest.uya
@@ -94,6 +95,9 @@ test:
 	./tests/test_hydrate_large_file.sh
 	./tests/test_hydrate_restore.sh
 	./tests/test_repo_init.sh
+	./tests/test_file_remote_clone.sh
+	./tests/test_push_cas_failure.sh
+	./tests/test_fetch_sparse_profile.sh
 	./tests/test_status_empty.sh
 	./tests/test_status_clean.sh
 	./tests/test_status_split.sh

@@ -10,9 +10,11 @@ use commands.commit.run_commit;
 use commands.checkout.run_checkout;
 use commands.dehydrate.run_dehydrate;
 use commands.diff.run_diff;
+use commands.fetch.run_fetch;
 use commands.help.run_help;
 use commands.hydrate.run_hydrate;
 use commands.log.run_log;
+use commands.push.run_push;
 use commands.sparse.run_sparse;
 use commands.version.run_version;
 use commands.status.run_status;
@@ -29,6 +31,10 @@ export fn main() i32 {
         return run_help();
     } else if plan.action == DispatchAction.Version {
         return run_version();
+    } else if plan.action == DispatchAction.Fetch {
+        return run_fetch();
+    } else if plan.action == DispatchAction.Push {
+        return run_push();
     } else if plan.action == DispatchAction.Status {
         return run_status();
     } else if plan.action == DispatchAction.Diff {

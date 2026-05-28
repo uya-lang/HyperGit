@@ -1,0 +1,71 @@
+use std.http.server.HttpServer;
+use std.http.server.http_server_close;
+use std.http.types.MAX_BODY_SIZE;
+use std.http.uyagin.Engine;
+use std.http.uyagin.EngineRunOptions;
+use std.http.uyagin.GinListener;
+use std.http.uyagin.UyaginLimits;
+use std.http.uyagin.uyagin_limits_default;
+use std.http.uyagin.uyagin_listen_loopback_with_options;
+use std.http.uyagin.uyagin_new;
+use std.http.uyagin.uyagin_run_options_default;
+use std.http.uyagin.uyagin_set_limits;
+use std.http.uyagin.uyagin_set_run_options;
+
+export const HTTP_REMOTE_DEFAULT_MAX_CONNECTIONS: i32 = 64;
+export const HTTP_REMOTE_DEFAULT_READ_TIMEOUT_MS: u32 = 15000u32;
+export const HTTP_REMOTE_DEFAULT_WRITE_TIMEOUT_MS: u32 = 15000u32;
+export const HTTP_REMOTE_DEFAULT_IDLE_TIMEOUT_MS: u32 = 30000u32;
+
+export struct HttpRemoteServer {
+    engine: Engine,
+    listener: GinListener
+}
+
+export fn http_remote_default_run_options() EngineRunOptions {
+    var options: EngineRunOptions = uyagin_run_options_default();
+    options.max_connections = HTTP_REMOTE_DEFAULT_MAX_CONNECTIONS;
+    options.read_timeout_ms = HTTP_REMOTE_DEFAULT_READ_TIMEOUT_MS;
+    options.write_timeout_ms = HTTP_REMOTE_DEFAULT_WRITE_TIMEOUT_MS;
+    options.idle_timeout_ms = HTTP_REMOTE_DEFAULT_IDLE_TIMEOUT_MS;
+    return options;
+}
+
+export fn http_remote_default_limits() UyaginLimits {
+    var limits: UyaginLimits = uyagin_limits_default();
+    limits.max_body_bytes = MAX_BODY_SIZE as usize;
+    return limits;
+}
+
+export fn http_remote_engine_new() Engine {
+    var engine: Engine = uyagin_new();
+    const options: EngineRunOptions = http_remote_default_run_options();
+    const limits: UyaginLimits = http_remote_default_limits();
+    uyagin_set_run_options(&engine, options);
+    uyagin_set_limits(&engine, limits);
+    return engine;
+}
+
+export fn http_remote_server_listen_loopback(port: u16) !HttpRemoteServer {
+    var engine: Engine = http_remote_engine_new();
+    const listener: GinListener = try uyagin_listen_loopback_with_options(port, &engine.run_options);
+    return HttpRemoteServer{
+        engine: engine,
+        listener: listener,
+    };
+}
+
+export fn http_remote_server_close(server: &HttpRemoteServer) void {
+    if server == null {
+        return;
+    }
+    var http_server: HttpServer = server.listener.server;
+    http_server_close(&http_server);
+}
+
+export fn http_remote_server_port(server: &HttpRemoteServer) u16 {
+    if server == null {
+        return 0 as u16;
+    }
+    return server.listener.server.port;
+}
