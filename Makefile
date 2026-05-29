@@ -80,6 +80,7 @@ test:
 	./tests/test_add_stage_concurrent.sh
 	./tests/test_add_fast_path.sh
 	./tests/test_add_pathspec_scan.sh
+	./tests/test_add_skip_repo_metadata.sh
 	./tests/test_add_permission_error.sh
 	./tests/test_add_reserved_name_error.sh
 	./tests/test_add_delete.sh

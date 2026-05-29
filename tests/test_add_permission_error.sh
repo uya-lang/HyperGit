@@ -35,11 +35,8 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
-if [ -s "$stdout_file" ]; then
-    echo "unexpected stdout for unreadable add" >&2
-    cat "$stdout_file" >&2
-    exit 1
-fi
+printf 'readable.txt\n' >"$TMP_DIR/expected.stdout"
+diff -u "$TMP_DIR/expected.stdout" "$stdout_file"
 
 cat >"$TMP_DIR/expected.stderr" <<'EOF'
 warning: skipped unreadable path: unreadable.txt

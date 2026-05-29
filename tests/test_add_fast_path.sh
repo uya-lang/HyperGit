@@ -39,12 +39,6 @@ run_add() {
         exit 1
     fi
 
-    if [ -s "$stdout_file" ]; then
-        echo "unexpected stdout for $name" >&2
-        cat "$stdout_file" >&2
-        exit 1
-    fi
-
     if [ -s "$stderr_file" ]; then
         echo "unexpected stderr for $name" >&2
         cat "$stderr_file" >&2
@@ -56,6 +50,7 @@ STAGE_FILE="$REPO_DIR/.hgit/workspace/stage.hgi"
 
 chmod 000 "$REPO_DIR/src/main.uya"
 run_add clean_fast_path src/main.uya
+test ! -s "$TMP_DIR/clean_fast_path.stdout"
 
 ENTRY_COUNT="$(od -An -t u8 -j 40 -N 8 "$STAGE_FILE" | awk '{print $1}')"
 if [ "$ENTRY_COUNT" != "0" ]; then
@@ -66,6 +61,8 @@ fi
 chmod 600 "$REPO_DIR/src/main.uya"
 printf 'changed\n' >"$REPO_DIR/src/main.uya"
 run_add first_stage src/main.uya
+printf 'src/main.uya\n' >"$TMP_DIR/first_stage.expected"
+diff -u "$TMP_DIR/first_stage.expected" "$TMP_DIR/first_stage.stdout"
 
 ENTRY_COUNT="$(od -An -t u8 -j 40 -N 8 "$STAGE_FILE" | awk '{print $1}')"
 if [ "$ENTRY_COUNT" != "1" ]; then
@@ -77,6 +74,8 @@ OBJECT_COUNT_BEFORE="$(find "$REPO_DIR/.hgit/objects/loose" -type f | wc -l | tr
 
 chmod 000 "$REPO_DIR/src/main.uya"
 run_add repeat_fast_path src/main.uya
+printf 'src/main.uya\n' >"$TMP_DIR/repeat_fast_path.expected"
+diff -u "$TMP_DIR/repeat_fast_path.expected" "$TMP_DIR/repeat_fast_path.stdout"
 
 ENTRY_COUNT="$(od -An -t u8 -j 40 -N 8 "$STAGE_FILE" | awk '{print $1}')"
 if [ "$ENTRY_COUNT" != "1" ]; then

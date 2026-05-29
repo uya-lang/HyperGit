@@ -38,17 +38,17 @@ wait "$PID_SRC"
 wait "$PID_DOCS"
 
 for name in add_src add_docs; do
-    if [ -s "$TMP_DIR/$name.stdout" ]; then
-        echo "unexpected stdout for $name" >&2
-        cat "$TMP_DIR/$name.stdout" >&2
-        exit 1
-    fi
     if [ -s "$TMP_DIR/$name.stderr" ]; then
         echo "unexpected stderr for $name" >&2
         cat "$TMP_DIR/$name.stderr" >&2
         exit 1
     fi
 done
+
+printf 'src/main.uya\n' >"$TMP_DIR/add_src.expected"
+diff -u "$TMP_DIR/add_src.expected" "$TMP_DIR/add_src.stdout"
+printf 'docs/readme.md\n' >"$TMP_DIR/add_docs.expected"
+diff -u "$TMP_DIR/add_docs.expected" "$TMP_DIR/add_docs.stdout"
 
 STAGE_FILE="$REPO_DIR/.hgit/workspace/stage.hgi"
 if [ ! -f "$STAGE_FILE" ]; then

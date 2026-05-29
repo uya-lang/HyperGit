@@ -11,6 +11,7 @@ use std.thread.thread_pool_shutdown;
 
 use libc.free;
 use libc.malloc;
+use libc.sched_getaffinity;
 use core.ids.ObjectId;
 use large.chunk_hash.ChunkHashes;
 use large.chunk_hash.chunk_hash_plain;
@@ -33,7 +34,8 @@ error LargePrepareAlloc;
 error LargePrepareAsyncFailed;
 
 export const LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT: i32 = 4;
-const LARGE_PREPARE_MAX_PARALLEL_WORKERS: usize = 4 as usize;
+const LARGE_PREPARE_MAX_PARALLEL_WORKERS: usize = 32 as usize;
+const LARGE_PREPARE_CPU_MASK_BYTES: usize = 128 as usize;
 const LARGE_PREPARE_TASK_SCRATCH_ALLOC_FAILED: usize = 1 as usize;
 const LARGE_PREPARE_TASK_PART_ALLOC_FAILED: usize = 2 as usize;
 const LARGE_PREPARE_TASK_HASH_FAILED: usize = 3 as usize;
@@ -80,6 +82,43 @@ fn large_prepare_max_chunk_bytes(chunks: LargeChunkList) usize {
 
 fn large_prepare_hash_scratch_bytes(max_chunk_bytes: usize) usize {
     return max_chunk_bytes + 256 as usize;
+}
+
+fn large_prepare_count_mask_bits(mask: &[byte]) usize {
+    var total: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < mask.len {
+        var value: u32 = mask.ptr[i] as u32;
+        while value != 0u32 {
+            total = total + (value & 1u32) as usize;
+            if total >= LARGE_PREPARE_MAX_PARALLEL_WORKERS {
+                return LARGE_PREPARE_MAX_PARALLEL_WORKERS;
+            }
+            value = value >> 1;
+        }
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn large_prepare_detected_worker_count() usize {
+    var mask: [byte: 128] = [];
+    if sched_getaffinity(0i64, LARGE_PREPARE_CPU_MASK_BYTES, &mask[0] as &void) < 0 {
+        return LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT as usize;
+    }
+    const detected: usize = large_prepare_count_mask_bits(mask[0: LARGE_PREPARE_CPU_MASK_BYTES]);
+    if detected == 0 as usize {
+        return LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT as usize;
+    }
+    return detected;
+}
+
+fn large_prepare_default_requested_workers() i32 {
+    const detected: usize = large_prepare_detected_worker_count();
+    if detected == 0 as usize {
+        return LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT;
+    }
+    return detected as i32;
 }
 
 fn large_prepare_parallel_worker_count(chunk_count: usize, requested_workers: i32) usize {
@@ -182,14 +221,17 @@ fn large_prepare_fill_parts_parallel(
         thread_pool_shutdown(&pool);
     }
 
-    var ready0: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready1: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready2: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready3: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var futures: [Future<!usize>: 4] = [ready0, ready1, ready2, ready3];
+    const futures: &Future<!usize> = malloc(@size_of(Future<!usize>) as usize * worker_count) as &Future<!usize>;
+    if futures == null {
+        return error.LargePrepareAlloc;
+    }
+    defer {
+        free(futures as &void);
+    }
 
     task_index = 0 as usize;
     while task_index < worker_count {
+        futures[task_index] = future_ready_ok<usize>(0 as usize);
         futures[task_index] = async_compute<usize>(
             &pool,
             &large_prepare_hash_task_run as &void,
@@ -316,7 +358,7 @@ export fn prepare_chunked_blob_repository_parallel_default(
         arena,
         logical_bytes,
         file_type,
-        LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT,
+        large_prepare_default_requested_workers(),
     );
 }
 
@@ -348,6 +390,6 @@ export fn prepare_chunked_blob_object_id_parallel_default(
         arena,
         logical_bytes,
         file_type,
-        LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT,
+        large_prepare_default_requested_workers(),
     );
 }

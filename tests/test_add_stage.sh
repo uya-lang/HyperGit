@@ -38,12 +38,6 @@ run_add() {
         exit 1
     fi
 
-    if [ -s "$stdout_file" ]; then
-        echo "unexpected stdout for $name" >&2
-        cat "$stdout_file" >&2
-        exit 1
-    fi
-
     if [ -s "$stderr_file" ]; then
         echo "unexpected stderr for $name" >&2
         cat "$stderr_file" >&2
@@ -52,7 +46,11 @@ run_add() {
 }
 
 run_add add_src src
+printf 'src/main.uya\n' >"$TMP_DIR/add_src.expected"
+diff -u "$TMP_DIR/add_src.expected" "$TMP_DIR/add_src.stdout"
 run_add add_docs docs
+printf 'docs/readme.md\n' >"$TMP_DIR/add_docs.expected"
+diff -u "$TMP_DIR/add_docs.expected" "$TMP_DIR/add_docs.stdout"
 
 STAGE_FILE="$REPO_DIR/.hgit/workspace/stage.hgi"
 if [ ! -f "$STAGE_FILE" ]; then

@@ -188,6 +188,14 @@ fn workspace_scan_dirent_is_dot(entry: &Dirent) bool {
     return false;
 }
 
+fn workspace_scan_dirent_is_repo_metadata(entry: &Dirent) bool {
+    return workspace_scan_dirent_equals(entry, ".hgit") ||
+        workspace_scan_dirent_equals(entry, ".git") ||
+        workspace_scan_dirent_equals(entry, ".hg") ||
+        workspace_scan_dirent_equals(entry, ".svn") ||
+        workspace_scan_dirent_equals(entry, ".repo");
+}
+
 fn workspace_scan_kind_from_mode(mode: u32) !WorkspaceFileKind {
     const kind: u32 = workspace_scan_mode_type(mode);
     if kind == WORKSPACE_SCAN_STAT_S_IFREG {
@@ -250,7 +258,7 @@ fn workspace_scan_count_files(root: &WorkspaceScanPath, relative: &WorkspaceScan
         if workspace_scan_dirent_is_dot(entry) {
             continue;
         }
-        if relative.len == 0 && workspace_scan_dirent_equals(entry, ".hgit") {
+        if workspace_scan_dirent_is_repo_metadata(entry) {
             continue;
         }
 
@@ -296,7 +304,7 @@ fn workspace_scan_collect_files(arena: &Arena, root: &WorkspaceScanPath, relativ
         if workspace_scan_dirent_is_dot(entry) {
             continue;
         }
-        if relative.len == 0 && workspace_scan_dirent_equals(entry, ".hgit") {
+        if workspace_scan_dirent_is_repo_metadata(entry) {
             continue;
         }
 

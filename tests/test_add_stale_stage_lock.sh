@@ -34,11 +34,8 @@ if [ "$status" -ne 0 ]; then
     exit 1
 fi
 
-if [ -s "$stdout_file" ]; then
-    echo "unexpected stdout for add with stale stage lock" >&2
-    cat "$stdout_file" >&2
-    exit 1
-fi
+printf 'note.txt\n' >"$TMP_DIR/expected.stdout"
+diff -u "$TMP_DIR/expected.stdout" "$stdout_file"
 
 if [ -s "$stderr_file" ]; then
     echo "unexpected stderr for add with stale stage lock" >&2

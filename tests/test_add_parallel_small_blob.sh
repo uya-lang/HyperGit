@@ -45,12 +45,6 @@ run_add() {
         exit 1
     fi
 
-    if [ -s "$TMP_DIR/$name.stdout" ]; then
-        echo "unexpected stdout for $name" >&2
-        cat "$TMP_DIR/$name.stdout" >&2
-        exit 1
-    fi
-
     if [ -s "$TMP_DIR/$name.stderr" ]; then
         echo "unexpected stderr for $name" >&2
         cat "$TMP_DIR/$name.stderr" >&2
@@ -84,6 +78,13 @@ make_repo "$PARALLEL_REPO"
 
 run_add "$SERIAL_REPO" 1 serial_add
 run_add "$PARALLEL_REPO" 4 parallel_add
+
+if [ ! -s "$TMP_DIR/serial_add.stdout" ] || [ ! -s "$TMP_DIR/parallel_add.stdout" ]; then
+    echo "expected add to print staged paths for serial and parallel runs" >&2
+    exit 1
+fi
+
+diff -u "$TMP_DIR/serial_add.stdout" "$TMP_DIR/parallel_add.stdout"
 
 capture_repo_state "$SERIAL_REPO" serial
 capture_repo_state "$PARALLEL_REPO" parallel

@@ -17,8 +17,10 @@ mkdir -p "$REPO_DIR"
     ln -s docs/readme.md "$LINK_PATH"
 )
 
-run_and_expect_clean_io() {
+run_and_expect_io() {
     local name="$1"
+    local expected_stdout="$2"
+    shift
     shift
     local stdout_file="$TMP_DIR/$name.stdout"
     local stderr_file="$TMP_DIR/$name.stderr"
@@ -37,11 +39,8 @@ run_and_expect_clean_io() {
         exit 1
     fi
 
-    if [ -s "$stdout_file" ]; then
-        echo "unexpected stdout for $name" >&2
-        cat "$stdout_file" >&2
-        exit 1
-    fi
+    printf '%s' "$expected_stdout" >"$TMP_DIR/$name.expected.stdout"
+    diff -u "$TMP_DIR/$name.expected.stdout" "$stdout_file"
 
     if [ -s "$stderr_file" ]; then
         echo "unexpected stderr for $name" >&2
@@ -50,7 +49,8 @@ run_and_expect_clean_io() {
     fi
 }
 
-run_and_expect_clean_io add_symlink "$TMP_DIR/hgx" add "$LINK_PATH"
+run_and_expect_io add_symlink "link.txt
+" "$TMP_DIR/hgx" add "$LINK_PATH"
 
 STAGE_FILE="$REPO_DIR/.hgit/workspace/stage.hgi"
 if [ ! -f "$STAGE_FILE" ]; then
@@ -100,7 +100,7 @@ if [ -s "$TMP_DIR/status-staged.stderr" ]; then
     exit 1
 fi
 
-run_and_expect_clean_io commit_symlink env HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' "$TMP_DIR/hgx" commit -m "add symlink"
+run_and_expect_io commit_symlink "" env HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' "$TMP_DIR/hgx" commit -m "add symlink"
 
 (
     cd "$REPO_DIR"
