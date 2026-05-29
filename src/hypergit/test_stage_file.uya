@@ -6,6 +6,8 @@ use std.testing.run_test;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_init;
 
+use libc.free;
+use libc.malloc;
 use libc.system;
 use core.ids.Hash32;
 use core.ids.CommitId;
@@ -90,9 +92,57 @@ fn test_stage_file_roundtrip_with_entry() !void {
     try expect(decoded.entries.ptr[0].file_mode == 33188u32);
 }
 
+fn test_stage_file_roundtrip_above_legacy_size_limit() !void {
+    const ENTRY_COUNT: usize = 15000 as usize;
+
+    const setup_status: i32 = system("rm -rf build/stage-file-large && mkdir -p build/stage-file-large");
+    try expect(setup_status == 0);
+
+    const raw_entries: &StageEntry = malloc(@size_of(StageEntry) as usize * ENTRY_COUNT) as &StageEntry;
+    try expect(raw_entries != null);
+    defer {
+        free(raw_entries as &void);
+    }
+
+    var path_buf: [byte: 12] = ['m' as byte, 'a' as byte, 'n' as byte, 'y' as byte, '/' as byte, 'f' as byte, 'i' as byte, 'l' as byte, 'e' as byte, '.' as byte, 'b' as byte, 'i' as byte];
+    var i: usize = 0 as usize;
+    while i < ENTRY_COUNT {
+        raw_entries[i] = StageEntry{
+            path: ByteList{ ptr: path_buf[0: 12].ptr, len: 12 as usize },
+            kind: StageEntryKind.Add,
+            base_object: make_object_id((i % 200 as usize) as byte),
+            has_staged_object: true,
+            staged_object: make_object_id(((i + 1 as usize) % 200 as usize) as byte),
+            file_mode: 33188u32,
+        };
+        i = i + 1 as usize;
+    }
+
+    const snapshot: StageSnapshot = stage_snapshot_init(
+        stage_state_with_entry_count(make_commit_id(42 as byte), ENTRY_COUNT as u64, 5678i64),
+        stage_entry_list_from_slice(raw_entries[0: ENTRY_COUNT]),
+    );
+    try stage_file_write("build/stage-file-large/stage.hgi", &snapshot);
+
+    const arena_bytes: usize = 16777216 as usize;
+    const arena_buf: &byte = malloc(arena_bytes) as &byte;
+    try expect(arena_buf != null);
+    defer {
+        free(arena_buf as &void);
+    }
+    var arena: Arena = Arena{ buffer: arena_buf, size: 0, used: 0 };
+    arena_init(&arena, arena_buf, arena_bytes);
+    const decoded: StageSnapshot = try stage_file_read("build/stage-file-large/stage.hgi", &arena);
+    try expect(decoded.state.entry_count == ENTRY_COUNT as u64);
+    try expect(decoded.entries.len == ENTRY_COUNT);
+    try expect(decoded.entries.ptr[0].path.len == 12 as usize);
+    try expect(decoded.entries.ptr[ENTRY_COUNT - 1 as usize].has_staged_object);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Stage File Tests");
     run_test("stage file write empty roundtrip", test_stage_file_write_empty_roundtrip);
     run_test("stage file roundtrip with entry", test_stage_file_roundtrip_with_entry);
+    run_test("stage file roundtrip above legacy size limit", test_stage_file_roundtrip_above_legacy_size_limit);
     return test_suite_end();
 }

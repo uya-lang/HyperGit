@@ -1,6 +1,7 @@
+use std;
 use std.async.Future;
+use std.async.Waker;
 use std.async.block_on;
-use std.async.future_ready_ok;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 use std.mem.arena.arena_init;
@@ -33,12 +34,13 @@ use object.types.StorageTier;
 error LargePrepareAlloc;
 error LargePrepareAsyncFailed;
 
-export const LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT: i32 = 4;
-const LARGE_PREPARE_MAX_PARALLEL_WORKERS: usize = 32 as usize;
+export const LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT: i32 = 2;
+const LARGE_PREPARE_MAX_PARALLEL_WORKERS: usize = 2 as usize;
 const LARGE_PREPARE_CPU_MASK_BYTES: usize = 128 as usize;
+const LARGE_PREPARE_MAX_ASYNC_INFLIGHT: usize = 16 as usize;
+const LARGE_PREPARE_TASK_OK: usize = 0 as usize;
 const LARGE_PREPARE_TASK_SCRATCH_ALLOC_FAILED: usize = 1 as usize;
-const LARGE_PREPARE_TASK_PART_ALLOC_FAILED: usize = 2 as usize;
-const LARGE_PREPARE_TASK_HASH_FAILED: usize = 3 as usize;
+const LARGE_PREPARE_TASK_HASH_FAILED: usize = 2 as usize;
 
 export struct LargePreparedChunkedBlob {
     payload: ChunkedBlobPayload,
@@ -47,8 +49,9 @@ export struct LargePreparedChunkedBlob {
 }
 
 struct LargePrepareHashTask {
-    chunks: &LargeChunk,
-    len: usize,
+    chunk: &LargeChunk,
+    parts: &ChunkedBlobPart,
+    part_index: usize,
     scratch_bytes: usize
 }
 
@@ -66,18 +69,6 @@ fn large_prepare_alloc_parts(arena: &Arena, count: usize) !&[ChunkedBlobPart] {
         return error.LargePrepareAlloc;
     }
     return raw[0: count];
-}
-
-fn large_prepare_max_chunk_bytes(chunks: LargeChunkList) usize {
-    var max_bytes: usize = 0 as usize;
-    var i: usize = 0 as usize;
-    while i < chunks.len {
-        if chunks.ptr[i].bytes.len > max_bytes {
-            max_bytes = chunks.ptr[i].bytes.len;
-        }
-        i = i + 1 as usize;
-    }
-    return max_bytes;
 }
 
 fn large_prepare_hash_scratch_bytes(max_chunk_bytes: usize) usize {
@@ -139,6 +130,48 @@ fn large_prepare_parallel_worker_count(chunk_count: usize, requested_workers: i3
     return worker_count;
 }
 
+fn large_prepare_part_from_chunk(arena: &Arena, chunk: &LargeChunk) !ChunkedBlobPart {
+    const hashes: ChunkHashes = try chunk_hash_plain(arena, chunk.bytes.ptr[0: chunk.bytes.len]);
+    return ChunkedBlobPart{
+        logical_chunk_id: hashes.logical_chunk_id,
+        storage_id: hashes.stored_checksum,
+        offset: chunk.logical_offset,
+        logical_size: chunk.logical_size,
+        stored_size: chunk.logical_size,
+        checksum: hashes.stored_checksum,
+        storage_tier: StorageTier.Hot,
+    };
+}
+
+fn large_prepare_async_batch_count(task_count: usize, worker_count: usize) usize {
+    var batch_count: usize = worker_count;
+    if batch_count > LARGE_PREPARE_MAX_ASYNC_INFLIGHT {
+        batch_count = LARGE_PREPARE_MAX_ASYNC_INFLIGHT;
+    }
+    if batch_count > task_count {
+        batch_count = task_count;
+    }
+    if batch_count == 0 as usize {
+        return 1 as usize;
+    }
+    return batch_count;
+}
+
+fn large_prepare_kick_async_future(future: &Future<!usize>) void {
+    var waker: Waker = Waker{};
+    waker.reset();
+    waker.clear_io_interest();
+    _ = future.poll(&waker);
+    waker.reset();
+    waker.clear_io_interest();
+    _ = future.poll(&waker);
+}
+
+fn large_prepare_wait_async_future(future: Future<!usize>) !usize {
+    const wait_result: !usize = block_on<usize>(future);
+    return wait_result;
+}
+
 fn large_prepare_hash_task_run(task_ptr: usize) usize {
     const task: &LargePrepareHashTask = task_ptr as &LargePrepareHashTask;
     const scratch: &byte = malloc(task.scratch_bytes) as &byte;
@@ -149,33 +182,12 @@ fn large_prepare_hash_task_run(task_ptr: usize) usize {
         free(scratch as &void);
     }
 
-    const raw_parts: &ChunkedBlobPart = malloc(@size_of(ChunkedBlobPart) as usize * task.len) as &ChunkedBlobPart;
-    if raw_parts == null {
-        return LARGE_PREPARE_TASK_PART_ALLOC_FAILED;
-    }
-    const raw_part_slice: &[ChunkedBlobPart] = raw_parts[0: task.len];
-
     var local_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
-    var i: usize = 0 as usize;
-    while i < task.len {
-        const chunk: &LargeChunk = &task.chunks[i];
-        arena_init(&local_arena, scratch, task.scratch_bytes);
-        const hashes: ChunkHashes = chunk_hash_plain(&local_arena, chunk.bytes.ptr[0: chunk.bytes.len]) catch {
-            free(raw_parts as &void);
-            return LARGE_PREPARE_TASK_HASH_FAILED;
-        };
-        raw_part_slice.ptr[i] = ChunkedBlobPart{
-            logical_chunk_id: hashes.logical_chunk_id,
-            storage_id: hashes.stored_checksum,
-            offset: chunk.logical_offset,
-            logical_size: chunk.logical_size,
-            stored_size: chunk.logical_size,
-            checksum: hashes.stored_checksum,
-            storage_tier: StorageTier.Hot,
-        };
-        i = i + 1 as usize;
-    }
-    return @usize_from_ptr(raw_parts as &void);
+    arena_init(&local_arena, scratch, task.scratch_bytes);
+    task.parts[task.part_index] = large_prepare_part_from_chunk(&local_arena, task.chunk) catch {
+        return LARGE_PREPARE_TASK_HASH_FAILED;
+    };
+    return LARGE_PREPARE_TASK_OK;
 }
 
 fn large_prepare_fill_parts_parallel(
@@ -189,30 +201,18 @@ fn large_prepare_fill_parts_parallel(
         return error.LargePrepareAsyncFailed;
     }
 
-    const tasks: &LargePrepareHashTask = arena_alloc(arena, @size_of(LargePrepareHashTask) as usize * worker_count) as &LargePrepareHashTask;
+    const tasks: &LargePrepareHashTask = arena_alloc(arena, @size_of(LargePrepareHashTask) as usize * chunks.len) as &LargePrepareHashTask;
     if tasks == null {
         return error.LargePrepareAlloc;
     }
-
-    const base_len: usize = chunks.len / worker_count;
-    const extra: usize = chunks.len % worker_count;
-    var cursor: usize = 0 as usize;
     var task_index: usize = 0 as usize;
-    while task_index < worker_count {
-        var shard_len: usize = base_len;
-        if task_index < extra {
-            shard_len = shard_len + 1 as usize;
-        }
-        const shard: LargeChunkList = LargeChunkList{
-            ptr: &chunks.ptr[cursor],
-            len: shard_len,
-        };
+    while task_index < chunks.len {
         tasks[task_index] = LargePrepareHashTask{
-            chunks: shard.ptr,
-            len: shard.len,
-            scratch_bytes: large_prepare_hash_scratch_bytes(large_prepare_max_chunk_bytes(shard)),
+            chunk: &chunks.ptr[task_index],
+            parts: raw_parts.ptr,
+            part_index: task_index,
+            scratch_bytes: large_prepare_hash_scratch_bytes(chunks.ptr[task_index].bytes.len),
         };
-        cursor = cursor + shard_len;
         task_index = task_index + 1 as usize;
     }
 
@@ -221,7 +221,8 @@ fn large_prepare_fill_parts_parallel(
         thread_pool_shutdown(&pool);
     }
 
-    const futures: &Future<!usize> = malloc(@size_of(Future<!usize>) as usize * worker_count) as &Future<!usize>;
+    const batch_count: usize = large_prepare_async_batch_count(chunks.len, worker_count);
+    const futures: &Future<!usize> = malloc(@size_of(Future<!usize>) as usize * batch_count) as &Future<!usize>;
     if futures == null {
         return error.LargePrepareAlloc;
     }
@@ -229,41 +230,39 @@ fn large_prepare_fill_parts_parallel(
         free(futures as &void);
     }
 
-    task_index = 0 as usize;
-    while task_index < worker_count {
-        futures[task_index] = future_ready_ok<usize>(0 as usize);
-        futures[task_index] = async_compute<usize>(
-            &pool,
-            &large_prepare_hash_task_run as &void,
-            @usize_from_ptr((&tasks[task_index]) as &void),
-        );
-        task_index = task_index + 1 as usize;
-    }
-
-    cursor = 0 as usize;
-    task_index = 0 as usize;
-    while task_index < worker_count {
-        const shard_ptr: usize = block_on<usize>(futures[task_index]) catch {
-            return error.LargePrepareAsyncFailed;
-        };
-        if shard_ptr == LARGE_PREPARE_TASK_HASH_FAILED {
-            return error.LargePrepareAsyncFailed;
-        }
-        if shard_ptr == LARGE_PREPARE_TASK_SCRATCH_ALLOC_FAILED ||
-            shard_ptr == LARGE_PREPARE_TASK_PART_ALLOC_FAILED {
-            return error.LargePrepareAlloc;
+    var start_index: usize = 0 as usize;
+    while start_index < chunks.len {
+        var current_batch: usize = batch_count;
+        if current_batch > chunks.len - start_index {
+            current_batch = chunks.len - start_index;
         }
 
-        const shard_parts: &ChunkedBlobPart = shard_ptr as &ChunkedBlobPart;
-        const shard_part_slice: &[ChunkedBlobPart] = shard_parts[0: tasks[task_index].len];
-        var shard_index: usize = 0 as usize;
-        while shard_index < tasks[task_index].len {
-            raw_parts.ptr[cursor + shard_index] = shard_part_slice.ptr[shard_index];
-            shard_index = shard_index + 1 as usize;
+        var batch_index: usize = 0 as usize;
+        while batch_index < current_batch {
+            const task_offset: usize = start_index + batch_index;
+            futures[batch_index] = async_compute<usize>(
+                &pool,
+                &large_prepare_hash_task_run as &void,
+                @usize_from_ptr((&tasks[task_offset]) as &void),
+            );
+            large_prepare_kick_async_future(&futures[batch_index]);
+            batch_index = batch_index + 1 as usize;
         }
-        free(shard_parts as &void);
-        cursor = cursor + tasks[task_index].len;
-        task_index = task_index + 1 as usize;
+
+        batch_index = 0 as usize;
+        while batch_index < current_batch {
+            const status: usize = large_prepare_wait_async_future(futures[batch_index]) catch {
+                return error.LargePrepareAsyncFailed;
+            };
+            if status == LARGE_PREPARE_TASK_HASH_FAILED {
+                return error.LargePrepareAsyncFailed;
+            }
+            if status == LARGE_PREPARE_TASK_SCRATCH_ALLOC_FAILED {
+                return error.LargePrepareAlloc;
+            }
+            batch_index = batch_index + 1 as usize;
+        }
+        start_index = start_index + current_batch;
     }
 }
 
@@ -280,17 +279,7 @@ export fn prepare_chunked_blob_repository_with_workers(
     if effective_workers <= 1 as usize {
         var i: usize = 0 as usize;
         while i < chunks.len {
-            const chunk: &LargeChunk = &chunks.ptr[i];
-            const hashes: ChunkHashes = try chunk_hash_plain(arena, chunk.bytes.ptr[0: chunk.bytes.len]);
-            raw_parts.ptr[i] = ChunkedBlobPart{
-                logical_chunk_id: hashes.logical_chunk_id,
-                storage_id: hashes.stored_checksum,
-                offset: chunk.logical_offset,
-                logical_size: chunk.logical_size,
-                stored_size: chunk.logical_size,
-                checksum: hashes.stored_checksum,
-                storage_tier: StorageTier.Hot,
-            };
+            raw_parts.ptr[i] = try large_prepare_part_from_chunk(arena, &chunks.ptr[i]);
             i = i + 1 as usize;
         }
     } else {
@@ -321,17 +310,7 @@ export fn prepare_chunked_blob_repository_default(
 
     var i: usize = 0 as usize;
     while i < chunks.len {
-        const chunk: &LargeChunk = &chunks.ptr[i];
-        const hashes: ChunkHashes = try chunk_hash_plain(arena, chunk.bytes.ptr[0: chunk.bytes.len]);
-        raw_parts.ptr[i] = ChunkedBlobPart{
-            logical_chunk_id: hashes.logical_chunk_id,
-            storage_id: hashes.stored_checksum,
-            offset: chunk.logical_offset,
-            logical_size: chunk.logical_size,
-            stored_size: chunk.logical_size,
-            checksum: hashes.stored_checksum,
-            storage_tier: StorageTier.Hot,
-        };
+        raw_parts.ptr[i] = try large_prepare_part_from_chunk(arena, &chunks.ptr[i]);
         i = i + 1 as usize;
     }
 

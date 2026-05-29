@@ -37,7 +37,7 @@ export const LOCAL_CHANGE_FILE_MAGIC: u32 = 0x314C4348u32;
 export const LOCAL_CHANGE_FILE_VERSION: u16 = 1u16;
 const LOCAL_CHANGE_FILE_FLAG_HAS_LOGICAL_SIZE: u16 = 1u16;
 const LOCAL_CHANGE_FILE_HEADER_BYTES: usize = 16 as usize;
-const LOCAL_CHANGE_FILE_MAX_BYTES: usize = 4194304 as usize;
+const LOCAL_CHANGE_FILE_MAX_BYTES: usize = 67108864 as usize;
 
 error LocalChangeFileAlloc;
 error LocalChangeFileInvalid;
@@ -243,7 +243,7 @@ export fn local_change_file_read(arena: &Arena, path: &const byte) !LocalChangeL
     }
     const has_logical_size: bool = (flags & LOCAL_CHANGE_FILE_FLAG_HAS_LOGICAL_SIZE) != 0u16;
     const entry_count_u64: u64 = try codec_decode_u64(input, &offset);
-    if entry_count_u64 > 65535u64 {
+    if entry_count_u64 > size as u64 {
         return error.LocalChangeFileTooLarge;
     }
     const entry_count: usize = entry_count_u64 as usize;

@@ -12,10 +12,12 @@ use libc.free;
 use libc.getpid;
 use libc.malloc;
 use libc.rename;
+use libc.Stat;
 use libc.sys_close;
 use libc.sys_kill;
 use libc.sys_open;
 use libc.sys_write;
+use libc.stat;
 use libc.unlink;
 use libc.EEXIST;
 use libc.ESRCH;
@@ -60,7 +62,7 @@ export const STAGE_FILE_VERSION: u16 = 1u16;
 const STAGE_FILE_FLAGS: u16 = 0u16;
 const STAGE_FILE_HEADER_BYTES: usize = 56 as usize;
 const STAGE_FILE_LOCK_PID_MAX_BYTES: usize = 32 as usize;
-const STAGE_FILE_MAX_BYTES: usize = 1048576 as usize;
+const STAGE_FILE_MAX_BYTES: usize = 67108864 as usize;
 const STAGE_FILE_PATH_MAX: usize = 4096 as usize;
 
 error StageFileOpenFailed;
@@ -394,6 +396,9 @@ export fn stage_file_write(path: &const byte, snapshot: &StageSnapshot) !void {
     const final_path: StageFilePath = try stage_file_path_from_cstr(path);
     const temp_path: StageFilePath = try stage_file_path_with_suffix(&final_path, ".tmp");
     const total_len: usize = try stage_snapshot_encoded_len(snapshot);
+    if total_len > STAGE_FILE_MAX_BYTES {
+        return error.StageFileTooLarge;
+    }
     const stream: &FILE = fopen(&temp_path.bytes[0] as &const byte, "w");
     if stream == null {
         return error.StageFileOpenFailed;
@@ -459,15 +464,22 @@ export fn stage_file_read(path: &const byte, arena: &Arena) !StageSnapshot {
         _ = fclose(stream);
     }
 
-    const raw_input: &[byte] = try stage_file_arena_bytes(arena, STAGE_FILE_MAX_BYTES);
-    const count: usize = fread(raw_input.ptr, 1 as usize, STAGE_FILE_MAX_BYTES, stream);
-    if count == 0 {
+    var st: Stat = Stat{};
+    if stat(path, &st) != 0 {
         return error.StageFileReadFailed;
     }
-    if count == STAGE_FILE_MAX_BYTES {
+    const size: usize = st.st_size as usize;
+    if size == 0 as usize {
+        return error.StageFileReadFailed;
+    }
+    if size > STAGE_FILE_MAX_BYTES {
         return error.StageFileTooLarge;
     }
-    const input: &[byte] = raw_input.ptr[0: count];
+    const input: &[byte] = try stage_file_arena_bytes(arena, size);
+    const count: usize = fread(input.ptr, 1 as usize, size, stream);
+    if count != size {
+        return error.StageFileReadFailed;
+    }
 
     var offset: usize = 0;
     if try codec_decode_u32(input, &offset) != STAGE_FILE_MAGIC {
@@ -483,7 +495,7 @@ export fn stage_file_read(path: &const byte, arena: &Arena) !StageSnapshot {
     const entry_count: u64 = try codec_decode_u64(input, &offset);
     const last_update_ms: i64 = try codec_decode_i64(input, &offset);
 
-    if entry_count > 65535u64 {
+    if entry_count > input.len as u64 {
         return error.StageFileTooLarge;
     }
 

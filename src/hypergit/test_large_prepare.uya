@@ -19,7 +19,7 @@ use large.chunker.LargeChunkList;
 use large.chunker.cdc_chunk_bytes_default;
 use large.prepare.LargePreparedChunkedBlob;
 use large.prepare.large_prepare_recommended_arena_bytes;
-use large.prepare.prepare_chunked_blob_repository_parallel_default;
+use large.prepare.prepare_chunked_blob_repository_with_workers;
 use large.prepare.prepare_chunked_blob_repository_default;
 use object.types.ChunkRef;
 use object.types.FileType;
@@ -27,6 +27,7 @@ use object.types.StorageTier;
 
 const REPRO_BYTES: usize = 10485760 as usize;
 const REPRO_BYTES_U32: u32 = 10485760u32;
+const MANY_CHUNK_REPRO_BYTES: usize = 33554433 as usize;
 
 fn fill_payload_randomish(payload: &byte, len: usize) void {
     var state: u64 = 0x123456789abcdef0u64;
@@ -92,6 +93,22 @@ fn print_prepare_error(prefix: &const byte, err_id: u32) void {
         return;
     }
     fprintf(stderr, "%s%u\n" as *byte, prefix as *byte, err_id);
+}
+
+fn expect_prepared_equal(left: &LargePreparedChunkedBlob, right: &LargePreparedChunkedBlob) !void {
+    try expect(left.parts.len == right.parts.len);
+    try expect(left.payload.chunk_count == right.payload.chunk_count);
+
+    var part_index: usize = 0 as usize;
+    while part_index < left.parts.len {
+        try expect(left.parts.ptr[part_index].logical_size == right.parts.ptr[part_index].logical_size);
+        try expect(left.parts.ptr[part_index].stored_size == right.parts.ptr[part_index].stored_size);
+        try expect(left.parts.ptr[part_index].offset == right.parts.ptr[part_index].offset);
+        try expect_hash_equal(&left.parts.ptr[part_index].logical_chunk_id, &right.parts.ptr[part_index].logical_chunk_id);
+        try expect_hash_equal(&left.parts.ptr[part_index].storage_id, &right.parts.ptr[part_index].storage_id);
+        try expect_hash_equal(&left.parts.ptr[part_index].checksum, &right.parts.ptr[part_index].checksum);
+        part_index = part_index + 1 as usize;
+    }
 }
 
 fn write_ref(refs: &[ChunkRef], index: usize, hashes: &ChunkHashes, size: u32) void {
@@ -192,17 +209,7 @@ fn test_serial_multi_chunk_prepare_roundtrip() !void {
     };
     try expect(parallel_prepared.parts.len == chunks.len);
     try expect(parallel_prepared.payload.chunk_count == chunks.len as u32);
-
-    var part_index: usize = 0 as usize;
-    while part_index < chunks.len {
-        try expect(serial_prepared.parts.ptr[part_index].logical_size == parallel_prepared.parts.ptr[part_index].logical_size);
-        try expect(serial_prepared.parts.ptr[part_index].stored_size == parallel_prepared.parts.ptr[part_index].stored_size);
-        try expect(serial_prepared.parts.ptr[part_index].offset == parallel_prepared.parts.ptr[part_index].offset);
-        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].logical_chunk_id, &parallel_prepared.parts.ptr[part_index].logical_chunk_id);
-        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].storage_id, &parallel_prepared.parts.ptr[part_index].storage_id);
-        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].checksum, &parallel_prepared.parts.ptr[part_index].checksum);
-        part_index = part_index + 1 as usize;
-    }
+    try expect_prepared_equal(&serial_prepared, &parallel_prepared);
 }
 
 fn test_repetitive_large_prepare_serial_and_parallel() !void {
@@ -247,18 +254,54 @@ fn test_repetitive_large_prepare_serial_and_parallel() !void {
         return err;
     };
 
-    try expect(serial_prepared.parts.len == parallel_prepared.parts.len);
-    try expect(serial_prepared.payload.chunk_count == parallel_prepared.payload.chunk_count);
-    var part_index: usize = 0 as usize;
-    while part_index < serial_prepared.parts.len {
-        try expect(serial_prepared.parts.ptr[part_index].logical_size == parallel_prepared.parts.ptr[part_index].logical_size);
-        try expect(serial_prepared.parts.ptr[part_index].stored_size == parallel_prepared.parts.ptr[part_index].stored_size);
-        try expect(serial_prepared.parts.ptr[part_index].offset == parallel_prepared.parts.ptr[part_index].offset);
-        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].logical_chunk_id, &parallel_prepared.parts.ptr[part_index].logical_chunk_id);
-        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].storage_id, &parallel_prepared.parts.ptr[part_index].storage_id);
-        try expect_hash_equal(&serial_prepared.parts.ptr[part_index].checksum, &parallel_prepared.parts.ptr[part_index].checksum);
-        part_index = part_index + 1 as usize;
+    try expect_prepared_equal(&serial_prepared, &parallel_prepared);
+}
+
+fn test_parallel_prepare_queues_more_chunks_than_workers() !void {
+    const payload_ptr: &byte = malloc(MANY_CHUNK_REPRO_BYTES) as &byte;
+    try expect(payload_ptr != null);
+    defer {
+        free(payload_ptr as &void);
     }
+    fill_payload_randomish(payload_ptr, MANY_CHUNK_REPRO_BYTES);
+
+    const prepare_bytes: usize = try large_prepare_recommended_arena_bytes(MANY_CHUNK_REPRO_BYTES as u64);
+
+    const serial_scratch: &byte = malloc(prepare_bytes) as &byte;
+    try expect(serial_scratch != null);
+    defer {
+        free(serial_scratch as &void);
+    }
+    var serial_arena: Arena = Arena{ buffer: serial_scratch, size: 0, used: 0 };
+    arena_init(&serial_arena, serial_scratch, prepare_bytes);
+    const serial_prepared: LargePreparedChunkedBlob = prepare_chunked_blob_repository_default(
+        &serial_arena,
+        payload_ptr[0: MANY_CHUNK_REPRO_BYTES],
+        FileType.Binary,
+    ) catch |err| {
+        print_prepare_error("queued serial prepare failed: ", @error_id(err));
+        return err;
+    };
+    try expect(serial_prepared.chunks.len > 2 as usize);
+
+    const parallel_scratch: &byte = malloc(prepare_bytes) as &byte;
+    try expect(parallel_scratch != null);
+    defer {
+        free(parallel_scratch as &void);
+    }
+    var parallel_arena: Arena = Arena{ buffer: parallel_scratch, size: 0, used: 0 };
+    arena_init(&parallel_arena, parallel_scratch, prepare_bytes);
+    const parallel_prepared: LargePreparedChunkedBlob = prepare_chunked_blob_repository_with_workers(
+        &parallel_arena,
+        payload_ptr[0: MANY_CHUNK_REPRO_BYTES],
+        FileType.Binary,
+        2 as i32,
+    ) catch |err| {
+        print_prepare_error("queued parallel prepare failed: ", @error_id(err));
+        return err;
+    };
+
+    try expect_prepared_equal(&serial_prepared, &parallel_prepared);
 }
 
 export fn main() i32 {
@@ -266,5 +309,6 @@ export fn main() i32 {
     run_test("large hash can roundtrip into chunk ref", test_large_hash_can_roundtrip_into_chunk_ref);
     run_test("serial multi chunk prepare roundtrip", test_serial_multi_chunk_prepare_roundtrip);
     run_test("repetitive large prepare serial and parallel", test_repetitive_large_prepare_serial_and_parallel);
+    run_test("parallel prepare queues more chunks than workers", test_parallel_prepare_queues_more_chunks_than_workers);
     return test_suite_end();
 }
