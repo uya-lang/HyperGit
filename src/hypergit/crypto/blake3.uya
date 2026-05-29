@@ -1,0 +1,27 @@
+@c_import("blake3_c/blake3.c", "-O3 -DBLAKE3_NO_AVX512");
+@c_import("blake3_c/blake3_dispatch.c", "-O3 -DBLAKE3_NO_AVX512");
+@c_import("blake3_c/blake3_portable.c", "-O3 -DBLAKE3_NO_AVX512");
+@c_import("blake3_c/blake3_sse2.c", "-O3 -DBLAKE3_NO_AVX512 -msse2");
+@c_import("blake3_c/blake3_sse41.c", "-O3 -DBLAKE3_NO_AVX512 -msse4.1");
+@c_import("blake3_c/blake3_avx2.c", "-O3 -DBLAKE3_NO_AVX512 -mavx2");
+@c_import("blake3_c/hypergit_blake3_bridge.c", "-O3 -DBLAKE3_NO_AVX512");
+
+extern fn hypergit_blake3_digest_c(input: &byte, input_len: usize, out: &byte) void;
+
+const HYPERGIT_BLAKE3_OUT_BYTES: usize = 32 as usize;
+
+export fn hypergit_blake3_digest(data: &[byte], digest: &[byte]) void {
+    if digest.len < HYPERGIT_BLAKE3_OUT_BYTES || digest.ptr == null {
+        return;
+    }
+
+    var input_ptr: &byte = data.ptr;
+    if data.len == 0 as usize && input_ptr == null {
+        var zero: [byte: 1] = [0: 1];
+        input_ptr = &zero[0];
+        hypergit_blake3_digest_c(input_ptr, 0 as usize, digest.ptr);
+        return;
+    }
+
+    hypergit_blake3_digest_c(input_ptr, data.len, digest.ptr);
+}

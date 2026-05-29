@@ -13,16 +13,23 @@ make_repo() {
     (
         cd "$repo_dir"
         "$TMP_DIR/hgx" init >/dev/null 2>&1
-        mkdir -p src/alpha src/beta docs
+        mkdir -p src assets
         local i
-        for i in $(seq 1 48); do
-            printf 'alpha-%02d\n' $((i % 7)) >"src/alpha/file_$i.txt"
-            printf 'beta-%02d\n' $((i % 5)) >"src/beta/file_$i.txt"
-        done
         for i in $(seq 1 24); do
-            printf 'doc-%02d\n' $((i % 3)) >"docs/doc_$i.md"
+            printf 'small-%02d\n' $((i % 9)) >"src/file_$i.txt"
         done
-        ln -s ../docs/doc_1.md src/doc-link
+        python3 - <<'PY'
+from pathlib import Path
+
+chunk_a = b'abcd1234' * 131072
+chunk_b = b'wxyz5678' * 131072
+with Path('assets/big_a.bin').open('wb') as f:
+    for _ in range(9):
+        f.write(chunk_a)
+with Path('assets/big_b.bin').open('wb') as f:
+    for _ in range(9):
+        f.write(chunk_b)
+PY
     )
 }
 
@@ -34,7 +41,7 @@ run_add() {
     set +e
     (
         cd "$repo_dir"
-        HGX_ADD_PARALLEL_WORKERS="$workers" "$TMP_DIR/hgx" add src docs
+        HGX_ADD_PARALLEL_WORKERS="$workers" "$TMP_DIR/hgx" add src assets
     ) >"$TMP_DIR/$name.stdout" 2>"$TMP_DIR/$name.stderr"
     local status=$?
     set -e
@@ -68,6 +75,7 @@ capture_repo_state() {
     fi
 
     find "$repo_dir/.hgit/objects/loose" -type f | sed "s|$repo_dir/.hgit/objects/loose/||" | sort >"$TMP_DIR/$name.objects"
+    find "$repo_dir/.hgit/cache/chunks" -type f | sed "s|$repo_dir/.hgit/cache/chunks/||" | sort >"$TMP_DIR/$name.chunks"
 }
 
 SERIAL_REPO="$TMP_DIR/repo-serial"
@@ -80,7 +88,7 @@ run_add "$SERIAL_REPO" 1 serial_add
 run_add "$PARALLEL_REPO" 4 parallel_add
 
 if [ ! -s "$TMP_DIR/serial_add.stdout" ] || [ ! -s "$TMP_DIR/parallel_add.stdout" ]; then
-    echo "expected add to print staged paths for serial and parallel runs" >&2
+    echo "expected add to print staged paths for serial and parallel mixed runs" >&2
     exit 1
 fi
 
@@ -93,9 +101,10 @@ capture_repo_state "$PARALLEL_REPO" parallel
 
 diff -u "$TMP_DIR/serial.status" "$TMP_DIR/parallel.status"
 diff -u "$TMP_DIR/serial.objects" "$TMP_DIR/parallel.objects"
+diff -u "$TMP_DIR/serial.chunks" "$TMP_DIR/parallel.chunks"
 
-OBJECT_COUNT="$(wc -l <"$TMP_DIR/serial.objects" | tr -d ' ')"
-if [ "$OBJECT_COUNT" -lt 10 ]; then
-    echo "expected staged loose objects after add, got $OBJECT_COUNT" >&2
+CHUNK_COUNT="$(wc -l <"$TMP_DIR/serial.chunks" | tr -d ' ')"
+if [ "$CHUNK_COUNT" -lt 2 ]; then
+    echo "expected cached chunks after mixed parallel add, got $CHUNK_COUNT" >&2
     exit 1
 fi

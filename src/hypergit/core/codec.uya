@@ -1,4 +1,4 @@
-use std.crypto.blake3.blake3_digest;
+use crypto.blake3.hypergit_blake3_digest;
 
 use core.ids.Hash32;
 use core.ids.HASH32_BYTES;
@@ -272,7 +272,7 @@ export fn codec_validate_canonical_map_order(keys: &[ByteSpan]) !void {
 
 export fn codec_hash_payload(payload: &[byte]) Hash32 {
     var hash: Hash32 = Hash32{ bytes: [] };
-    blake3_digest(payload, hash.bytes[0: HASH32_BYTES]);
+    hypergit_blake3_digest(payload, hash.bytes[0: HASH32_BYTES]);
     return hash;
 }
 

@@ -1,5 +1,44 @@
 # HyperGit Benchmarks
 
+## 2026-05-29 BLAKE3 Official C/SIMD Shim
+
+This run compares the old pure-Uya `std.crypto.blake3` path with the new
+HyperGit-local shim that vendors the official BLAKE3 C implementation and
+enables runtime dispatch across portable, SSE2, SSE4.1 and AVX2 code paths.
+
+Command:
+
+```bash
+bash bench/bench_blake3_hot.sh 200000 128 3
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Core(TM) i7-14700`
+- `cores`: `28`
+
+Results:
+
+| workload | before_ms | after_ms | speedup |
+| --- | ---: | ---: | ---: |
+| `blake3_digest(64B) * 200000` | 235 | 100 | `2.35x` |
+| `blake3_digest(1MiB) * 128` | 2352 | 45 | `52.3x` |
+| `hash_domain_payload(1MiB) * 128` | 2500 | 183 | `13.7x` |
+| `prepare_chunked_blob_repository_parallel_default(10MiB) * 3` | 2063 | 446 | `4.63x` |
+
+Takeaways:
+
+- Direct large-buffer BLAKE3 throughput improved the most, which is exactly the
+  hot path behind large-object hashing and pack/object validation.
+- Domain-separated object hashing also sped up substantially, even after
+  accounting for the extra buffer assembly step around the digest call.
+- End-to-end large prepare is still bounded by chunking and object-shape work,
+  but the hashing-heavy part is now much cheaper.
+- The final implementation also keeps a strict-verify `segment_pack_read`
+  alongside a pack-only read mode used by `composite_store`, so missing or
+  corrupt sidecar indexes no longer block direct pack reads.
+
 ## 2026-05-29 Add Pathspec Hot Path
 
 This run isolates the main `hgx add <pathspec>` bottleneck we optimized in this change:

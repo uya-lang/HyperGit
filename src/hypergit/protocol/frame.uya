@@ -1,4 +1,4 @@
-use std.crypto.blake3.blake3_digest;
+use crypto.blake3.hypergit_blake3_digest;
 
 use core.codec.ByteSpan;
 use core.codec.codec_decode_u16;
@@ -107,7 +107,7 @@ export fn protocol_frame_encoded_len(payload_len: usize) usize {
 
 export fn protocol_frame_checksum(payload: &[byte]) Hash32 {
     var checksum: Hash32 = Hash32{ bytes: [] };
-    blake3_digest(payload, checksum.bytes[0: HASH32_BYTES]);
+    hypergit_blake3_digest(payload, checksum.bytes[0: HASH32_BYTES]);
     return checksum;
 }
 

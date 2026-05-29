@@ -24,6 +24,7 @@ use store.segment_pack.SEGMENT_PACK_RECORD_TRAILER_BYTES;
 use store.segment_pack.SegmentPackRecord;
 use store.segment_pack.SegmentPackSnapshot;
 use store.segment_pack.segment_pack_read;
+use store.segment_pack.segment_pack_read_pack_only;
 
 fn composite_snapshot_arena_bytes(file_size: usize) usize {
     var max_records: usize = 0 as usize;
@@ -90,7 +91,7 @@ fn composite_pack_has(pack_path: &byte, id: ObjectId) !bool {
     var scratch_arena: Arena = Arena{ buffer: scratch_raw, size: 0, used: 0 };
     arena_init(&scratch_arena, scratch_raw, scratch_size);
 
-    const snapshot: SegmentPackSnapshot = try segment_pack_read(pack_path as &const byte, &scratch_arena);
+    const snapshot: SegmentPackSnapshot = try segment_pack_read_pack_only(pack_path as &const byte, &scratch_arena);
     _ = try composite_pack_find_record_index(&snapshot, id);
     return true;
 }
@@ -123,7 +124,7 @@ fn composite_pack_get(pack_path: &byte, id: ObjectId, arena: &Arena) !ObjectByte
     var scratch_arena: Arena = Arena{ buffer: scratch_raw, size: 0, used: 0 };
     arena_init(&scratch_arena, scratch_raw, scratch_size);
 
-    const snapshot: SegmentPackSnapshot = try segment_pack_read(pack_path as &const byte, &scratch_arena);
+    const snapshot: SegmentPackSnapshot = try segment_pack_read_pack_only(pack_path as &const byte, &scratch_arena);
     const record_index: usize = try composite_pack_find_record_index(&snapshot, id);
     return try composite_copy_object_bytes(arena, snapshot.records.ptr[record_index].object_bytes);
 }

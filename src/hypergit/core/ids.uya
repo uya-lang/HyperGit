@@ -1,4 +1,4 @@
-use std.crypto.blake3.blake3_digest;
+use crypto.blake3.hypergit_blake3_digest;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 use std.string.strlen;
@@ -223,6 +223,6 @@ export fn hash_domain_payload(arena: &Arena, domain: &const byte, payload: &[byt
     }
 
     var digest: Hash32 = Hash32{ bytes: [] };
-    blake3_digest(combined, digest.bytes[0: HASH32_BYTES]);
+    hypergit_blake3_digest(combined, digest.bytes[0: HASH32_BYTES]);
     return digest;
 }

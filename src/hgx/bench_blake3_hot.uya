@@ -1,0 +1,213 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.time.now_ms;
+
+use libc.fprintf;
+use libc.free;
+use libc.malloc;
+use libc.stderr;
+use core.ids.Hash32;
+use core.ids.hash_domain_payload;
+use crypto.blake3.hypergit_blake3_digest;
+use large.prepare.LargePreparedChunkedBlob;
+use large.prepare.large_prepare_recommended_arena_bytes;
+use large.prepare.prepare_chunked_blob_repository_parallel_default;
+use object.types.FileType;
+
+const BENCH_USAGE: &const byte = "usage: bench_blake3_hot [small-iters] [large-iters] [prepare-iters]\n";
+const SMALL_BYTES: usize = 64 as usize;
+const LARGE_BYTES: usize = 1048576 as usize;
+const PREPARE_BYTES: usize = 10485760 as usize;
+const DEFAULT_SMALL_ITERS: usize = 200000 as usize;
+const DEFAULT_LARGE_ITERS: usize = 128 as usize;
+const DEFAULT_PREPARE_ITERS: usize = 3 as usize;
+const DOMAIN_LABEL: &const byte = "hypergit.bench.hash.v1";
+
+error BenchParse;
+error BenchAlloc;
+
+fn bench_parse_usize(text: &byte) !usize {
+    if text == null || text[0] == 0 as byte {
+        return error.BenchParse;
+    }
+
+    var value: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while text[i] != 0 as byte {
+        if text[i] < '0' as byte || text[i] > '9' as byte {
+            return error.BenchParse;
+        }
+        value = value * 10 as usize + (text[i] - '0' as byte) as usize;
+        i = i + 1 as usize;
+    }
+    if value == 0 as usize {
+        return error.BenchParse;
+    }
+    return value;
+}
+
+fn fill_payload_randomish(payload: &byte, len: usize) void {
+    var state: u64 = 0x123456789abcdef0u64;
+    var i: usize = 0 as usize;
+    while i < len {
+        state = state ^ (state << 13);
+        state = state ^ (state >> 7);
+        state = state ^ (state << 17);
+        payload[i] = (state & 255u64) as byte;
+        i = i + 1 as usize;
+    }
+}
+
+fn bench_direct_digest(payload: &[byte], iterations: usize, sink_out: &u64) !u64 {
+    var digest: Hash32 = Hash32{ bytes: [] };
+    var sink: u64 = 0u64;
+    var i: usize = 0 as usize;
+    const started_ms: u64 = try now_ms();
+    while i < iterations {
+        hypergit_blake3_digest(payload, digest.bytes[0: 32 as usize]);
+        sink = sink + digest.bytes[i % 32 as usize] as u64;
+        i = i + 1 as usize;
+    }
+    const finished_ms: u64 = try now_ms();
+    *sink_out = sink;
+    return finished_ms - started_ms;
+}
+
+fn bench_domain_hash(payload: &[byte], iterations: usize, sink_out: &u64) !u64 {
+    const scratch_bytes: usize = payload.len + 512 as usize;
+    const scratch: &byte = malloc(scratch_bytes) as &byte;
+    if scratch == null {
+        return error.BenchAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+
+    var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+    var sink: u64 = 0u64;
+    var i: usize = 0 as usize;
+    const started_ms: u64 = try now_ms();
+    while i < iterations {
+        arena_init(&arena, scratch, scratch_bytes);
+        const digest: Hash32 = try hash_domain_payload(&arena, DOMAIN_LABEL, payload);
+        sink = sink + digest.bytes[(i + 7 as usize) % 32 as usize] as u64;
+        i = i + 1 as usize;
+    }
+    const finished_ms: u64 = try now_ms();
+    *sink_out = sink;
+    return finished_ms - started_ms;
+}
+
+fn bench_large_prepare(payload: &[byte], iterations: usize, sink_out: &u64) !u64 {
+    const arena_bytes: usize = try large_prepare_recommended_arena_bytes(payload.len as u64);
+    const scratch: &byte = malloc(arena_bytes) as &byte;
+    if scratch == null {
+        return error.BenchAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+
+    var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+    var sink: u64 = 0u64;
+    var i: usize = 0 as usize;
+    const started_ms: u64 = try now_ms();
+    while i < iterations {
+        arena_init(&arena, scratch, arena_bytes);
+        const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_parallel_default(
+            &arena,
+            payload,
+            FileType.Binary,
+        );
+        sink = sink + prepared.parts.len as u64 + prepared.payload.chunk_count as u64;
+        i = i + 1 as usize;
+    }
+    const finished_ms: u64 = try now_ms();
+    *sink_out = sink;
+    return finished_ms - started_ms;
+}
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    if argc != 1 && argc != 2 && argc != 3 && argc != 4 {
+        fprintf(stderr, "%s" as *byte, BENCH_USAGE as *byte);
+        return 1;
+    }
+
+    var small_iters: usize = DEFAULT_SMALL_ITERS;
+    var large_iters: usize = DEFAULT_LARGE_ITERS;
+    var prepare_iters: usize = DEFAULT_PREPARE_ITERS;
+    if argc >= 2 {
+        small_iters = bench_parse_usize(get_argv(1)) catch {
+            fprintf(stderr, "%s" as *byte, BENCH_USAGE as *byte);
+            return 1;
+        };
+    }
+    if argc >= 3 {
+        large_iters = bench_parse_usize(get_argv(2)) catch {
+            fprintf(stderr, "%s" as *byte, BENCH_USAGE as *byte);
+            return 1;
+        };
+    }
+    if argc >= 4 {
+        prepare_iters = bench_parse_usize(get_argv(3)) catch {
+            fprintf(stderr, "%s" as *byte, BENCH_USAGE as *byte);
+            return 1;
+        };
+    }
+
+    const small_payload_ptr: &byte = malloc(SMALL_BYTES) as &byte;
+    const large_payload_ptr: &byte = malloc(LARGE_BYTES) as &byte;
+    const prepare_payload_ptr: &byte = malloc(PREPARE_BYTES) as &byte;
+    if small_payload_ptr == null || large_payload_ptr == null || prepare_payload_ptr == null {
+        if small_payload_ptr != null {
+            free(small_payload_ptr as &void);
+        }
+        if large_payload_ptr != null {
+            free(large_payload_ptr as &void);
+        }
+        if prepare_payload_ptr != null {
+            free(prepare_payload_ptr as &void);
+        }
+        return 1;
+    }
+    defer {
+        free(small_payload_ptr as &void);
+        free(large_payload_ptr as &void);
+        free(prepare_payload_ptr as &void);
+    }
+
+    fill_payload_randomish(small_payload_ptr, SMALL_BYTES);
+    fill_payload_randomish(large_payload_ptr, LARGE_BYTES);
+    fill_payload_randomish(prepare_payload_ptr, PREPARE_BYTES);
+
+    var small_sink: u64 = 0u64;
+    var large_sink: u64 = 0u64;
+    var domain_sink: u64 = 0u64;
+    var prepare_sink: u64 = 0u64;
+
+    const small_elapsed: u64 = bench_direct_digest(small_payload_ptr[0: SMALL_BYTES], small_iters, &small_sink) catch |err| {
+        fprintf(stderr, "small_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const large_elapsed: u64 = bench_direct_digest(large_payload_ptr[0: LARGE_BYTES], large_iters, &large_sink) catch |err| {
+        fprintf(stderr, "large_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const domain_elapsed: u64 = bench_domain_hash(large_payload_ptr[0: LARGE_BYTES], large_iters, &domain_sink) catch |err| {
+        fprintf(stderr, "domain_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const prepare_elapsed: u64 = bench_large_prepare(prepare_payload_ptr[0: PREPARE_BYTES], prepare_iters, &prepare_sink) catch |err| {
+        fprintf(stderr, "prepare_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    fprintf(stderr, "small_bytes=%llu iterations=%llu elapsed_ms=%llu sink=%llu\n" as *byte, SMALL_BYTES as u64, small_iters as u64, small_elapsed, small_sink);
+    fprintf(stderr, "large_bytes=%llu iterations=%llu elapsed_ms=%llu sink=%llu\n" as *byte, LARGE_BYTES as u64, large_iters as u64, large_elapsed, large_sink);
+    fprintf(stderr, "domain_bytes=%llu iterations=%llu elapsed_ms=%llu sink=%llu\n" as *byte, LARGE_BYTES as u64, large_iters as u64, domain_elapsed, domain_sink);
+    fprintf(stderr, "prepare_bytes=%llu iterations=%llu elapsed_ms=%llu sink=%llu\n" as *byte, PREPARE_BYTES as u64, prepare_iters as u64, prepare_elapsed, prepare_sink);
+    return 0;
+}

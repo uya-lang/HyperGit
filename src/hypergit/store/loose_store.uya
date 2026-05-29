@@ -1,4 +1,3 @@
-use std.crypto.blake3.blake3_digest;
 use std.io.file.File;
 use std.io.file.file_close;
 use std.io.file.file_open;
@@ -14,6 +13,7 @@ use libc.getpid;
 use libc.mkdir;
 use libc.rename;
 use libc.stat;
+use libc.sys_gettid;
 use libc.unlink;
 use libc.EACCES;
 use libc.EEXIST;
@@ -26,6 +26,7 @@ use libc.O_WRONLY;
 use libc.S_IRWXU;
 use libc.free;
 use libc.malloc;
+use crypto.blake3.hypergit_blake3_digest;
 use core.codec.CODEC_ENVELOPE_BYTES;
 use core.codec.DecodedObject;
 use core.codec.codec_decode_object;
@@ -169,7 +170,7 @@ fn loose_store_ensure_dir(path: &StorePath) !void {
     if mkdir(store_path_cstr(path) as &const byte, S_IRWXU as i32) == 0 {
         return;
     }
-    if errno == EEXIST && store_path_is_dir(path) {
+    if store_path_is_dir(path) {
         return;
     }
     if loose_store_errno_is_permission() {
@@ -234,7 +235,7 @@ fn hash_object_payload(kind: ObjectKind, payload: &[byte]) !ObjectId {
     }
 
     var hash: Hash32 = Hash32{ bytes: [] };
-    blake3_digest(combined, hash.bytes[0: HASH32_BYTES]);
+    hypergit_blake3_digest(combined, hash.bytes[0: HASH32_BYTES]);
     return object_id_from_hash(hash);
 }
 
@@ -258,6 +259,11 @@ fn build_loose_paths(root: &StorePath, id: &ObjectId, dir_out: &StorePath, file_
     var temp_path: StorePath = store_path_clone(&file_path);
     try store_path_append_literal(&temp_path, ".tmp.");
     try append_decimal_i32(&temp_path, getpid());
+    try store_path_append_byte(&temp_path, '.' as byte);
+    const tid: i32 = sys_gettid() catch {
+        return error.StorePathTooLong;
+    };
+    try append_decimal_i32(&temp_path, tid);
 
     dir_out[0] = store_path_clone(&dir_path);
     file_out[0] = store_path_clone(&file_path);

@@ -59,6 +59,7 @@ test:
 	$(UYA) test src/hypergit/test_stage_state.uya
 	$(UYA) test src/hypergit/test_stage_file.uya
 	$(UYA) test src/hypergit/test_small_blob_hash.uya
+	$(UYA) test src/hypergit/test_blake3_compat.uya
 	$(UYA) test src/hypergit/test_workspace_scan.uya
 	$(UYA) test src/hypergit/test_workspace_state_file.uya
 	$(UYA) test src/hypergit/test_local_change_file.uya
@@ -88,6 +89,7 @@ test:
 	./tests/test_add_large_file.sh
 	./tests/test_add_large_file_small_edit.sh
 	./tests/test_add_parallel_small_blob.sh
+	./tests/test_add_parallel_mixed_blob.sh
 	./tests/test_add_stale_stage_lock.sh
 	./tests/test_add_symlink.sh
 	./tests/test_commit_first.sh

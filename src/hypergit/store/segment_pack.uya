@@ -1,5 +1,4 @@
 use std.crypto.crc32.crc32_compute;
-use std.crypto.blake3.blake3_digest;
 use std.io.file.FILE;
 use std.io.file.fclose;
 use std.io.file.fopen;
@@ -28,6 +27,7 @@ use libc.readdir;
 use libc.closedir;
 use libc.stat;
 use libc.ENOENT;
+use crypto.blake3.hypergit_blake3_digest;
 use core.codec.DecodedObject;
 use core.codec.codec_hash_payload;
 use core.codec.codec_decode_hash32;
@@ -334,7 +334,7 @@ fn segment_pack_hash_object_payload(kind: ObjectKind, payload: &[byte]) !ObjectI
     }
 
     var digest: Hash32 = Hash32{ bytes: [] };
-    blake3_digest(combined, digest.bytes[0: HASH32_BYTES]);
+    hypergit_blake3_digest(combined, digest.bytes[0: HASH32_BYTES]);
     return object_id_from_hash(digest);
 }
 
@@ -672,7 +672,7 @@ fn segment_pack_decode_index_entry(input: &[byte], entry_offset: usize) !Segment
     return entry;
 }
 
-export fn segment_pack_read(path: &const byte, arena: &Arena) !SegmentPackSnapshot {
+fn segment_pack_read_internal(path: &const byte, arena: &Arena, verify_index_hash: bool) !SegmentPackSnapshot {
     const raw_bytes: ByteList = try segment_pack_read_file_bytes(path, arena);
     const file_size: usize = raw_bytes.len;
 
@@ -752,7 +752,9 @@ export fn segment_pack_read(path: &const byte, arena: &Arena) !SegmentPackSnapsh
     if footer.segment_seq != header.segment_seq || offset != file_size {
         return error.SegmentPackInvalid;
     }
-    try segment_pack_verify_footer_index_hash(&footer, path, arena);
+    if verify_index_hash {
+        try segment_pack_verify_footer_index_hash(&footer, path, arena);
+    }
 
     return SegmentPackSnapshot{
         header: header,
@@ -760,6 +762,14 @@ export fn segment_pack_read(path: &const byte, arena: &Arena) !SegmentPackSnapsh
         footer: footer,
         raw_bytes: ByteList{ ptr: input.ptr, len: input.len },
     };
+}
+
+export fn segment_pack_read(path: &const byte, arena: &Arena) !SegmentPackSnapshot {
+    return try segment_pack_read_internal(path, arena, true);
+}
+
+export fn segment_pack_read_pack_only(path: &const byte, arena: &Arena) !SegmentPackSnapshot {
+    return try segment_pack_read_internal(path, arena, false);
 }
 
 export fn segment_pack_index_lookup(path: &const byte, id: ObjectId, arena: &Arena) !SegmentPackIndexEntry {

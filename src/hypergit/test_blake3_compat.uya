@@ -1,0 +1,65 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use std.crypto.blake3.blake3_digest;
+
+use core.ids.Hash32;
+use crypto.blake3.hypergit_blake3_digest;
+
+fn fill_payload_randomish(payload: &byte, len: usize) void {
+    var state: u64 = 0x123456789abcdef0u64;
+    var i: usize = 0 as usize;
+    while i < len {
+        state = state ^ (state << 13);
+        state = state ^ (state >> 7);
+        state = state ^ (state << 17);
+        payload[i] = (state & 255u64) as byte;
+        i = i + 1 as usize;
+    }
+}
+
+fn expect_digest_match(payload: &[byte]) !void {
+    var std_digest: Hash32 = Hash32{ bytes: [] };
+    var native_digest: Hash32 = Hash32{ bytes: [] };
+    blake3_digest(payload, std_digest.bytes[0: 32 as usize]);
+    hypergit_blake3_digest(payload, native_digest.bytes[0: 32 as usize]);
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        try expect(std_digest.bytes[i] == native_digest.bytes[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn test_blake3_matches_std_on_small_inputs() !void {
+    var empty: [byte: 1] = [0: 1];
+    try expect_digest_match(empty[0: 0 as usize]);
+
+    var short: [byte: 5] = [
+        'h' as byte,
+        'e' as byte,
+        'l' as byte,
+        'l' as byte,
+        'o' as byte,
+    ];
+    try expect_digest_match(short[0: 5 as usize]);
+
+    var block: [byte: 64] = [];
+    fill_payload_randomish(&block[0], 64 as usize);
+    try expect_digest_match(block[0: 64 as usize]);
+}
+
+fn test_blake3_matches_std_on_large_input() !void {
+    var payload: [byte: 4096] = [];
+    fill_payload_randomish(&payload[0], 4096 as usize);
+    try expect_digest_match(payload[0: 4096 as usize]);
+}
+
+export fn main() i32 {
+    test_suite_begin("BLAKE3 Compatibility Tests");
+    run_test("small inputs", test_blake3_matches_std_on_small_inputs);
+    run_test("large input", test_blake3_matches_std_on_large_input);
+    return test_suite_end();
+}

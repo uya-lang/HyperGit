@@ -13,6 +13,7 @@ use libc.getpid;
 use libc.mkdir;
 use libc.rename;
 use libc.stat;
+use libc.sys_gettid;
 use libc.unlink;
 use libc.EACCES;
 use libc.EEXIST;
@@ -152,7 +153,7 @@ fn chunk_store_ensure_dir(path: &ChunkStorePath) !void {
     if mkdir(chunk_store_path_cstr(path) as &const byte, S_IRWXU as i32) == 0 {
         return;
     }
-    if errno == EEXIST && chunk_store_path_is_dir(path) {
+    if chunk_store_path_is_dir(path) {
         return;
     }
     if chunk_store_errno_is_permission() {
@@ -237,6 +238,11 @@ fn chunk_store_build_paths(
     try chunk_store_path_append_bytes(&temp, &hex[2], HASH32_HEX_BYTES - 2 as usize);
     try chunk_store_path_append_byte(&temp, '.' as byte);
     try chunk_store_append_decimal_i32(&temp, getpid());
+    try chunk_store_path_append_byte(&temp, '.' as byte);
+    const tid: i32 = sys_gettid() catch {
+        return error.ChunkStorePathTooLong;
+    };
+    try chunk_store_append_decimal_i32(&temp, tid);
     temp_path[0] = temp;
 }
 

@@ -1,4 +1,5 @@
 use std.async.Future;
+use std.async.Waker;
 use std.async.block_on;
 use std.async.future_ready_ok;
 use std.io.file.File;
@@ -26,6 +27,21 @@ use libc.free;
 use libc.fprintf;
 use libc.getenv;
 use libc.malloc;
+use libc.pthread_cond_init;
+use libc.pthread_cond_signal;
+use libc.pthread_cond_wait;
+use libc.pthread_cond_t;
+use libc.pthread_condattr_t;
+use libc.pthread_create;
+use libc.pthread_join;
+use libc.pthread_t;
+use libc.pthread_attr_t;
+use libc.pthread_mutex_init;
+use libc.pthread_mutex_lock;
+use libc.pthread_mutex_t;
+use libc.pthread_mutex_unlock;
+use libc.pthread_mutexattr_t;
+use libc.pthread_yield;
 use libc.readlink;
 use libc.stderr;
 use libc.stdout;
@@ -120,6 +136,13 @@ const ADD_PREPARE_SMALL_READ_FAILED: usize = 2 as usize;
 const ADD_PREPARE_SMALL_ALLOC_FAILED: usize = 3 as usize;
 const ADD_PREPARE_SMALL_ENCODE_FAILED: usize = 4 as usize;
 const ADD_PREPARE_SMALL_HASH_FAILED: usize = 5 as usize;
+const ADD_STORE_OBJECT_PERMISSION: usize = 6 as usize;
+const ADD_STORE_OBJECT_UNPROCESSABLE: usize = 7 as usize;
+const ADD_STORE_OBJECT_FATAL: usize = 8 as usize;
+const ADD_WORKER_SLOT_IDLE: i32 = 0;
+const ADD_WORKER_SLOT_ASSIGNED: i32 = 1;
+const ADD_WORKER_SLOT_COMPLETED: i32 = 2;
+const ADD_WORKER_SLOT_STOP: i32 = 3;
 
 error AddAlloc;
 error AddPathTooLong;
@@ -169,6 +192,14 @@ struct AddPrepareSmallBlobTask {
     base_entry_index: isize
 }
 
+struct AddStoreObjectTask {
+    root_fs_path: AddFsPath,
+    file_entry: &WorkspaceFileEntry,
+    base_entry_index: isize,
+    store: &LooseObjectStore,
+    chunk_store: &ChunkStore
+}
+
 struct AddPreparedSmallBlobResult {
     object_id: ObjectId,
     payload: AddOwnedBytes,
@@ -202,6 +233,26 @@ struct AddProgressState {
 
 struct AddPrintablePath {
     bytes: [byte: 4096] = []
+}
+
+struct AddCompletionQueue {
+    mutex: pthread_mutex_t,
+    cond: pthread_cond_t,
+    slots: [usize: 4] = [0: 4],
+    head: usize = 0 as usize,
+    tail: usize = 0 as usize,
+    len: usize = 0 as usize
+}
+
+struct AddWorkerSlot {
+    thread: pthread_t,
+    mutex: pthread_mutex_t,
+    cond: pthread_cond_t,
+    completion_queue: &AddCompletionQueue,
+    slot_index: usize,
+    state: i32,
+    task: &AddStoreObjectTask,
+    status: usize
 }
 
 fn add_zero_object_id() ObjectId {
@@ -629,6 +680,304 @@ fn add_store_worktree_object(store: &LooseObjectStore, chunk_store: &ChunkStore,
         hash_elapsed_ms: hash_elapsed_ms,
         store_elapsed_ms: add_elapsed_ms_since(store_started_ms),
     };
+}
+
+fn add_completion_queue_init(queue: &AddCompletionQueue) void {
+    queue.mutex = pthread_mutex_t{ state: 0, owner: 0, type: 0 };
+    queue.cond = pthread_cond_t{ waiters: 0, seq: 0, clock: 0 };
+    queue.head = 0 as usize;
+    queue.tail = 0 as usize;
+    queue.len = 0 as usize;
+    _ = pthread_mutex_init(&queue.mutex, null as &const pthread_mutexattr_t);
+    _ = pthread_cond_init(&queue.cond, null as &const pthread_condattr_t);
+}
+
+fn add_completion_queue_push(queue: &AddCompletionQueue, slot: usize) void {
+    if slot >= ADD_PARALLEL_MAX_WORKERS {
+        return;
+    }
+    _ = pthread_mutex_lock(&queue.mutex);
+    if queue.len < ADD_PARALLEL_MAX_WORKERS {
+        var tail: usize = queue.tail;
+        if tail >= ADD_PARALLEL_MAX_WORKERS {
+            tail = 0 as usize;
+        }
+        if tail == 0 as usize {
+            queue.slots[0] = slot;
+        } else if tail == 1 as usize {
+            queue.slots[1] = slot;
+        } else if tail == 2 as usize {
+            queue.slots[2] = slot;
+        } else {
+            queue.slots[3] = slot;
+        }
+        queue.tail = (tail + 1 as usize) % ADD_PARALLEL_MAX_WORKERS;
+        queue.len = queue.len + 1 as usize;
+        _ = pthread_cond_signal(&queue.cond);
+    }
+    _ = pthread_mutex_unlock(&queue.mutex);
+}
+
+fn add_completion_queue_try_pop(queue: &AddCompletionQueue, slot_out: &usize) bool {
+    _ = pthread_mutex_lock(&queue.mutex);
+    if queue.len == 0 as usize {
+        _ = pthread_mutex_unlock(&queue.mutex);
+        return false;
+    }
+    var head: usize = queue.head;
+    if head >= ADD_PARALLEL_MAX_WORKERS {
+        head = 0 as usize;
+    }
+    if head == 0 as usize {
+        *slot_out = queue.slots[0];
+    } else if head == 1 as usize {
+        *slot_out = queue.slots[1];
+    } else if head == 2 as usize {
+        *slot_out = queue.slots[2];
+    } else {
+        *slot_out = queue.slots[3];
+    }
+    queue.head = (head + 1 as usize) % ADD_PARALLEL_MAX_WORKERS;
+    queue.len = queue.len - 1 as usize;
+    _ = pthread_mutex_unlock(&queue.mutex);
+    return true;
+}
+
+fn add_completion_queue_wait_pop(queue: &AddCompletionQueue) usize {
+    var slot: usize = 0 as usize;
+    while !add_completion_queue_try_pop(queue, &slot) {
+        _ = pthread_yield();
+    }
+    return slot;
+}
+
+fn add_store_object_task_run(task_ptr: usize) usize {
+    const task: &AddStoreObjectTask = task_ptr as &AddStoreObjectTask;
+    const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&task.root_fs_path, task.file_entry) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            return ADD_STORE_OBJECT_PERMISSION;
+        }
+        if @error_id(err) == @error_id(error.AddReadFailed) ||
+            @error_id(err) == @error_id(error.AddAlloc) {
+            return ADD_STORE_OBJECT_UNPROCESSABLE;
+        }
+        return ADD_STORE_OBJECT_FATAL;
+    };
+    defer {
+        add_owned_bytes_free(&file_bytes);
+    }
+
+    const stored: AddStoredObjectResult = add_store_worktree_object(
+        task.store,
+        task.chunk_store,
+        task.file_entry,
+        add_owned_bytes_slice(&file_bytes),
+    ) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            return ADD_STORE_OBJECT_PERMISSION;
+        }
+        if @error_id(err) == @error_id(error.AddReadFailed) ||
+            @error_id(err) == @error_id(error.AddAlloc) {
+            return ADD_STORE_OBJECT_UNPROCESSABLE;
+        }
+        return ADD_STORE_OBJECT_FATAL;
+    };
+
+    const raw_result: &AddStoredObjectResult = malloc(@size_of(AddStoredObjectResult) as usize) as &AddStoredObjectResult;
+    if raw_result == null {
+        return ADD_STORE_OBJECT_FATAL;
+    }
+    raw_result[0] = AddStoredObjectResult{
+        object_id: ObjectId{ hash: stored.object_id.hash },
+        hash_elapsed_ms: stored.hash_elapsed_ms,
+        store_elapsed_ms: stored.store_elapsed_ms,
+    };
+    return @usize_from_ptr(raw_result as &void);
+}
+
+fn add_stored_object_result_free(result: &AddStoredObjectResult) void {
+    free(result as &void);
+}
+
+fn add_kick_async_future(future: &Future<!usize>) void {
+    var waker: Waker = Waker{};
+    waker.reset();
+    waker.clear_io_interest();
+    _ = future.poll(&waker);
+    waker.reset();
+    waker.clear_io_interest();
+    _ = future.poll(&waker);
+}
+
+fn add_worker_slot_init(slot: &AddWorkerSlot, slot_index: usize, completion_queue: &AddCompletionQueue) void {
+    slot.thread = pthread_t{
+        tid: 0i64,
+        stack: null,
+        stack_size: 0 as usize,
+        detached: 0,
+        exited: 0,
+        result: null,
+        start_routine: null,
+        arg: null,
+    };
+    slot.mutex = pthread_mutex_t{ state: 0, owner: 0, type: 0 };
+    slot.cond = pthread_cond_t{ waiters: 0, seq: 0, clock: 0 };
+    slot.completion_queue = completion_queue;
+    slot.slot_index = slot_index;
+    slot.state = ADD_WORKER_SLOT_IDLE;
+    slot.task = null as &AddStoreObjectTask;
+    slot.status = 0 as usize;
+    _ = pthread_mutex_init(&slot.mutex, null as &const pthread_mutexattr_t);
+    _ = pthread_cond_init(&slot.cond, null as &const pthread_condattr_t);
+}
+
+fn add_worker_slot_main(arg: &void) &void {
+    const slot: &AddWorkerSlot = arg as &AddWorkerSlot;
+    while true {
+        _ = pthread_mutex_lock(&slot.mutex);
+        const state: i32 = slot.state;
+        const task: &AddStoreObjectTask = slot.task;
+        _ = pthread_mutex_unlock(&slot.mutex);
+
+        if state == ADD_WORKER_SLOT_STOP {
+            return null;
+        }
+        if state != ADD_WORKER_SLOT_ASSIGNED || task == null as &AddStoreObjectTask {
+            _ = pthread_yield();
+            continue;
+        }
+
+        const status: usize = add_store_object_task_run(@usize_from_ptr(task as &void));
+
+        _ = pthread_mutex_lock(&slot.mutex);
+        if slot.state == ADD_WORKER_SLOT_ASSIGNED {
+            slot.status = status;
+            slot.state = ADD_WORKER_SLOT_COMPLETED;
+            _ = pthread_mutex_unlock(&slot.mutex);
+            continue;
+        }
+        _ = pthread_mutex_unlock(&slot.mutex);
+    }
+    return null;
+}
+
+fn add_worker_slot_assign(slot: &AddWorkerSlot, task: &AddStoreObjectTask) !void {
+    _ = pthread_mutex_lock(&slot.mutex);
+    if slot.state != ADD_WORKER_SLOT_IDLE {
+        _ = pthread_mutex_unlock(&slot.mutex);
+        return error.AddStoreFailed;
+    }
+    slot.task = task;
+    slot.status = 0 as usize;
+    slot.state = ADD_WORKER_SLOT_ASSIGNED;
+    _ = pthread_mutex_unlock(&slot.mutex);
+}
+
+fn add_worker_slot_is_idle(slot: &AddWorkerSlot) bool {
+    _ = pthread_mutex_lock(&slot.mutex);
+    const idle: bool = slot.state == ADD_WORKER_SLOT_IDLE;
+    _ = pthread_mutex_unlock(&slot.mutex);
+    return idle;
+}
+
+fn add_worker_slot_is_completed(slot: &AddWorkerSlot) bool {
+    _ = pthread_mutex_lock(&slot.mutex);
+    const completed: bool = slot.state == ADD_WORKER_SLOT_COMPLETED;
+    _ = pthread_mutex_unlock(&slot.mutex);
+    return completed;
+}
+
+fn add_worker_slots_find_completed(slots: &AddWorkerSlot, worker_count: usize, start_index: usize) usize {
+    if worker_count == 0 as usize {
+        return worker_count;
+    }
+    var checked: usize = 0 as usize;
+    while checked < worker_count {
+        const slot_index: usize = (start_index + checked) % worker_count;
+        if add_worker_slot_is_completed(&slots[slot_index]) {
+            return slot_index;
+        }
+        checked = checked + 1 as usize;
+    }
+    return worker_count;
+}
+
+fn add_worker_slot_take_completed(slot: &AddWorkerSlot, task_out: & &AddStoreObjectTask, status_out: &usize) !void {
+    _ = pthread_mutex_lock(&slot.mutex);
+    if slot.state != ADD_WORKER_SLOT_COMPLETED {
+        _ = pthread_mutex_unlock(&slot.mutex);
+        return error.AddStoreFailed;
+    }
+    task_out[0] = slot.task;
+    status_out[0] = slot.status;
+    slot.task = null as &AddStoreObjectTask;
+    slot.status = 0 as usize;
+    slot.state = ADD_WORKER_SLOT_IDLE;
+    _ = pthread_mutex_unlock(&slot.mutex);
+}
+
+fn add_worker_slot_request_stop(slot: &AddWorkerSlot) void {
+    _ = pthread_mutex_lock(&slot.mutex);
+    slot.state = ADD_WORKER_SLOT_STOP;
+    _ = pthread_mutex_unlock(&slot.mutex);
+}
+
+fn add_process_completed_object_task(
+    task: &AddStoreObjectTask,
+    status: usize,
+    existing_local_changes: &LocalChangeList,
+    base_inputs: ManifestLeafInputList,
+    raw_updates: &StageEntry,
+    update_index: &usize,
+    raw_change_updates: &LocalChange,
+    change_update_index: &usize,
+    skipped_count: &usize,
+    progress: &AddProgressState,
+) !void {
+    const file_entry: &WorkspaceFileEntry = task.file_entry;
+    if status == ADD_STORE_OBJECT_PERMISSION {
+        add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
+        *skipped_count = *skipped_count + 1 as usize;
+        add_progress_mark_file(progress, file_entry);
+        return;
+    }
+    if status == ADD_STORE_OBJECT_UNPROCESSABLE {
+        add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+        *skipped_count = *skipped_count + 1 as usize;
+        add_progress_mark_file(progress, file_entry);
+        return;
+    }
+    if status == ADD_STORE_OBJECT_FATAL {
+        return error.AddStoreFailed;
+    }
+
+    const stored: &AddStoredObjectResult = status as &AddStoredObjectResult;
+    defer {
+        add_stored_object_result_free(stored);
+    }
+
+    const update_index_before: usize = *update_index;
+    add_record_file_result(
+        existing_local_changes,
+        ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+        file_entry,
+        task.base_entry_index,
+        &stored.object_id,
+        raw_updates,
+        update_index,
+        raw_change_updates,
+        change_update_index,
+    );
+    add_print_new_stage_entries(
+        raw_updates,
+        update_index_before,
+        *update_index,
+        file_entry.logical_size,
+        stored.hash_elapsed_ms,
+        stored.store_elapsed_ms,
+        progress.enabled,
+    );
+    add_progress_mark_file(progress, file_entry);
 }
 
 export fn add_worktree_object_id(root: &RepoPath, file_entry: &WorkspaceFileEntry) !ObjectId {
@@ -1415,6 +1764,13 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     var change_update_index: usize = 0;
     var skipped_count: usize = 0;
     if effective_parallel_workers > 1 as usize {
+        const worker_tasks: &AddStoreObjectTask = arena_alloc(
+            &arena,
+            @size_of(AddStoreObjectTask) as usize * effective_parallel_workers,
+        ) as &AddStoreObjectTask;
+        if worker_tasks == null {
+            return error.AddAlloc;
+        }
         const batch_tasks: &AddPrepareSmallBlobTask = arena_alloc(
             &arena,
             @size_of(AddPrepareSmallBlobTask) as usize * effective_parallel_workers,
@@ -1428,14 +1784,20 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
             thread_pool_shutdown(&pool);
         }
 
+        var pending_large_future: Future<!usize> = future_ready_ok<usize>(0 as usize);
+        var pending_large_active: bool = false;
+        var pending_large_task: AddStoreObjectTask = AddStoreObjectTask{
+            root_fs_path: add_fs_path_clone(&root_fs_path),
+            file_entry: null as &WorkspaceFileEntry,
+            base_entry_index: 0 as isize,
+            store: &store,
+            chunk_store: &chunk_store,
+        };
         var pending_count: usize = 0 as usize;
         var file_index: usize = 0 as usize;
+
         while file_index < scanned_files.len {
             const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
-            var file_started_ms: u64 = 0u64;
-            if progress.enabled {
-                file_started_ms = add_now_ms_or_zero();
-            }
             const base_entry_index: isize = add_find_base_entry(
                 ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
                 &file_entry.path,
@@ -1501,60 +1863,57 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 continue;
             }
 
-            const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&root_fs_path, file_entry) catch |err| {
-                if add_error_is_skippable(@error_id(err)) {
-                    if @error_id(err) == @error_id(error.RepoPermissionDenied) {
-                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
-                    } else {
-                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
-                    }
-                    skipped_count = skipped_count + 1 as usize;
-                    add_progress_mark_file(&progress, file_entry);
-                    file_index = file_index + 1 as usize;
-                    continue;
-                }
-                return err;
-            };
-            defer {
-                add_owned_bytes_free(&file_bytes);
+            if pending_count > 0 as usize {
+                try add_process_small_blob_batch(
+                    &pool,
+                    pending_count,
+                    batch_tasks,
+                    &store,
+                    &existing_local_changes,
+                    ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                    raw_updates,
+                    &update_index,
+                    raw_change_updates,
+                    &change_update_index,
+                    &skipped_count,
+                    &progress,
+                );
+                pending_count = 0 as usize;
             }
-            const stored: AddStoredObjectResult = add_store_worktree_object(
-                &store,
-                &chunk_store,
-                file_entry,
-                add_owned_bytes_slice(&file_bytes),
-            ) catch |err| {
-                if add_error_is_skippable(@error_id(err)) {
-                    add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
-                    skipped_count = skipped_count + 1 as usize;
-                    add_progress_mark_file(&progress, file_entry);
-                    file_index = file_index + 1 as usize;
-                    continue;
-                }
-                return err;
+
+            if pending_large_active {
+                const status: usize = block_on<usize>(pending_large_future) catch {
+                    return error.AddStoreFailed;
+                };
+                pending_large_active = false;
+                try add_process_completed_object_task(
+                    &pending_large_task,
+                    status,
+                    &existing_local_changes,
+                    ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                    raw_updates,
+                    &update_index,
+                    raw_change_updates,
+                    &change_update_index,
+                    &skipped_count,
+                    &progress,
+                );
+            }
+
+            pending_large_task = AddStoreObjectTask{
+                root_fs_path: add_fs_path_clone(&root_fs_path),
+                file_entry: file_entry,
+                base_entry_index: base_entry_index,
+                store: &store,
+                chunk_store: &chunk_store,
             };
-            const update_index_before: usize = update_index;
-            add_record_file_result(
-                &existing_local_changes,
-                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-                file_entry,
-                base_entry_index,
-                &stored.object_id,
-                raw_updates,
-                &update_index,
-                raw_change_updates,
-                &change_update_index,
+            pending_large_future = async_compute<usize>(
+                &pool,
+                &add_store_object_task_run as &void,
+                @usize_from_ptr((&pending_large_task) as &void),
             );
-            add_print_new_stage_entries(
-                raw_updates,
-                update_index_before,
-                update_index,
-                file_entry.logical_size,
-                stored.hash_elapsed_ms,
-                stored.store_elapsed_ms,
-                progress.enabled,
-            );
-            add_progress_mark_file(&progress, file_entry);
+            add_kick_async_future(&pending_large_future);
+            pending_large_active = true;
             file_index = file_index + 1 as usize;
         }
 
@@ -1564,6 +1923,25 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 pending_count,
                 batch_tasks,
                 &store,
+                &existing_local_changes,
+                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                raw_updates,
+                &update_index,
+                raw_change_updates,
+                &change_update_index,
+                &skipped_count,
+                &progress,
+            );
+        }
+
+        if pending_large_active {
+            const status: usize = block_on<usize>(pending_large_future) catch {
+                return error.AddStoreFailed;
+            };
+            pending_large_active = false;
+            try add_process_completed_object_task(
+                &pending_large_task,
+                status,
                 &existing_local_changes,
                 ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
                 raw_updates,
