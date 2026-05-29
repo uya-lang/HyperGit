@@ -1,16 +1,10 @@
-use libc.DIR;
-use libc.Dirent;
 use libc.Stat;
-use libc.closedir;
 use libc.errno;
 use libc.getcwd;
 use libc.mkdir;
-use libc.opendir;
-use libc.readdir;
 use libc.stat;
 use libc.EACCES;
 use libc.EEXIST;
-use libc.ENOENT;
 use libc.EPERM;
 use libc.S_IRWXU;
 use std.io.file.FILE;
@@ -57,8 +51,6 @@ error RepoCurrentDirUnavailable;
 error RepoNotFound;
 error RepoPermissionDenied;
 error RepoExpectedDirectory;
-error RepoDirReadFailed;
-error RepoInitNonEmpty;
 error RepoConfigOpenFailed;
 error RepoConfigWriteFailed;
 error RepoConfigReadFailed;
@@ -211,44 +203,6 @@ export fn repo_path_is_dir(path: &RepoPath) bool {
         return false;
     }
     return (st.st_mode as u32 & STAT_S_IFMT) == STAT_S_IFDIR;
-}
-
-fn dirent_is_dot(entry: &Dirent) bool {
-    if entry.d_name[0] != '.' as byte {
-        return false;
-    }
-    if entry.d_name[1] == 0 as byte {
-        return true;
-    }
-    if entry.d_name[1] == '.' as byte && entry.d_name[2] == 0 as byte {
-        return true;
-    }
-    return false;
-}
-
-fn repo_dir_is_empty(path: &RepoPath) !bool {
-    const dir: &DIR = opendir(repo_path_cstr(path) as &const byte);
-    if dir == null {
-        if errno_is_permission() {
-            return error.RepoPermissionDenied;
-        }
-        return error.RepoDirReadFailed;
-        return false;
-    }
-    defer {
-        _ = closedir(dir);
-    }
-
-    while true {
-        const entry: &Dirent = readdir(dir);
-        if entry == null {
-            return true;
-        }
-        if !dirent_is_dot(entry) {
-            return false;
-        }
-    }
-    return true;
 }
 
 fn ensure_dir(path: &RepoPath) !void {
@@ -453,11 +407,6 @@ fn ensure_repo_structure(root: &RepoPath) !void {
 export fn repo_init_at(root: &RepoPath) !RepoInitResult {
     const hgit_dir: RepoPath = try repo_path_join_literal(root, HGIT_DIR_NAME);
     const existed: bool = repo_path_is_dir(&hgit_dir);
-    if !existed {
-        if !(try repo_dir_is_empty(root)) {
-            return error.RepoInitNonEmpty;
-        }
-    }
 
     try ensure_repo_structure(root);
 

@@ -77,5 +77,12 @@ grep -F '"format_version":1' "$EMPTY_DIR/.hgit/config.json" >/dev/null
 grep -F '"default_branch":"main"' "$EMPTY_DIR/.hgit/config.json" >/dev/null
 
 run_init_case "$EMPTY_DIR" 0 "reinitialized HyperGit repository in" ""
-run_init_case "$NONEMPTY_DIR" 1 "" "error: refusing to initialize in a non-empty directory
-"
+run_init_case "$NONEMPTY_DIR" 0 "initialized HyperGit repository in" ""
+
+if [ ! -f "$NONEMPTY_DIR/file.txt" ]; then
+    echo "expected existing file to survive init" >&2
+    exit 1
+fi
+
+grep -F 'data' "$NONEMPTY_DIR/file.txt" >/dev/null
+test -d "$NONEMPTY_DIR/.hgit"

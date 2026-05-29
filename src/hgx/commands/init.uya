@@ -32,7 +32,6 @@ use workspace.state_file.workspace_state_file_write;
 
 export const INIT_CREATED_TEXT: &const byte = "initialized HyperGit repository in %s/.hgit\n";
 export const INIT_REINITIALIZED_TEXT: &const byte = "reinitialized HyperGit repository in %s/.hgit\n";
-export const INIT_NON_EMPTY_TEXT: &const byte = "error: refusing to initialize in a non-empty directory\n";
 export const INIT_PERMISSION_TEXT: &const byte = "error: permission denied while initializing repository\n";
 export const INIT_FAILURE_TEXT: &const byte = "error: failed to initialize repository\n";
 
@@ -79,10 +78,6 @@ fn init_ensure_local_change_file(root: &RepoPath) !void {
 
 export fn run_init() i32 {
     const result: RepoInitResult = repo_init_current_dir() catch |err| {
-        if @error_id(err) == @error_id(error.RepoInitNonEmpty) {
-            fprintf(stderr, "%s" as *byte, INIT_NON_EMPTY_TEXT);
-            return EXIT_RUNTIME_ERROR;
-        }
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
             fprintf(stderr, "%s" as *byte, INIT_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;

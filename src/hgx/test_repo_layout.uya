@@ -38,25 +38,24 @@ fn test_repo_init_and_root_detection() !void {
     try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
 }
 
-fn test_repo_init_non_empty_error() !void {
+fn test_repo_init_non_empty_directory() !void {
     const setup_status: i32 = system("rm -rf build/repo-layout-test-nonempty && mkdir -p build/repo-layout-test-nonempty && printf data > build/repo-layout-test-nonempty/file.txt");
     try expect(setup_status == 0);
 
     const original_cwd: RepoPath = try repo_current_dir();
     try expect(chdir("build/repo-layout-test-nonempty") == 0);
 
-    const result: RepoInitResult = repo_init_current_dir() catch |err| {
-        try expect(@error_id(err) == @error_id(error.RepoInitNonEmpty));
-        try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
-        return;
-    };
-    _ = result;
-    return error.AssertionFailed;
+    const init_result: RepoInitResult = try repo_init_current_dir();
+    try expect(init_result.created_new == true);
+    try expect(system("test -f file.txt && grep -F data file.txt >/dev/null") == 0);
+    try expect(system("test -d .hgit && test -f .hgit/config.json") == 0);
+
+    try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
 }
 
 export fn main() i32 {
     test_suite_begin("HyperGit Repo Layout Tests");
     run_test("repo init and root detection", test_repo_init_and_root_detection);
-    run_test("repo init non-empty error", test_repo_init_non_empty_error);
+    run_test("repo init non-empty directory", test_repo_init_non_empty_directory);
     return test_suite_end();
 }
