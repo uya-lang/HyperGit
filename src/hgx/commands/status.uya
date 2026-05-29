@@ -52,13 +52,16 @@ use workspace.stage.stage_empty_snapshot;
 use workspace.stage.stage_entry_has_staged_content;
 use workspace.stage_file.stage_file_read;
 
-const STATUS_ARENA_BYTES: usize = 33554432 as usize;
+const STATUS_ARENA_BYTES: usize = 134217728 as usize;
 
 error StatusAlloc;
 error StatusPathTooLong;
 error StatusStageReadFailed;
 error StatusWorkspaceScanFailed;
 error StatusWorkspaceReadFailed;
+error StatusInvalidPath;
+error StatusReservedName;
+error StatusUnsupportedWorkspaceEntry;
 
 enum StatusChangeKind {
     NewFile,
@@ -89,6 +92,9 @@ export const STATUS_ROOT_FAILURE_TEXT: &const byte = "error: failed to locate re
 export const STATUS_CONFIG_FAILURE_TEXT: &const byte = "error: failed to read repository config\n";
 export const STATUS_HEAD_FAILURE_TEXT: &const byte = "error: failed to inspect repository head\n";
 export const STATUS_NONEMPTY_TEXT: &const byte = "error: 'status' beyond an empty repository is not implemented yet\n";
+export const STATUS_INVALID_PATH_TEXT: &const byte = "error: workspace path is not supported by HyperGit manifest rules\n";
+export const STATUS_RESERVED_NAME_TEXT: &const byte = "error: workspace uses Windows-incompatible names and cannot be inspected\n";
+export const STATUS_UNSUPPORTED_WORKSPACE_ENTRY_TEXT: &const byte = "error: workspace contains unsupported file types\n";
 export const STATUS_FAILURE_TEXT: &const byte = "error: failed to inspect repository status\n";
 export const STATUS_STAGED_HEADER_TEXT: &const byte = "Changes to be committed:\n";
 export const STATUS_UNSTAGED_HEADER_TEXT: &const byte = "Changes not staged for commit:\n";
@@ -98,6 +104,13 @@ export const STATUS_DELETED_LABEL: &const byte = "deleted";
 
 fn status_errno_permission() bool {
     return errno == EACCES || errno == EPERM;
+}
+
+fn status_manifest_path_error_is_invalid(err_id: u32) bool {
+    return err_id == @error_id(error.ManifestAbsolutePath) ||
+        err_id == @error_id(error.ManifestPathTraversal) ||
+        err_id == @error_id(error.ManifestInvalidUtf8) ||
+        err_id == @error_id(error.ManifestInvalidCharacter);
 }
 
 fn status_path_copy_bytes(path: &RepoPath, out: &RepoPath, limit: usize) void {
@@ -163,6 +176,15 @@ fn status_workspace_matches_manifest(arena: &Arena, root: &RepoPath, manifest_in
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
             return error.RepoPermissionDenied;
         }
+        if @error_id(err) == @error_id(error.StatusReservedName) {
+            return error.StatusReservedName;
+        }
+        if @error_id(err) == @error_id(error.StatusInvalidPath) {
+            return error.StatusInvalidPath;
+        }
+        if @error_id(err) == @error_id(error.StatusUnsupportedWorkspaceEntry) {
+            return error.StatusUnsupportedWorkspaceEntry;
+        }
         return error.StatusWorkspaceScanFailed;
     };
 
@@ -184,8 +206,11 @@ fn status_workspace_matches_manifest(arena: &Arena, root: &RepoPath, manifest_in
             if worktree_entry.file_mode != manifest_entry.mode {
                 return false;
             }
-            const worktree_id: ObjectId = add_worktree_object_id(root, worktree_entry) catch {
-                return false;
+            const worktree_id: ObjectId = add_worktree_object_id(root, worktree_entry) catch |err| {
+                if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                    return error.RepoPermissionDenied;
+                }
+                return error.StatusWorkspaceReadFailed;
             };
             if object_id_compare(&worktree_id, &manifest_entry.object_id) != 0 {
                 return false;
@@ -280,6 +305,15 @@ fn status_load_workspace_files(root: &RepoPath, arena: &Arena) !WorkspaceFileLis
         if @error_id(err) == @error_id(error.WorkspaceScanPermissionDenied) {
             return error.RepoPermissionDenied;
         }
+        if @error_id(err) == @error_id(error.ManifestReservedName) {
+            return error.StatusReservedName;
+        }
+        if status_manifest_path_error_is_invalid(@error_id(err)) {
+            return error.StatusInvalidPath;
+        }
+        if @error_id(err) == @error_id(error.WorkspaceScanUnsupportedFileType) {
+            return error.StatusUnsupportedWorkspaceEntry;
+        }
         return error.StatusWorkspaceScanFailed;
     };
 }
@@ -295,7 +329,10 @@ fn status_stage_entry_matches_worktree(root: &RepoPath, entry: &StageEntry, file
         return true;
     }
 
-    const worktree_id: ObjectId = add_worktree_object_id(root, file_entry) catch {
+    const worktree_id: ObjectId = add_worktree_object_id(root, file_entry) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
         return error.StatusWorkspaceReadFailed;
     };
     return object_id_compare(&worktree_id, &entry.staged_object) == 0;
@@ -475,6 +512,18 @@ export fn run_status() i32 {
                 fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
                 return EXIT_RUNTIME_ERROR;
             }
+            if @error_id(err) == @error_id(error.StatusReservedName) {
+                fprintf(stderr, "%s" as *byte, STATUS_RESERVED_NAME_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            if @error_id(err) == @error_id(error.StatusInvalidPath) {
+                fprintf(stderr, "%s" as *byte, STATUS_INVALID_PATH_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            if @error_id(err) == @error_id(error.StatusUnsupportedWorkspaceEntry) {
+                fprintf(stderr, "%s" as *byte, STATUS_UNSUPPORTED_WORKSPACE_ENTRY_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
             fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
         };
@@ -502,11 +551,27 @@ export fn run_status() i32 {
             fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;
         }
+        if @error_id(err) == @error_id(error.StatusReservedName) {
+            fprintf(stderr, "%s" as *byte, STATUS_RESERVED_NAME_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.StatusInvalidPath) {
+            fprintf(stderr, "%s" as *byte, STATUS_INVALID_PATH_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.StatusUnsupportedWorkspaceEntry) {
+            fprintf(stderr, "%s" as *byte, STATUS_UNSUPPORTED_WORKSPACE_ENTRY_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
         fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
 
-    const unstaged: StatusChangeList = status_collect_unstaged_changes(&arena, &root, staged.entries, &worktree) catch {
+    const unstaged: StatusChangeList = status_collect_unstaged_changes(&arena, &root, staged.entries, &worktree) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
         fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };

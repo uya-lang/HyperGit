@@ -218,51 +218,6 @@ fn segment_is_reserved_name(segment: &[byte]) bool {
     if last == ' ' as byte || last == '.' as byte {
         return true;
     }
-
-    var base_len: usize = 0;
-    while base_len < segment.len {
-        if segment.ptr[base_len] == '.' as byte {
-            break;
-        }
-        base_len = base_len + 1;
-    }
-    if base_len == 0 {
-        return false;
-    }
-
-    if base_len == 3 as usize {
-        const c0: byte = ascii_fold(segment.ptr[0]);
-        const c1: byte = ascii_fold(segment.ptr[1]);
-        const c2: byte = ascii_fold(segment.ptr[2]);
-        if c0 == 'c' as byte && c1 == 'o' as byte && c2 == 'n' as byte {
-            return true;
-        }
-        if c0 == 'p' as byte && c1 == 'r' as byte && c2 == 'n' as byte {
-            return true;
-        }
-        if c0 == 'a' as byte && c1 == 'u' as byte && c2 == 'x' as byte {
-            return true;
-        }
-        if c0 == 'n' as byte && c1 == 'u' as byte && c2 == 'l' as byte {
-            return true;
-        }
-    }
-
-    if base_len == 4 as usize {
-        const c0: byte = ascii_fold(segment.ptr[0]);
-        const c1: byte = ascii_fold(segment.ptr[1]);
-        const c2: byte = ascii_fold(segment.ptr[2]);
-        const c3: byte = ascii_fold(segment.ptr[3]);
-        if c3 >= '1' as byte && c3 <= '9' as byte {
-            if c0 == 'c' as byte && c1 == 'o' as byte && c2 == 'm' as byte {
-                return true;
-            }
-            if c0 == 'l' as byte && c1 == 'p' as byte && c2 == 't' as byte {
-                return true;
-            }
-        }
-    }
-
     return false;
 }
 

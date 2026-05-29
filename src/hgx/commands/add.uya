@@ -11,6 +11,9 @@ use std.string.strlen;
 use std.time.now_ms;
 
 use libc.O_RDONLY;
+use libc.EACCES;
+use libc.EPERM;
+use libc.errno;
 use libc.free;
 use libc.fprintf;
 use libc.malloc;
@@ -93,7 +96,8 @@ use workspace.stage_file.stage_file_lock_release;
 use workspace.stage_file.stage_file_read;
 use workspace.stage_file.stage_file_write;
 
-const ADD_ARENA_BYTES: usize = 33554432 as usize;
+const ADD_ARENA_BYTES: usize = 268435456 as usize;
+const ADD_PATHSPEC_ARENA_BYTES: usize = 65536 as usize;
 const ADD_PATH_MAX: usize = 4096;
 
 error AddAlloc;
@@ -108,12 +112,20 @@ error AddStageWriteFailed;
 error AddTimeFailed;
 error AddNoMatches;
 error AddLargeFileNotImplemented;
+error AddInvalidPath;
+error AddReservedName;
+error AddUnsupportedWorkspaceEntry;
 
 export const ADD_USAGE_TEXT: &const byte = "error: add requires at least one pathspec\n";
 export const ADD_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
 export const ADD_PERMISSION_TEXT: &const byte = "error: permission denied while staging files\n";
 export const ADD_NO_MATCH_TEXT: &const byte = "error: pathspec did not match any files\n";
 export const ADD_LARGE_FILE_TEXT: &const byte = "error: add for files larger than 8MB is not implemented yet\n";
+export const ADD_INVALID_PATH_TEXT: &const byte = "error: path is not supported by HyperGit manifest rules\n";
+export const ADD_RESERVED_NAME_TEXT: &const byte = "error: path uses Windows-incompatible names and cannot be staged\n";
+export const ADD_UNSUPPORTED_WORKSPACE_ENTRY_TEXT: &const byte = "error: workspace contains unsupported file types\n";
+export const ADD_SKIP_PERMISSION_TEXT: &const byte = "warning: skipped unreadable path: %s\n";
+export const ADD_SKIP_UNPROCESSABLE_TEXT: &const byte = "warning: skipped unprocessable path: %s\n";
 export const ADD_FAILURE_TEXT: &const byte = "error: failed to stage files\n";
 
 struct AddFsPath {
@@ -129,6 +141,15 @@ struct AddOwnedBytes {
 struct AddCachedObjectResult {
     hit: bool,
     object_id: ObjectId
+}
+
+export struct AddStageResult {
+    staged_count: usize,
+    skipped_count: usize
+}
+
+struct AddPrintablePath {
+    bytes: [byte: 4096] = []
 }
 
 fn add_zero_object_id() ObjectId {
@@ -209,13 +230,29 @@ fn add_owned_bytes_free(value: &AddOwnedBytes) void {
     }
 }
 
+fn add_errno_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn add_manifest_path_error_is_invalid(err_id: u32) bool {
+    return err_id == @error_id(error.ManifestAbsolutePath) ||
+        err_id == @error_id(error.ManifestPathTraversal) ||
+        err_id == @error_id(error.ManifestInvalidUtf8) ||
+        err_id == @error_id(error.ManifestInvalidCharacter);
+}
+
 fn add_read_file_bytes(path: &AddFsPath, size: usize) !AddOwnedBytes {
     const data: AddOwnedBytes = try add_owned_bytes_alloc(size);
     errdefer {
         add_owned_bytes_free(&data);
     }
 
-    const file: File = file_open(&path.bytes[0] as &const byte, O_RDONLY as i32, 0u32) catch {
+    const file: File = file_open(&path.bytes[0] as &const byte, O_RDONLY as i32, 0u32) catch |err| {
+        if @error_id(err) == @error_id(error.PermissionDenied) ||
+            @error_id(err) == EACCES as u32 ||
+            @error_id(err) == EPERM as u32 {
+            return error.RepoPermissionDenied;
+        }
         return error.AddReadFailed;
     };
     defer {
@@ -250,6 +287,9 @@ fn add_read_symlink_bytes(path: &AddFsPath, size_hint: usize) !AddOwnedBytes {
         const read_len: i32 = readlink(&path.bytes[0] as &const byte, data.raw, capacity);
         if read_len < 0 {
             add_owned_bytes_free(&data);
+            if add_errno_permission() {
+                return error.RepoPermissionDenied;
+            }
             return error.AddReadFailed;
         }
 
@@ -458,6 +498,34 @@ fn add_byte_list_equal(left: &ByteList, right: &ByteList) bool {
         i = i + 1;
     }
     return true;
+}
+
+fn add_copy_path_to_cstr(path: &ByteList, out: &AddPrintablePath) !&byte {
+    if path.len >= ADD_PATH_MAX {
+        return error.AddPathTooLong;
+    }
+    var i: usize = 0;
+    while i < path.len {
+        out.bytes[i] = path.ptr[i];
+        i = i + 1;
+    }
+    out.bytes[path.len] = 0 as byte;
+    return &out.bytes[0];
+}
+
+fn add_warn_skipped_path(path: &ByteList, message: &const byte) void {
+    var printable: AddPrintablePath = AddPrintablePath{ bytes: [] };
+    const path_cstr: &byte = add_copy_path_to_cstr(path, &printable) catch {
+        fprintf(stderr, "%s" as *byte, message);
+        return;
+    };
+    fprintf(stderr, message as *byte, path_cstr);
+}
+
+fn add_error_is_skippable(err_id: u32) bool {
+    return err_id == @error_id(error.RepoPermissionDenied) ||
+        err_id == @error_id(error.AddReadFailed) ||
+        err_id == @error_id(error.AddAlloc);
 }
 
 fn add_load_existing_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapshot {
@@ -719,7 +787,7 @@ fn add_merge_local_changes(arena: &Arena, existing: LocalChangeList, updates: &L
     return local_change_list_from_slice(raw[0: out_index]);
 }
 
-export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) !usize {
+export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) !AddStageResult {
     const arena_storage: &byte = malloc(ADD_ARENA_BYTES) as &byte;
     if arena_storage == null {
         return error.AddAlloc;
@@ -732,11 +800,25 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     arena_init(&arena, arena_storage, ADD_ARENA_BYTES);
 
     const scan_pathspecs: ManifestPathspecList = ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len };
-    const scanned_files: WorkspaceFileList = try workspace_scan_files_for_pathspecs(
+    const scanned_files: WorkspaceFileList = workspace_scan_files_for_pathspecs(
         &arena,
         repo_path_cstr(root) as &const byte,
         scan_pathspecs,
-    );
+    ) catch |err| {
+        if @error_id(err) == @error_id(error.WorkspaceScanPermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        if @error_id(err) == @error_id(error.ManifestReservedName) {
+            return error.AddReservedName;
+        }
+        if add_manifest_path_error_is_invalid(@error_id(err)) {
+            return error.AddInvalidPath;
+        }
+        if @error_id(err) == @error_id(error.WorkspaceScanUnsupportedFileType) {
+            return error.AddUnsupportedWorkspaceEntry;
+        }
+        return error.AddReadFailed;
+    };
 
     const stage_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STAGE_REL);
     const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
@@ -784,6 +866,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
 
     var update_index: usize = 0;
     var change_update_index: usize = 0;
+    var skipped_count: usize = 0;
     var file_index: usize = 0;
     while file_index < scanned_files.len {
         const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
@@ -805,11 +888,31 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         if cached_object.hit {
             stored_id = cached_object.object_id;
         } else {
-            const file_bytes: AddOwnedBytes = try add_read_workspace_entry_bytes(&root_fs_path, file_entry);
+            const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&root_fs_path, file_entry) catch |err| {
+                if add_error_is_skippable(@error_id(err)) {
+                    if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
+                    } else {
+                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+                    }
+                    skipped_count = skipped_count + 1 as usize;
+                    file_index = file_index + 1 as usize;
+                    continue;
+                }
+                return err;
+            };
             defer {
                 add_owned_bytes_free(&file_bytes);
             }
-            stored_id = try add_store_worktree_object(&store, &chunk_store, file_entry, add_owned_bytes_slice(&file_bytes));
+            stored_id = add_store_worktree_object(&store, &chunk_store, file_entry, add_owned_bytes_slice(&file_bytes)) catch |err| {
+                if add_error_is_skippable(@error_id(err)) {
+                    add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+                    skipped_count = skipped_count + 1 as usize;
+                    file_index = file_index + 1 as usize;
+                    continue;
+                }
+                return err;
+            };
         }
 
         const existing_local_change_index: isize = add_find_local_change(&existing_local_changes, &file_entry.path);
@@ -923,7 +1026,10 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 return error.AddLocalChangeWriteFailed;
             };
         }
-        return 0 as usize;
+        return AddStageResult{
+            staged_count: 0 as usize,
+            skipped_count: skipped_count,
+        };
     }
 
     add_sort_stage_entries(raw_updates, update_index);
@@ -949,7 +1055,10 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
             return error.AddLocalChangeWriteFailed;
         };
     }
-    return update_index;
+    return AddStageResult{
+        staged_count: update_index,
+        skipped_count: skipped_count,
+    };
 }
 
 export fn run_add() i32 {
@@ -960,7 +1069,7 @@ export fn run_add() i32 {
     }
 
     const pathspec_count: usize = (argc - 2) as usize;
-    const pathspec_storage: &byte = malloc(ADD_ARENA_BYTES) as &byte;
+    const pathspec_storage: &byte = malloc(ADD_PATHSPEC_ARENA_BYTES) as &byte;
     if pathspec_storage == null {
         fprintf(stderr, "%s" as *byte, ADD_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
@@ -969,7 +1078,7 @@ export fn run_add() i32 {
         free(pathspec_storage as &void);
     }
     var pathspec_arena: Arena = Arena{ buffer: pathspec_storage, size: 0, used: 0 };
-    arena_init(&pathspec_arena, pathspec_storage, ADD_ARENA_BYTES);
+    arena_init(&pathspec_arena, pathspec_storage, ADD_PATHSPEC_ARENA_BYTES);
 
     const raw_specs: &ByteList = arena_alloc(&pathspec_arena, @size_of(ByteList) as usize * pathspec_count) as &ByteList;
     if raw_specs == null {
@@ -980,7 +1089,15 @@ export fn run_add() i32 {
     var i: usize = 0;
     while i < pathspec_count {
         const raw_arg: &byte = get_argv(i as i32 + 2);
-        const normalized: ByteList = manifest_path_normalize(&pathspec_arena, (raw_arg as &byte)[0: strlen(raw_arg as &const byte)]) catch {
+        const normalized: ByteList = manifest_path_normalize(&pathspec_arena, (raw_arg as &byte)[0: strlen(raw_arg as &const byte)]) catch |err| {
+            if @error_id(err) == @error_id(error.ManifestReservedName) {
+                fprintf(stderr, "%s" as *byte, ADD_RESERVED_NAME_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            if add_manifest_path_error_is_invalid(@error_id(err)) {
+                fprintf(stderr, "%s" as *byte, ADD_INVALID_PATH_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
             fprintf(stderr, "%s" as *byte, ADD_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
         };
@@ -1002,7 +1119,7 @@ export fn run_add() i32 {
     };
 
     const pathspecs: ManifestPathspecList = manifest_pathspec_list_from_slice(raw_specs[0: pathspec_count]);
-    _ = add_stage_pathspecs(&root, pathspecs) catch |err| {
+    const result: AddStageResult = add_stage_pathspecs(&root, pathspecs) catch |err| {
         if @error_id(err) == @error_id(error.AddNoMatches) {
             fprintf(stderr, "%s" as *byte, ADD_NO_MATCH_TEXT);
             return EXIT_RUNTIME_ERROR;
@@ -1010,6 +1127,18 @@ export fn run_add() i32 {
         if @error_id(err) == @error_id(error.AddLargeFileNotImplemented) {
             fprintf(stderr, "%s" as *byte, ADD_LARGE_FILE_TEXT);
             return EXIT_NOT_IMPLEMENTED;
+        }
+        if @error_id(err) == @error_id(error.AddInvalidPath) {
+            fprintf(stderr, "%s" as *byte, ADD_INVALID_PATH_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.AddReservedName) {
+            fprintf(stderr, "%s" as *byte, ADD_RESERVED_NAME_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.AddUnsupportedWorkspaceEntry) {
+            fprintf(stderr, "%s" as *byte, ADD_UNSUPPORTED_WORKSPACE_ENTRY_TEXT);
+            return EXIT_RUNTIME_ERROR;
         }
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
             fprintf(stderr, "%s" as *byte, ADD_PERMISSION_TEXT);
@@ -1019,5 +1148,6 @@ export fn run_add() i32 {
         return EXIT_RUNTIME_ERROR;
     };
 
+    _ = result;
     return EXIT_OK;
 }

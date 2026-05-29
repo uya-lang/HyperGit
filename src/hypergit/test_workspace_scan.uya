@@ -71,8 +71,8 @@ fn test_workspace_scan_keeps_symlink_entries_without_recursing() !void {
     try expect(files.ptr[2].file_mode == 0o120000u32);
 }
 
-fn test_workspace_scan_rejects_reserved_manifest_paths() !void {
-    const setup_status: i32 = system("rm -rf build/workspace-scan-invalid-test && mkdir -p build/workspace-scan-invalid-test/repo && printf data > build/workspace-scan-invalid-test/repo/CON");
+fn test_workspace_scan_rejects_windows_incompatible_trailing_dot_paths() !void {
+    const setup_status: i32 = system("rm -rf build/workspace-scan-invalid-test && mkdir -p build/workspace-scan-invalid-test/repo && printf data > 'build/workspace-scan-invalid-test/repo/name.'");
     try expect(setup_status == 0);
 
     var arena_buf: [byte: 16384] = [];
@@ -115,7 +115,7 @@ export fn main() i32 {
     test_suite_begin("HyperGit Workspace Scan Tests");
     run_test("workspace scan skips hgit and sorts paths", test_workspace_scan_skips_hgit_and_sorts_paths);
     run_test("workspace scan keeps symlink entries without recursing", test_workspace_scan_keeps_symlink_entries_without_recursing);
-    run_test("workspace scan rejects reserved manifest paths", test_workspace_scan_rejects_reserved_manifest_paths);
+    run_test("workspace scan rejects windows incompatible trailing dot paths", test_workspace_scan_rejects_windows_incompatible_trailing_dot_paths);
     run_test("workspace scan pathspec limits to requested subtrees", test_workspace_scan_pathspec_limits_to_requested_subtrees);
     return test_suite_end();
 }

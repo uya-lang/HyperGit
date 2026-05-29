@@ -79,6 +79,8 @@ test:
 	./tests/test_add_stage_concurrent.sh
 	./tests/test_add_fast_path.sh
 	./tests/test_add_pathspec_scan.sh
+	./tests/test_add_permission_error.sh
+	./tests/test_add_reserved_name_error.sh
 	./tests/test_add_delete.sh
 	./tests/test_add_large_file.sh
 	./tests/test_add_large_file_small_edit.sh
@@ -107,6 +109,7 @@ test:
 	./tests/test_http_remote_smoke.sh
 	./tests/test_status_empty.sh
 	./tests/test_status_clean.sh
+	./tests/test_status_reserved_name_error.sh
 	./tests/test_status_split.sh
 	./tests/test_loose_store_concurrent.sh
 

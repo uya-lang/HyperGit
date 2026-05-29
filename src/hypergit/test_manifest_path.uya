@@ -233,10 +233,13 @@ fn test_reject_invalid_utf8() !void {
     try expect_normalize_error(truncated_three_byte[0: 2], @error_id(error.ManifestInvalidUtf8));
 }
 
-fn test_reject_reserved_names_and_trailing_space_dot() !void {
-    try expect_normalize_literal_error("CON", @error_id(error.ManifestReservedName));
-    try expect_normalize_literal_error("aux.txt", @error_id(error.ManifestReservedName));
-    try expect_normalize_literal_error("dir/Lpt9.log", @error_id(error.ManifestReservedName));
+fn test_allow_windows_device_names_in_manifest_paths() !void {
+    try expect_normalized_literal("CON", "CON");
+    try expect_normalized_literal("aux.txt", "aux.txt");
+    try expect_normalized_literal("dir/Lpt9.log", "dir/Lpt9.log");
+}
+
+fn test_reject_trailing_space_dot_segments() !void {
     try expect_normalize_literal_error("name.", @error_id(error.ManifestReservedName));
     try expect_normalize_literal_error("dir/file /tail", @error_id(error.ManifestReservedName));
 }
@@ -256,6 +259,7 @@ export fn main() i32 {
     run_test("reject parent traversal segments", test_reject_parent_traversal_segments);
     run_test("reject invalid characters", test_reject_invalid_characters);
     run_test("reject invalid utf8", test_reject_invalid_utf8);
-    run_test("reject reserved names and trailing space dot", test_reject_reserved_names_and_trailing_space_dot);
+    run_test("allow windows device names in manifest paths", test_allow_windows_device_names_in_manifest_paths);
+    run_test("reject trailing space dot segments", test_reject_trailing_space_dot_segments);
     return test_suite_end();
 }
