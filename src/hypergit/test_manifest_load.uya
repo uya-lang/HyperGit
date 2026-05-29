@@ -1,0 +1,165 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.system;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use core.ids.ManifestId;
+use manifest.load.manifest_load_flatten;
+use manifest.load.manifest_load_flatten_pathspecs;
+use manifest.path.manifest_path_normalize;
+use manifest.query.manifest_pathspec_list_from_slice;
+use manifest.root.manifest_root_build_and_store;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(make_hash(seed));
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(make_object_id(seed));
+}
+
+fn normalize_literal(arena: &Arena, text: &const byte) !ByteList {
+    return try manifest_path_normalize(arena, literal_bytes(text));
+}
+
+fn make_leaf_input(arena: &Arena, text: &const byte, seed: byte) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try normalize_literal(arena, text),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: make_object_id(seed),
+        logical_size: seed as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: make_policy_id(seed + 20 as byte),
+    };
+}
+
+fn expect_path(entries: &ManifestLeafInputList, index: usize, expected: &const byte) !void {
+    const text: &[byte] = literal_bytes(expected);
+    try expect(entries.ptr[index].path.len == text.len);
+    var i: usize = 0 as usize;
+    while i < text.len {
+        try expect(entries.ptr[index].path.ptr[i] == text.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn build_sample_manifest(store_root: &const byte) !void {
+    const store: LooseObjectStore = try loose_store_open(store_root);
+
+    var input_arena_buf: [byte: 32768] = [];
+    var input_arena: Arena = Arena{ buffer: &input_arena_buf[0], size: 0, used: 0 };
+    arena_init(&input_arena, &input_arena_buf[0], 32768 as usize);
+
+    const input0: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "docs/readme.md", 11 as byte);
+    const input1: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/lib/a.uya", 12 as byte);
+    const input2: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/lib/b.uya", 13 as byte);
+    const input3: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "src/main.uya", 14 as byte);
+    const input4: ManifestLeafInputEntry = try make_leaf_input(&input_arena, "tests/main.uya", 15 as byte);
+    var inputs: [ManifestLeafInputEntry: 5] = [input0, input1, input2, input3, input4];
+
+    var build_arena_buf: [byte: 131072] = [];
+    var build_arena: Arena = Arena{ buffer: &build_arena_buf[0], size: 0, used: 0 };
+    arena_init(&build_arena, &build_arena_buf[0], 131072 as usize);
+
+    const root_id: ManifestId = try manifest_root_build_and_store(
+        &build_arena,
+        &store,
+        manifest_leaf_input_list_from_slice(inputs[0: 5]),
+    );
+
+    var load_arena_buf: [byte: 131072] = [];
+    var load_arena: Arena = Arena{ buffer: &load_arena_buf[0], size: 0, used: 0 };
+    arena_init(&load_arena, &load_arena_buf[0], 131072 as usize);
+
+    const lib_spec: ByteList = try normalize_literal(&load_arena, "src/lib");
+    const doc_spec: ByteList = try normalize_literal(&load_arena, "docs/readme.md");
+    var specs: [ByteList: 2] = [lib_spec, doc_spec];
+    const filtered: ManifestLeafInputList = try manifest_load_flatten_pathspecs(
+        &load_arena,
+        &store,
+        &root_id,
+        manifest_pathspec_list_from_slice(specs[0: 2]),
+    );
+    try expect(filtered.len == 3 as usize);
+    try expect_path(&filtered, 0 as usize, "docs/readme.md");
+    try expect_path(&filtered, 1 as usize, "src/lib/a.uya");
+    try expect_path(&filtered, 2 as usize, "src/lib/b.uya");
+
+    var full_arena_buf: [byte: 131072] = [];
+    var full_arena: Arena = Arena{ buffer: &full_arena_buf[0], size: 0, used: 0 };
+    arena_init(&full_arena, &full_arena_buf[0], 131072 as usize);
+    const all_spec: ByteList = try normalize_literal(&full_arena, "");
+    var all_specs: [ByteList: 1] = [all_spec];
+    const filtered_all: ManifestLeafInputList = try manifest_load_flatten_pathspecs(
+        &full_arena,
+        &store,
+        &root_id,
+        manifest_pathspec_list_from_slice(all_specs[0: 1]),
+    );
+    try expect(filtered_all.len == 5 as usize);
+    try expect_path(&filtered_all, 0 as usize, "docs/readme.md");
+    try expect_path(&filtered_all, 1 as usize, "src/lib/a.uya");
+    try expect_path(&filtered_all, 2 as usize, "src/lib/b.uya");
+    try expect_path(&filtered_all, 3 as usize, "src/main.uya");
+    try expect_path(&filtered_all, 4 as usize, "tests/main.uya");
+
+    var exact_arena_buf: [byte: 131072] = [];
+    var exact_arena: Arena = Arena{ buffer: &exact_arena_buf[0], size: 0, used: 0 };
+    arena_init(&exact_arena, &exact_arena_buf[0], 131072 as usize);
+    const flattened: ManifestLeafInputList = try manifest_load_flatten(&exact_arena, &store, &root_id);
+    try expect(flattened.len == filtered_all.len);
+    var i: usize = 0 as usize;
+    while i < flattened.len {
+        try expect(flattened.ptr[i].path.len == filtered_all.ptr[i].path.len);
+        var j: usize = 0 as usize;
+        while j < flattened.ptr[i].path.len {
+            try expect(flattened.ptr[i].path.ptr[j] == filtered_all.ptr[i].path.ptr[j]);
+            j = j + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+}
+
+fn test_manifest_load_flatten_pathspecs_filters_matching_entries() !void {
+    try expect(system("rm -rf build/manifest-load-filter && mkdir -p build/manifest-load-filter/objects/loose") == 0);
+    try build_sample_manifest("build/manifest-load-filter/objects/loose");
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Manifest Load Tests");
+    run_test("manifest load flatten pathspecs filters matching entries", test_manifest_load_flatten_pathspecs_filters_matching_entries);
+    return test_suite_end();
+}

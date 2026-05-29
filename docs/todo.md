@@ -374,7 +374,7 @@
 - [x] 基准重复 `hgx add` 命中 metadata fast path。
 - [ ] 基准 large file chunk。
 - [ ] 基准 hydrate。
-- [ ] 记录每次基准命令和机器信息。
+- [x] 记录每次基准命令和机器信息。
 
 ## 23. Release Readiness
 

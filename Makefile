@@ -51,6 +51,7 @@ test:
 	$(UYA) test src/hypergit/test_manifest_shard.uya
 	$(UYA) test src/hypergit/test_manifest_root.uya
 	$(UYA) test src/hypergit/test_manifest_query.uya
+	$(UYA) test src/hypergit/test_manifest_load.uya
 	$(UYA) test src/hypergit/test_manifest_flat_diff.uya
 	$(UYA) test src/hypergit/test_manifest_diff.uya
 	$(UYA) test src/hypergit/test_commit_build.uya
@@ -82,6 +83,7 @@ test:
 	./tests/test_add_permission_error.sh
 	./tests/test_add_reserved_name_error.sh
 	./tests/test_add_delete.sh
+	./tests/test_add_delete_file_pathspec.sh
 	./tests/test_add_large_file.sh
 	./tests/test_add_large_file_small_edit.sh
 	./tests/test_add_parallel_small_blob.sh

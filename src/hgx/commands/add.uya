@@ -48,7 +48,7 @@ use large.prepare.LargePreparedChunkedBlob;
 use large.prepare.large_prepare_recommended_arena_bytes;
 use large.prepare.prepare_chunked_blob_object_id_parallel_default;
 use large.prepare.prepare_chunked_blob_repository_parallel_default;
-use manifest.load.manifest_load_flatten;
+use manifest.load.manifest_load_flatten_pathspecs;
 use manifest.path.manifest_path_compare;
 use manifest.path.manifest_path_normalize;
 use manifest.query.ManifestPathspecList;
@@ -683,7 +683,12 @@ fn add_load_local_changes(local_change_path: &RepoPath, arena: &Arena) !LocalCha
     };
 }
 
-fn add_load_base_inputs(arena: &Arena, store: &LooseObjectStore, base_commit: &CommitId) !ManifestLeafInputList {
+fn add_load_base_inputs(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    base_commit: &CommitId,
+    pathspecs: ManifestPathspecList,
+) !ManifestLeafInputList {
     const zero_commit: CommitId = stage_zero_commit_id();
     if commit_id_compare(base_commit, &zero_commit) == 0 {
         return ManifestLeafInputList{ ptr: null, len: 0 };
@@ -696,31 +701,47 @@ fn add_load_base_inputs(arena: &Arena, store: &LooseObjectStore, base_commit: &C
     const payload: CommitPayload = decode_commit_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
         return error.AddStoreFailed;
     };
-    return manifest_load_flatten(arena, store, &payload.manifest_root) catch {
+    return manifest_load_flatten_pathspecs(
+        arena,
+        store,
+        &payload.manifest_root,
+        ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+    ) catch {
         return error.AddStoreFailed;
     };
 }
 
 fn add_find_base_entry(base_inputs: ManifestLeafInputList, path: &ByteList) isize {
-    var i: usize = 0;
-    while i < base_inputs.len {
-        if add_byte_list_equal(&base_inputs.ptr[i].path, path) {
-            return i as isize;
+    var low: usize = 0 as usize;
+    var high: usize = base_inputs.len;
+    while low < high {
+        const mid: usize = low + ((high - low) / 2 as usize);
+        const cmp: i32 = manifest_path_compare(&base_inputs.ptr[mid].path, path);
+        if cmp < 0 {
+            low = mid + 1 as usize;
+        } else {
+            high = mid;
         }
-        i = i + 1 as usize;
+    }
+    if low < base_inputs.len && manifest_path_compare(&base_inputs.ptr[low].path, path) == 0 {
+        return low as isize;
     }
     return -1;
 }
 
 fn add_workspace_has_path(files: &WorkspaceFileList, path: &ByteList) bool {
-    var i: usize = 0;
-    while i < files.len {
-        if add_byte_list_equal(&files.ptr[i].path, path) {
-            return true;
+    var low: usize = 0 as usize;
+    var high: usize = files.len;
+    while low < high {
+        const mid: usize = low + ((high - low) / 2 as usize);
+        const cmp: i32 = manifest_path_compare(&files.ptr[mid].path, path);
+        if cmp < 0 {
+            low = mid + 1 as usize;
+        } else {
+            high = mid;
         }
-        i = i + 1 as usize;
     }
-    return false;
+    return low < files.len && manifest_path_compare(&files.ptr[low].path, path) == 0;
 }
 
 fn add_find_local_change(changes: &LocalChangeList, path: &ByteList) isize {
@@ -1113,18 +1134,23 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     const existing_snapshot: StageSnapshot = try add_load_existing_snapshot(&stage_path, &arena);
     const existing_local_changes: LocalChangeList = try add_load_local_changes(&local_change_path, &arena);
 
-    const matched_count: usize = add_count_matches(&scanned_files, &pathspecs);
+    const matched_count: usize = scanned_files.len;
 
     const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
     const store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
     const chunk_store_root: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_CHUNKS_REL);
     const chunk_store: ChunkStore = try chunk_store_open(repo_path_cstr(&chunk_store_root));
-    const base_inputs: ManifestLeafInputList = try add_load_base_inputs(&arena, &store, &existing_snapshot.state.base_commit);
+    const base_inputs: ManifestLeafInputList = try add_load_base_inputs(
+        &arena,
+        &store,
+        &existing_snapshot.state.base_commit,
+        ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+    );
 
     var delete_match_count: usize = 0;
     var base_index: usize = 0;
     while base_index < base_inputs.len {
-        if manifest_pathspec_matches_any(pathspecs, &base_inputs.ptr[base_index].path) && !add_workspace_has_path(&scanned_files, &base_inputs.ptr[base_index].path) {
+        if !add_workspace_has_path(&scanned_files, &base_inputs.ptr[base_index].path) {
             delete_match_count = delete_match_count + 1 as usize;
         }
         base_index = base_index + 1 as usize;
@@ -1168,11 +1194,6 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         var file_index: usize = 0 as usize;
         while file_index < scanned_files.len {
             const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
-            if !manifest_pathspec_matches_any(pathspecs, &file_entry.path) {
-                file_index = file_index + 1 as usize;
-                continue;
-            }
-
             const base_entry_index: isize = add_find_base_entry(
                 ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
                 &file_entry.path,
@@ -1289,11 +1310,6 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         var file_index: usize = 0 as usize;
         while file_index < scanned_files.len {
             const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
-            if !manifest_pathspec_matches_any(pathspecs, &file_entry.path) {
-                file_index = file_index + 1 as usize;
-                continue;
-            }
-
             const base_entry_index: isize = add_find_base_entry(
                 ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
                 &file_entry.path,
@@ -1352,7 +1368,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     base_index = 0;
     while base_index < base_inputs.len {
         const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_index];
-        if manifest_pathspec_matches_any(pathspecs, &base_entry.path) && !add_workspace_has_path(&scanned_files, &base_entry.path) {
+        if !add_workspace_has_path(&scanned_files, &base_entry.path) {
             const existing_local_change_index: isize = add_find_local_change(&existing_local_changes, &base_entry.path);
             var watcher_seq: u64 = 0u64;
             var reconcile_epoch: u64 = 0u64;

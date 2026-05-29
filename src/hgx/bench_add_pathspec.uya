@@ -1,0 +1,387 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.time.now_ms;
+
+use libc.fprintf;
+use libc.free;
+use libc.malloc;
+use libc.stderr;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.load.manifest_load_flatten;
+use manifest.load.manifest_load_flatten_pathspecs;
+use manifest.query.ManifestPathspecList;
+use manifest.query.manifest_pathspec_list_from_slice;
+use manifest.root.manifest_root_build_and_store;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+
+export const BENCH_ADD_PATHSPEC_USAGE_TEXT: &const byte =
+    "usage: bench_add_pathspec <entry-count> <objects-root>\n";
+
+const BENCH_GROUP_COUNT: usize = 20 as usize;
+const BENCH_ITERATIONS: usize = 3 as usize;
+
+error BenchAddAlloc;
+error BenchAddParse;
+
+fn bench_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn bench_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(bench_hash(seed));
+}
+
+fn bench_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(bench_object_id(seed));
+}
+
+fn bench_parse_usize(text: &byte) !usize {
+    if text == null || text[0] == 0 as byte {
+        return error.BenchAddParse;
+    }
+
+    var value: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while text[i] != 0 as byte {
+        if text[i] < '0' as byte || text[i] > '9' as byte {
+            return error.BenchAddParse;
+        }
+        value = value * 10 as usize + (text[i] - '0' as byte) as usize;
+        i = i + 1 as usize;
+    }
+    if value == 0 as usize {
+        return error.BenchAddParse;
+    }
+    return value;
+}
+
+fn bench_group_count(total_entries: usize) usize {
+    if total_entries < BENCH_GROUP_COUNT {
+        return total_entries;
+    }
+    return BENCH_GROUP_COUNT;
+}
+
+fn bench_files_per_group(total_entries: usize, group_count: usize) usize {
+    return (total_entries + group_count - 1 as usize) / group_count;
+}
+
+fn bench_make_u32_decimal_fixed(raw: &byte, width: usize, value: usize) void {
+    var divisor: usize = 1 as usize;
+    var i: usize = 1 as usize;
+    while i < width {
+        divisor = divisor * 10 as usize;
+        i = i + 1 as usize;
+    }
+
+    i = 0 as usize;
+    while i < width {
+        raw[i] = ('0' as byte) + ((value / divisor) % 10 as usize) as byte;
+        if divisor > 1 as usize {
+            divisor = divisor / 10 as usize;
+        }
+        i = i + 1 as usize;
+    }
+}
+
+fn bench_make_path(arena: &Arena, total_entries: usize, index: usize) !ByteList {
+    const group_count: usize = bench_group_count(total_entries);
+    const files_per_group: usize = bench_files_per_group(total_entries, group_count);
+    const group_index: usize = index / files_per_group;
+    const file_index: usize = index % files_per_group;
+    const total_len: usize = 24 as usize;
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.BenchAddAlloc;
+    }
+
+    raw[0] = 's' as byte;
+    raw[1] = 'r' as byte;
+    raw[2] = 'c' as byte;
+    raw[3] = '/' as byte;
+    raw[4] = 'p' as byte;
+    raw[5] = 'k' as byte;
+    raw[6] = 'g' as byte;
+    bench_make_u32_decimal_fixed(&raw[7], 2 as usize, group_index);
+    raw[9] = '/' as byte;
+    raw[10] = 'f' as byte;
+    raw[11] = 'i' as byte;
+    raw[12] = 'l' as byte;
+    raw[13] = 'e' as byte;
+    bench_make_u32_decimal_fixed(&raw[14], 6 as usize, file_index);
+    raw[20] = '.' as byte;
+    raw[21] = 't' as byte;
+    raw[22] = 'x' as byte;
+    raw[23] = 't' as byte;
+    return ByteList{ ptr: raw, len: total_len };
+}
+
+fn bench_make_dir_path(arena: &Arena, group_index: usize) !ByteList {
+    const total_len: usize = 9 as usize;
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.BenchAddAlloc;
+    }
+
+    raw[0] = 's' as byte;
+    raw[1] = 'r' as byte;
+    raw[2] = 'c' as byte;
+    raw[3] = '/' as byte;
+    raw[4] = 'p' as byte;
+    raw[5] = 'k' as byte;
+    raw[6] = 'g' as byte;
+    bench_make_u32_decimal_fixed(&raw[7], 2 as usize, group_index);
+    return ByteList{ ptr: raw, len: total_len };
+}
+
+fn bench_make_input(arena: &Arena, total_entries: usize, index: usize) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try bench_make_path(arena, total_entries, index),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: bench_object_id((index % 200 as usize) as byte),
+        logical_size: index as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: bench_policy_id((index % 200 as usize) as byte + 20 as byte),
+    };
+}
+
+fn bench_load_arena_bytes(total_entries: usize) usize {
+    return @size_of(ManifestLeafInputEntry) as usize * total_entries * 2 as usize +
+        total_entries * 128 as usize +
+        67108864 as usize;
+}
+
+fn bench_measure_full(store: &LooseObjectStore, root_id: &ManifestId, total_entries: usize) !u64 {
+    var total_ms: u64 = 0u64;
+    var iter: usize = 0 as usize;
+    while iter < BENCH_ITERATIONS {
+        const arena_bytes: usize = bench_load_arena_bytes(total_entries);
+        const arena_storage: &byte = malloc(arena_bytes) as &byte;
+        if arena_storage == null {
+            return error.BenchAddAlloc;
+        }
+        var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+        arena_init(&arena, arena_storage, arena_bytes);
+
+        const started_ms: u64 = now_ms() catch {
+            free(arena_storage as &void);
+            return error.BenchAddParse;
+        };
+        const inputs: ManifestLeafInputList = try manifest_load_flatten(&arena, store, root_id);
+        const finished_ms: u64 = now_ms() catch {
+            free(arena_storage as &void);
+            return error.BenchAddParse;
+        };
+        if inputs.len != total_entries {
+            free(arena_storage as &void);
+            return error.BenchAddParse;
+        }
+        total_ms = total_ms + (finished_ms - started_ms);
+        free(arena_storage as &void);
+        iter = iter + 1 as usize;
+    }
+    return total_ms / BENCH_ITERATIONS as u64;
+}
+
+fn bench_measure_pathspec(
+    store: &LooseObjectStore,
+    root_id: &ManifestId,
+    total_entries: usize,
+    pathspecs: ManifestPathspecList,
+    expected_len: usize,
+) !u64 {
+    var total_ms: u64 = 0u64;
+    var iter: usize = 0 as usize;
+    while iter < BENCH_ITERATIONS {
+        const arena_bytes: usize = bench_load_arena_bytes(total_entries);
+        const arena_storage: &byte = malloc(arena_bytes) as &byte;
+        if arena_storage == null {
+            return error.BenchAddAlloc;
+        }
+        var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+        arena_init(&arena, arena_storage, arena_bytes);
+
+        const started_ms: u64 = now_ms() catch {
+            free(arena_storage as &void);
+            return error.BenchAddParse;
+        };
+        const inputs: ManifestLeafInputList = try manifest_load_flatten_pathspecs(
+            &arena,
+            store,
+            root_id,
+            ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+        );
+        const finished_ms: u64 = now_ms() catch {
+            free(arena_storage as &void);
+            return error.BenchAddParse;
+        };
+        if inputs.len != expected_len {
+            free(arena_storage as &void);
+            return error.BenchAddParse;
+        }
+        total_ms = total_ms + (finished_ms - started_ms);
+        free(arena_storage as &void);
+        iter = iter + 1 as usize;
+    }
+    return total_ms / BENCH_ITERATIONS as u64;
+}
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    if argc != 3 {
+        fprintf(stderr, "%s" as *byte, BENCH_ADD_PATHSPEC_USAGE_TEXT);
+        return 1;
+    }
+
+    const total_entries: usize = bench_parse_usize(get_argv(1)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_ADD_PATHSPEC_USAGE_TEXT);
+        return 1;
+    };
+    const objects_root: &byte = get_argv(2);
+    if objects_root == null || objects_root[0] == 0 as byte {
+        fprintf(stderr, "%s" as *byte, BENCH_ADD_PATHSPEC_USAGE_TEXT);
+        return 1;
+    }
+
+    const input_bytes: usize = @size_of(ManifestLeafInputEntry) as usize * total_entries +
+        total_entries * 64 as usize +
+        1048576 as usize;
+    const build_bytes: usize = @size_of(usize) as usize * total_entries * 4 as usize +
+        @size_of(ManifestLeafInputEntry) as usize * total_entries * 2 as usize +
+        total_entries * 96 as usize +
+        33554432 as usize;
+
+    const input_storage: &byte = malloc(input_bytes) as &byte;
+    if input_storage == null {
+        return 1;
+    }
+    defer {
+        free(input_storage as &void);
+    }
+    var input_arena: Arena = Arena{ buffer: input_storage, size: 0, used: 0 };
+    arena_init(&input_arena, input_storage, input_bytes);
+
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(
+        &input_arena,
+        @size_of(ManifestLeafInputEntry) as usize * total_entries,
+    ) as &ManifestLeafInputEntry;
+    if raw_inputs == null {
+        return 1;
+    }
+
+    var i: usize = 0 as usize;
+    while i < total_entries {
+        raw_inputs[i] = bench_make_input(&input_arena, total_entries, i) catch |err| {
+            fprintf(stderr, "input_build_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+        i = i + 1 as usize;
+    }
+
+    const build_storage: &byte = malloc(build_bytes) as &byte;
+    if build_storage == null {
+        return 1;
+    }
+    defer {
+        free(build_storage as &void);
+    }
+    var build_arena: Arena = Arena{ buffer: build_storage, size: 0, used: 0 };
+    arena_init(&build_arena, build_storage, build_bytes);
+
+    const store: LooseObjectStore = loose_store_open(objects_root) catch {
+        fprintf(stderr, "store_open_error\n" as *byte);
+        return 1;
+    };
+    const root_id: ManifestId = manifest_root_build_and_store(
+        &build_arena,
+        &store,
+        manifest_leaf_input_list_from_slice(raw_inputs[0: total_entries]),
+    ) catch |err| {
+        fprintf(stderr, "manifest_store_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    const group_count: usize = bench_group_count(total_entries);
+    const files_per_group: usize = bench_files_per_group(total_entries, group_count);
+    var target_group: usize = 5 as usize;
+    if target_group >= group_count {
+        target_group = group_count - 1 as usize;
+    }
+    var target_index: usize = target_group * files_per_group + (files_per_group / 2 as usize);
+    if target_index >= total_entries {
+        target_index = total_entries - 1 as usize;
+    }
+    const file_pathspec: ByteList = bench_make_path(&input_arena, total_entries, target_index) catch {
+        fprintf(stderr, "pathspec_build_error\n" as *byte);
+        return 1;
+    };
+    const dir_pathspec: ByteList = bench_make_dir_path(&input_arena, target_group) catch {
+        fprintf(stderr, "pathspec_build_error\n" as *byte);
+        return 1;
+    };
+    var file_specs: [ByteList: 1] = [file_pathspec];
+    var dir_specs: [ByteList: 1] = [dir_pathspec];
+
+    const full_avg_ms: u64 = bench_measure_full(&store, &root_id, total_entries) catch |err| {
+        fprintf(stderr, "full_bench_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const file_avg_ms: u64 = bench_measure_pathspec(
+        &store,
+        &root_id,
+        total_entries,
+        manifest_pathspec_list_from_slice(file_specs[0: 1]),
+        1 as usize,
+    ) catch |err| {
+        fprintf(stderr, "file_bench_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    var dir_expected_len: usize = files_per_group;
+    if (target_group + 1 as usize) * files_per_group > total_entries {
+        dir_expected_len = total_entries - target_group * files_per_group;
+    }
+    const dir_avg_ms: u64 = bench_measure_pathspec(
+        &store,
+        &root_id,
+        total_entries,
+        manifest_pathspec_list_from_slice(dir_specs[0: 1]),
+        dir_expected_len,
+    ) catch |err| {
+        fprintf(stderr, "dir_bench_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    fprintf(
+        stderr,
+        "entries=%llu full_avg_ms=%llu file_pathspec_avg_ms=%llu dir_pathspec_avg_ms=%llu file_matches=1 dir_matches=%llu\n" as *byte,
+        total_entries as u64,
+        full_avg_ms,
+        file_avg_ms,
+        dir_avg_ms,
+        dir_expected_len as u64,
+    );
+    return 0;
+}
