@@ -6,6 +6,7 @@ use std.async.Future;
 use std.async.block_on;
 use std.async.future_ready_ok;
 use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
 use std.mem.arena.arena_init;
 use std.runtime.get_argc;
 use std.runtime.get_argv;
@@ -44,7 +45,9 @@ use large.chunk_store.ChunkStore;
 use large.chunk_store.chunk_store_open;
 use large.range_read.chunked_blob_read_range;
 use manifest.load.manifest_load_flatten;
+use manifest.path.manifest_path_compare;
 use manifest.path.manifest_path_normalize;
+use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
 use object.codec.decode_chunked_blob_object;
 use object.codec.decode_commit_object;
@@ -64,6 +67,7 @@ use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
 use store.repo_layout.HGIT_WORKSPACE_SPARSE_REL;
+use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STATE_REL;
 use store.repo_layout.REPO_PATH_MAX;
 use store.repo_layout.RepoConfig;
@@ -74,7 +78,9 @@ use store.repo_layout.repo_path_join_literal;
 use store.repo_layout.repo_read_config;
 use workspace.checkout_plan.CheckoutAction;
 use workspace.checkout_plan.CheckoutActionKind;
+use workspace.checkout_plan.CheckoutActionList;
 use workspace.checkout_plan.CheckoutPlan;
+use workspace.checkout_plan.CheckoutPathList;
 use workspace.checkout_plan.checkout_plan_build;
 use workspace.local_change_file.local_change_file_read;
 use workspace.local_change_file.local_change_file_write;
@@ -84,7 +90,16 @@ use workspace.local_view.workspace_local_view_merge_virtual_changes;
 use workspace.reconcile.workspace_reconcile_scan;
 use workspace.sparse_profile.SparseProfile;
 use workspace.sparse_profile.sparse_profile_file_default;
+use workspace.stage.StageEntryKind;
+use workspace.stage.StageEntry;
+use workspace.stage.StageEntryList;
+use workspace.stage.StageSnapshot;
+use workspace.stage.stage_empty_snapshot;
+use workspace.stage_file.stage_file_read;
+use workspace.stage_view.stage_view_manifest_inputs_from_snapshot;
 use workspace.state.LocalChangeList;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
 use workspace.state.WorkspaceState;
 use workspace.state.local_change_dirty_count;
 use workspace.state.local_change_materialized_count;
@@ -200,6 +215,15 @@ fn checkout_resolve_commit_spec(root: &RepoPath, config: &RepoConfig, spec: &byt
         return try commit_id_decode_hex((spec as &byte)[0: HASH32_HEX_BYTES]);
     }
     return error.CheckoutInvalidSpec;
+}
+
+fn checkout_is_restore_workspace_request(argc: i32) bool {
+    if argc == 3 && checkout_same_arg(get_argv(2), ".") {
+        return true;
+    }
+    return argc == 4 &&
+        checkout_same_arg(get_argv(2), "--") &&
+        checkout_same_arg(get_argv(3), ".");
 }
 
 fn checkout_repo_root_bytes(root: &RepoPath) ByteList {
@@ -662,6 +686,98 @@ export fn checkout_current_sparse_profile(arena: &Arena, root: &RepoPath) !Spars
     };
 }
 
+fn checkout_load_stage_snapshot(root: &RepoPath, arena: &Arena) !StageSnapshot {
+    const stage_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STAGE_REL);
+    return stage_file_read(repo_path_cstr(&stage_path) as &const byte, arena) catch |err| {
+        if @error_id(err) == @error_id(error.StageFileNotFound) {
+            return stage_empty_snapshot(0i64);
+        }
+        return error.CheckoutFailure;
+    };
+}
+
+fn checkout_restore_should_delete(stage_entries: &StageEntryList, path: &ByteList) bool {
+    var i: usize = 0;
+    while i < stage_entries.len {
+        const entry: &StageEntry = &stage_entries.ptr[i];
+        const cmp: i32 = manifest_path_compare(&entry.path, path);
+        if cmp == 0 {
+            return entry.kind == StageEntryKind.Delete;
+        }
+        if cmp > 0 {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn checkout_restore_plan_build(
+    arena: &Arena,
+    target_inputs: &ManifestLeafInputList,
+    local_changes: &LocalChangeList,
+    stage_entries: &StageEntryList,
+) !CheckoutPlan {
+    if local_changes.len == 0 {
+        return CheckoutPlan{
+            actions: CheckoutActionList{ ptr: null, len: 0 },
+            blocked_paths: CheckoutPathList{ ptr: null, len: 0 },
+        };
+    }
+
+    const raw_actions: &CheckoutAction = arena_alloc(
+        arena,
+        @size_of(CheckoutAction) as usize * local_changes.len,
+    ) as &CheckoutAction;
+    if raw_actions == null {
+        return error.CheckoutAlloc;
+    }
+
+    var target_index: usize = 0;
+    var out_index: usize = 0;
+    var change_index: usize = 0;
+    while change_index < local_changes.len {
+        const change: &LocalChange = &local_changes.ptr[change_index];
+        while target_index < target_inputs.len &&
+            manifest_path_compare(&target_inputs.ptr[target_index].path, &change.path) < 0 {
+            target_index = target_index + 1 as usize;
+        }
+
+        var target_entry: &ManifestLeafInputEntry = null;
+        if target_index < target_inputs.len &&
+            manifest_path_compare(&target_inputs.ptr[target_index].path, &change.path) == 0 {
+            target_entry = &target_inputs.ptr[target_index];
+        }
+
+        if target_entry != null {
+            if change.status != ChangeStatus.Materialized && change.status != ChangeStatus.Virtual {
+                raw_actions[out_index] = CheckoutAction{
+                    kind: CheckoutActionKind.WriteFile,
+                    path: ByteList{ ptr: target_entry.path.ptr, len: target_entry.path.len },
+                    object_id: target_entry.object_id,
+                    file_mode: target_entry.mode,
+                };
+                out_index = out_index + 1 as usize;
+            }
+        } else if checkout_restore_should_delete(stage_entries, &change.path) {
+            raw_actions[out_index] = CheckoutAction{
+                kind: CheckoutActionKind.DeleteFile,
+                path: ByteList{ ptr: change.path.ptr, len: change.path.len },
+                object_id: ObjectId{ hash: change.base_object.hash },
+                file_mode: 0u32,
+            };
+            out_index = out_index + 1 as usize;
+        }
+
+        change_index = change_index + 1 as usize;
+    }
+
+    return CheckoutPlan{
+        actions: CheckoutActionList{ ptr: raw_actions, len: out_index },
+        blocked_paths: CheckoutPathList{ ptr: null, len: 0 },
+    };
+}
+
 export fn checkout_state_has_base_commit(state: &WorkspaceState) bool {
     return state.base_commit.id.hash.bytes[0] != 0 as byte ||
         state.base_commit.id.hash.bytes[31] != 0 as byte;
@@ -716,7 +832,8 @@ fn checkout_sync_workspace_files(
 
 export fn run_checkout() i32 {
     const argc: i32 = get_argc();
-    if argc != 3 {
+    const restore_workspace: bool = checkout_is_restore_workspace_request(argc);
+    if !restore_workspace && argc != 3 {
         fprintf(stderr, "%s" as *byte, CHECKOUT_USAGE_TEXT);
         return EXIT_USAGE_ERROR;
     }
@@ -730,20 +847,6 @@ export fn run_checkout() i32 {
         return EXIT_RUNTIME_ERROR;
     };
     const config: RepoConfig = repo_read_config(&root) catch {
-        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
-
-    const target_spec: &byte = get_argv(2);
-    const target_commit: CommitId = checkout_resolve_commit_spec(&root, &config, target_spec) catch |err| {
-        if @error_id(err) == @error_id(error.CheckoutNoCommits) {
-            fprintf(stderr, "%s" as *byte, CHECKOUT_NO_COMMITS_TEXT);
-            return EXIT_RUNTIME_ERROR;
-        }
-        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
-            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
-            return EXIT_RUNTIME_ERROR;
-        }
         fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
@@ -792,7 +895,102 @@ export fn run_checkout() i32 {
             return EXIT_RUNTIME_ERROR;
         };
     }
-    const target_inputs: ManifestLeafInputList = checkout_manifest_inputs_from_commit(&arena, &store, &target_commit) catch |err| {
+    const current_materialized: ManifestLeafInputList = workspace_local_view_filter_expected_inputs(
+        &arena,
+        &current_inputs,
+        &current_local_changes,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    if restore_workspace {
+        const stage_snapshot: StageSnapshot = checkout_load_stage_snapshot(&root, &arena) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const restore_target_inputs: ManifestLeafInputList = stage_view_manifest_inputs_from_snapshot(
+            &arena,
+            &store,
+            &stage_snapshot,
+            &current_state.base_commit,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const restore_target_materialized: ManifestLeafInputList = workspace_local_view_filter_expected_inputs(
+            &arena,
+            &restore_target_inputs,
+            &current_local_changes,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const restore_changes: LocalChangeList = workspace_reconcile_scan(
+            &arena,
+            repo_path_cstr(&root) as &const byte,
+            &restore_target_materialized,
+            current_state.watcher_seq,
+            current_state.watcher_seq + 1u64,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const restore_plan: CheckoutPlan = checkout_restore_plan_build(
+            &arena,
+            &restore_target_materialized,
+            &restore_changes,
+            &stage_snapshot.entries,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        checkout_apply_plan(&arena, &store, &root, &restore_plan) catch |err| {
+            if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+
+        const final_changes: LocalChangeList = workspace_reconcile_scan(
+            &arena,
+            repo_path_cstr(&root) as &const byte,
+            &current_materialized,
+            current_state.watcher_seq + 1u64,
+            current_state.watcher_seq + 2u64,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        checkout_sync_virtual_state(
+            &arena,
+            &root,
+            &current_state.base_commit,
+            &current_inputs,
+            &current_materialized,
+            &final_changes,
+            &current_state,
+            current_state.watcher_seq + 1u64,
+            current_state.watcher_seq + 2u64,
+        ) catch |err| {
+            if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        return EXIT_OK;
+    }
+
+    const target_spec: &byte = get_argv(2);
+    const target_commit: CommitId = checkout_resolve_commit_spec(&root, &config, target_spec) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutNoCommits) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_NO_COMMITS_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
         if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
             fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;
@@ -800,11 +998,11 @@ export fn run_checkout() i32 {
         fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
-    const current_materialized: ManifestLeafInputList = workspace_local_view_filter_expected_inputs(
-        &arena,
-        &current_inputs,
-        &current_local_changes,
-    ) catch {
+    const target_inputs: ManifestLeafInputList = checkout_manifest_inputs_from_commit(&arena, &store, &target_commit) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
         fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };

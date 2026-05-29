@@ -11,7 +11,9 @@ use libc.getenv;
 use libc.free;
 use libc.fprintf;
 use libc.malloc;
+use libc.stat;
 use libc.stderr;
+use libc.Stat;
 use cli.EXIT_NOT_IMPLEMENTED;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
@@ -55,6 +57,7 @@ use store.head_ref.repo_read_head_commit;
 use store.head_ref.repo_write_head_commit;
 use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_object_path;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_INDEXES_COMMIT_GRAPH_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
@@ -99,6 +102,8 @@ const COMMIT_ARENA_BYTES: usize = 33554432 as usize;
 const COMMIT_FILE_MODE_EXEC_BITS: u32 = 73u32;
 const COMMIT_FILE_MODE_TYPE_MASK: u32 = 61440u32;
 const COMMIT_FILE_MODE_SYMLINK: u32 = 40960u32;
+const COMMIT_OBJECT_PATH_BYTES: usize = 4096 as usize;
+const COMMIT_OBJECT_SCRATCH_EXTRA_BYTES: usize = 65536 as usize;
 
 error CommitAlloc;
 error CommitStageReadFailed;
@@ -217,6 +222,71 @@ fn commit_load_stage_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapsh
     };
 }
 
+fn commit_stage_entry_logical_size(store: &LooseObjectStore, object_id: &ObjectId) !u64 {
+    var object_path: [byte: COMMIT_OBJECT_PATH_BYTES] = [];
+    _ = loose_store_object_path(store, object_id, object_path[0: COMMIT_OBJECT_PATH_BYTES]) catch {
+        return error.CommitStoreFailed;
+    };
+
+    var st: Stat = Stat{};
+    if stat(&object_path[0] as &const byte, &st) != 0 {
+        return error.CommitStoreFailed;
+    }
+
+    var scratch_size: usize = st.st_size as usize;
+    if scratch_size == 0 as usize {
+        scratch_size = 1 as usize;
+    }
+    scratch_size = scratch_size * 2 as usize;
+    if scratch_size < st.st_size as usize {
+        return error.CommitAlloc;
+    }
+    if scratch_size + COMMIT_OBJECT_SCRATCH_EXTRA_BYTES < scratch_size {
+        return error.CommitAlloc;
+    }
+    scratch_size = scratch_size + COMMIT_OBJECT_SCRATCH_EXTRA_BYTES;
+
+    const scratch: &byte = malloc(scratch_size) as &byte;
+    if scratch == null {
+        return error.CommitAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+
+    var temp_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+    arena_init(&temp_arena, scratch, scratch_size);
+
+    const object_bytes: ObjectBytes = store.get(object_id[0], &temp_arena) catch {
+        return error.CommitStoreFailed;
+    };
+    var object_offset: usize = 0;
+    const kind: ObjectKind = decode_object_kind(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &object_offset) catch {
+        return error.CommitUnsupportedStageEntry;
+    };
+    object_offset = 0 as usize;
+    if kind == ObjectKind.SmallBlob {
+        const blob: SmallBlobPayload = decode_small_blob_object(
+            object_bytes.bytes.ptr[0: object_bytes.bytes.len],
+            &object_offset,
+        ) catch {
+            return error.CommitUnsupportedStageEntry;
+        };
+        return blob.logical_size;
+    }
+    if kind == ObjectKind.ChunkedBlob {
+        const blob: ChunkedBlobPayload = decode_chunked_blob_object(
+            &temp_arena,
+            object_bytes.bytes.ptr[0: object_bytes.bytes.len],
+            &object_offset,
+        ) catch {
+            return error.CommitUnsupportedStageEntry;
+        };
+        return blob.logical_size;
+    }
+    return error.CommitUnsupportedStageEntry;
+}
+
 fn commit_manifest_inputs_from_stage(arena: &Arena, store: &LooseObjectStore, snapshot: &StageSnapshot) !ManifestLeafInputList {
     if snapshot.entries.len == 0 {
         return ManifestLeafInputList{ ptr: null, len: 0 };
@@ -235,35 +305,12 @@ fn commit_manifest_inputs_from_stage(arena: &Arena, store: &LooseObjectStore, sn
             return error.CommitUnsupportedStageEntry;
         }
 
-        var object_offset: usize = 0;
-        const object_bytes: ObjectBytes = store.get(entry.staged_object, arena) catch {
-            return error.CommitStoreFailed;
-        };
-        const kind: ObjectKind = decode_object_kind(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &object_offset) catch {
-            return error.CommitUnsupportedStageEntry;
-        };
-        object_offset = 0 as usize;
-        var logical_size: u64 = 0u64;
-        if kind == ObjectKind.SmallBlob {
-            const blob: SmallBlobPayload = decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &object_offset) catch {
-                return error.CommitUnsupportedStageEntry;
-            };
-            logical_size = blob.logical_size;
-        } else if kind == ObjectKind.ChunkedBlob {
-            const blob: ChunkedBlobPayload = decode_chunked_blob_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &object_offset) catch {
-                return error.CommitUnsupportedStageEntry;
-            };
-            logical_size = blob.logical_size;
-        } else {
-            return error.CommitUnsupportedStageEntry;
-        }
-
         raw_inputs[out_index] = ManifestLeafInputEntry{
             path: commit_clone_byte_list(&entry.path),
             kind: commit_stage_entry_kind(entry),
             mode: entry.file_mode,
             object_id: ObjectId{ hash: entry.staged_object.hash },
-            logical_size: logical_size,
+            logical_size: try commit_stage_entry_logical_size(store, &entry.staged_object),
             content_type: ContentType.Unknown,
             policy_id: placeholder_policy_id(),
         };

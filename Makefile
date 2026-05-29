@@ -93,6 +93,7 @@ test:
 	./tests/test_add_stale_stage_lock.sh
 	./tests/test_add_symlink.sh
 	./tests/test_commit_first.sh
+	./tests/test_commit_large_staged.sh
 	./tests/test_commit_second_parent.sh
 	./tests/test_log_first.sh
 	./tests/test_diff_add.sh
@@ -102,6 +103,7 @@ test:
 	./tests/test_diff_binary.sh
 	./tests/test_diff_large_file.sh
 	./tests/test_checkout_content.sh
+	./tests/test_checkout_restore_workspace.sh
 	./tests/test_checkout_parallel_apply.sh
 	./tests/test_checkout_dirty.sh
 	./tests/test_checkout_state_recovery.sh
@@ -116,6 +118,7 @@ test:
 	./tests/test_http_remote_smoke.sh
 	./tests/test_status_empty.sh
 	./tests/test_status_clean.sh
+	./tests/test_status_large_staged.sh
 	./tests/test_status_reserved_name_error.sh
 	./tests/test_status_split.sh
 	./tests/test_loose_store_concurrent.sh

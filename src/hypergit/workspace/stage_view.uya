@@ -1,0 +1,320 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+
+use libc.Stat;
+use libc.free;
+use libc.malloc;
+use libc.stat;
+use core.ids.CommitId;
+use core.ids.ObjectId;
+use core.ids.commit_id_compare;
+use core.policy.placeholder_policy_id;
+use manifest.load.manifest_load_flatten;
+use manifest.path.manifest_path_compare;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.codec.decode_chunked_blob_object;
+use object.codec.decode_commit_object;
+use object.codec.decode_object_kind;
+use object.codec.decode_small_blob_object;
+use object.types.ByteList;
+use object.types.ChunkedBlobPayload;
+use object.types.CommitPayload;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ObjectKind;
+use object.types.SmallBlobPayload;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_object_path;
+use store.object_store.ObjectBytes;
+use workspace.stage.StageEntry;
+use workspace.stage.StageEntryKind;
+use workspace.stage.StageSnapshot;
+use workspace.stage.stage_entry_has_staged_content;
+use workspace.stage.stage_zero_commit_id;
+
+const STAGE_VIEW_FILE_MODE_TYPE_MASK: u32 = 61440u32;
+const STAGE_VIEW_FILE_MODE_SYMLINK: u32 = 40960u32;
+const STAGE_VIEW_FILE_MODE_EXEC_BITS: u32 = 73u32;
+const STAGE_VIEW_OBJECT_PATH_BYTES: usize = 4096 as usize;
+const STAGE_VIEW_OBJECT_SCRATCH_EXTRA_BYTES: usize = 65536 as usize;
+
+error StageViewAlloc;
+error StageViewStoreFailed;
+error StageViewUnsupportedStageEntry;
+
+fn stage_view_has_object_id(id: &ObjectId) bool {
+    var i: usize = 0;
+    while i < 32 as usize {
+        if id.hash.bytes[i] != 0 as byte {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn stage_view_stage_entry_kind(entry: &StageEntry) EntryKind {
+    if (entry.file_mode & STAGE_VIEW_FILE_MODE_TYPE_MASK) == STAGE_VIEW_FILE_MODE_SYMLINK {
+        return EntryKind.Symlink;
+    }
+    if (entry.file_mode & STAGE_VIEW_FILE_MODE_EXEC_BITS) != 0u32 {
+        return EntryKind.Executable;
+    }
+    return EntryKind.File;
+}
+
+fn stage_view_commit_payload(arena: &Arena, store: &LooseObjectStore, commit_id: &CommitId) !CommitPayload {
+    const object_bytes: ObjectBytes = store.get(commit_id.id, arena) catch {
+        return error.StageViewStoreFailed;
+    };
+    var offset: usize = 0;
+    const payload: CommitPayload = decode_commit_object(
+        arena,
+        object_bytes.bytes.ptr[0: object_bytes.bytes.len],
+        &offset,
+    ) catch {
+        return error.StageViewStoreFailed;
+    };
+    if offset != object_bytes.bytes.len {
+        return error.StageViewStoreFailed;
+    }
+    return payload;
+}
+
+fn stage_view_base_inputs(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    snapshot: &StageSnapshot,
+    fallback_base_commit: &CommitId,
+) !ManifestLeafInputList {
+    const zero_commit: CommitId = stage_zero_commit_id();
+    var base_commit: CommitId = snapshot.state.base_commit;
+    if snapshot.entries.len == 0 &&
+        commit_id_compare(&base_commit, &zero_commit) == 0 &&
+        commit_id_compare(fallback_base_commit, &zero_commit) != 0 {
+        base_commit = fallback_base_commit[0];
+    }
+    if commit_id_compare(&base_commit, &zero_commit) == 0 {
+        return ManifestLeafInputList{ ptr: null, len: 0 };
+    }
+
+    const payload: CommitPayload = try stage_view_commit_payload(arena, store, &base_commit);
+    return manifest_load_flatten(arena, store, &payload.manifest_root) catch {
+        return error.StageViewStoreFailed;
+    };
+}
+
+fn stage_view_entry_logical_size(arena: &Arena, store: &LooseObjectStore, object_id: &ObjectId) !u64 {
+    _ = arena;
+
+    var object_path: [byte: STAGE_VIEW_OBJECT_PATH_BYTES] = [];
+    _ = loose_store_object_path(
+        store,
+        object_id,
+        object_path[0: STAGE_VIEW_OBJECT_PATH_BYTES],
+    ) catch {
+        return error.StageViewStoreFailed;
+    };
+
+    var st: Stat = Stat{};
+    if stat(&object_path[0] as &const byte, &st) != 0 {
+        return error.StageViewStoreFailed;
+    }
+
+    var scratch_size: usize = st.st_size as usize;
+    if scratch_size == 0 as usize {
+        scratch_size = 1 as usize;
+    }
+    scratch_size = scratch_size * 2 as usize;
+    if scratch_size < st.st_size as usize {
+        return error.StageViewAlloc;
+    }
+    if scratch_size + STAGE_VIEW_OBJECT_SCRATCH_EXTRA_BYTES < scratch_size {
+        return error.StageViewAlloc;
+    }
+    scratch_size = scratch_size + STAGE_VIEW_OBJECT_SCRATCH_EXTRA_BYTES;
+
+    const scratch: &byte = malloc(scratch_size) as &byte;
+    if scratch == null {
+        return error.StageViewAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+
+    var temp_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+    arena_init(&temp_arena, scratch, scratch_size);
+
+    const object_bytes: ObjectBytes = store.get(object_id[0], &temp_arena) catch {
+        return error.StageViewStoreFailed;
+    };
+    var offset: usize = 0;
+    const kind: ObjectKind = decode_object_kind(
+        object_bytes.bytes.ptr[0: object_bytes.bytes.len],
+        &offset,
+    ) catch {
+        return error.StageViewUnsupportedStageEntry;
+    };
+    offset = 0 as usize;
+    if kind == ObjectKind.SmallBlob {
+        const blob: SmallBlobPayload = decode_small_blob_object(
+            object_bytes.bytes.ptr[0: object_bytes.bytes.len],
+            &offset,
+        ) catch {
+            return error.StageViewUnsupportedStageEntry;
+        };
+        if offset != object_bytes.bytes.len {
+            return error.StageViewUnsupportedStageEntry;
+        }
+        return blob.logical_size;
+    }
+    if kind == ObjectKind.ChunkedBlob {
+        const blob: ChunkedBlobPayload = decode_chunked_blob_object(
+            &temp_arena,
+            object_bytes.bytes.ptr[0: object_bytes.bytes.len],
+            &offset,
+        ) catch {
+            return error.StageViewUnsupportedStageEntry;
+        };
+        if offset != object_bytes.bytes.len {
+            return error.StageViewUnsupportedStageEntry;
+        }
+        return blob.logical_size;
+    }
+    return error.StageViewUnsupportedStageEntry;
+}
+
+fn stage_view_manifest_input_from_stage(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    entry: &StageEntry,
+    base_entry: &ManifestLeafInputEntry,
+) !ManifestLeafInputEntry {
+    var object_id: ObjectId = base_entry.object_id;
+    var logical_size: u64 = base_entry.logical_size;
+    if stage_entry_has_staged_content(entry) {
+        object_id = ObjectId{ hash: entry.staged_object.hash };
+        logical_size = try stage_view_entry_logical_size(arena, store, &object_id);
+    } else if !stage_view_has_object_id(&base_entry.object_id) {
+        return error.StageViewUnsupportedStageEntry;
+    }
+
+    return ManifestLeafInputEntry{
+        path: ByteList{ ptr: entry.path.ptr, len: entry.path.len },
+        kind: stage_view_stage_entry_kind(entry),
+        mode: entry.file_mode,
+        object_id: object_id,
+        logical_size: logical_size,
+        content_type: base_entry.content_type,
+        policy_id: base_entry.policy_id,
+    };
+}
+
+fn stage_view_manifest_input_from_stage_without_base(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    entry: &StageEntry,
+) !ManifestLeafInputEntry {
+    if !stage_entry_has_staged_content(entry) {
+        return error.StageViewUnsupportedStageEntry;
+    }
+
+    const object_id: ObjectId = ObjectId{ hash: entry.staged_object.hash };
+    return ManifestLeafInputEntry{
+        path: ByteList{ ptr: entry.path.ptr, len: entry.path.len },
+        kind: stage_view_stage_entry_kind(entry),
+        mode: entry.file_mode,
+        object_id: object_id,
+        logical_size: try stage_view_entry_logical_size(arena, store, &object_id),
+        content_type: ContentType.Unknown,
+        policy_id: placeholder_policy_id(),
+    };
+}
+
+export fn stage_view_manifest_inputs_from_snapshot(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    snapshot: &StageSnapshot,
+    fallback_base_commit: &CommitId,
+) !ManifestLeafInputList {
+    const base_inputs: ManifestLeafInputList = try stage_view_base_inputs(
+        arena,
+        store,
+        snapshot,
+        fallback_base_commit,
+    );
+    if snapshot.entries.len == 0 {
+        return base_inputs;
+    }
+
+    const max_len: usize = base_inputs.len + snapshot.entries.len;
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(
+        arena,
+        @size_of(ManifestLeafInputEntry) as usize * max_len,
+    ) as &ManifestLeafInputEntry;
+    if raw_inputs == null {
+        return error.StageViewAlloc;
+    }
+
+    var base_index: usize = 0;
+    var stage_index: usize = 0;
+    var out_index: usize = 0;
+    while base_index < base_inputs.len && stage_index < snapshot.entries.len {
+        const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_index];
+        const stage_entry: &StageEntry = &snapshot.entries.ptr[stage_index];
+        const cmp: i32 = manifest_path_compare(&base_entry.path, &stage_entry.path);
+        if cmp < 0 {
+            raw_inputs[out_index] = base_entry[0];
+            out_index = out_index + 1 as usize;
+            base_index = base_index + 1 as usize;
+            continue;
+        }
+        if cmp > 0 {
+            if stage_entry.kind != StageEntryKind.Delete {
+                raw_inputs[out_index] = try stage_view_manifest_input_from_stage_without_base(
+                    arena,
+                    store,
+                    stage_entry,
+                );
+                out_index = out_index + 1 as usize;
+            }
+            stage_index = stage_index + 1 as usize;
+            continue;
+        }
+
+        if stage_entry.kind != StageEntryKind.Delete {
+            raw_inputs[out_index] = try stage_view_manifest_input_from_stage(
+                arena,
+                store,
+                stage_entry,
+                base_entry,
+            );
+            out_index = out_index + 1 as usize;
+        }
+        base_index = base_index + 1 as usize;
+        stage_index = stage_index + 1 as usize;
+    }
+
+    while base_index < base_inputs.len {
+        raw_inputs[out_index] = base_inputs.ptr[base_index];
+        out_index = out_index + 1 as usize;
+        base_index = base_index + 1 as usize;
+    }
+    while stage_index < snapshot.entries.len {
+        const stage_entry: &StageEntry = &snapshot.entries.ptr[stage_index];
+        if stage_entry.kind != StageEntryKind.Delete {
+            raw_inputs[out_index] = try stage_view_manifest_input_from_stage_without_base(
+                arena,
+                store,
+                stage_entry,
+            );
+            out_index = out_index + 1 as usize;
+        }
+        stage_index = stage_index + 1 as usize;
+    }
+
+    return manifest_leaf_input_list_from_slice(raw_inputs[0: out_index]);
+}

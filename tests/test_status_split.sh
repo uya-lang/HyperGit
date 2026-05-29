@@ -81,3 +81,51 @@ Changes not staged for commit:
 EOF
 
 run_status_case "$REPO_SPLIT" "$TMP_DIR/repo-split.expected"
+
+REPO_TRACKED="$TMP_DIR/repo-tracked"
+mkdir -p "$REPO_TRACKED"
+(
+    cd "$REPO_TRACKED"
+    "$TMP_DIR/hgx" init >/dev/null 2>&1
+    printf 'one\n' >main.txt
+    "$TMP_DIR/hgx" add main.txt >/dev/null 2>&1
+    HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' "$TMP_DIR/hgx" commit -m "first" >/dev/null 2>&1
+    printf 'two\n' >main.txt
+)
+
+cat >"$TMP_DIR/repo-tracked.expected" <<'EOF'
+On branch main
+
+Changes not staged for commit:
+  modified:   main.txt
+EOF
+
+run_status_case "$REPO_TRACKED" "$TMP_DIR/repo-tracked.expected"
+
+REPO_COMMITTED_SPLIT="$TMP_DIR/repo-committed-split"
+mkdir -p "$REPO_COMMITTED_SPLIT"
+(
+    cd "$REPO_COMMITTED_SPLIT"
+    "$TMP_DIR/hgx" init >/dev/null 2>&1
+    mkdir -p docs src
+    printf 'base\n' >src/main.uya
+    "$TMP_DIR/hgx" add src >/dev/null 2>&1
+    HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' "$TMP_DIR/hgx" commit -m "first" >/dev/null 2>&1
+    printf 'staged\n' >src/main.uya
+    "$TMP_DIR/hgx" add src/main.uya >/dev/null 2>&1
+    printf 'unstaged\n' >src/main.uya
+    printf 'readme\n' >docs/readme.md
+)
+
+cat >"$TMP_DIR/repo-committed-split.expected" <<'EOF'
+On branch main
+
+Changes to be committed:
+  modified:   src/main.uya
+
+Changes not staged for commit:
+  new file:   docs/readme.md
+  modified:   src/main.uya
+EOF
+
+run_status_case "$REPO_COMMITTED_SPLIT" "$TMP_DIR/repo-committed-split.expected"

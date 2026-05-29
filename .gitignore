@@ -6,3 +6,4 @@ bin/*
 build/*
 !build/.gitkeep
 .marscode/deviceInfo.json
+tmp
