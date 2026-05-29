@@ -114,6 +114,7 @@ export const COMMIT_NOT_REPO_TEXT: &const byte = "error: not a HyperGit reposito
 export const COMMIT_PERMISSION_TEXT: &const byte = "error: permission denied while creating commit\n";
 export const COMMIT_NOTHING_STAGED_TEXT: &const byte = "error: nothing staged to commit\n";
 export const COMMIT_EXISTING_HISTORY_TEXT: &const byte = "error: commit from an existing history is not implemented yet\n";
+export const COMMIT_STAGE_LOCK_TEXT: &const byte = "error: staging area is locked by another HyperGit process\n";
 export const COMMIT_UNSUPPORTED_STAGE_TEXT: &const byte = "error: commit with staged deletions or unsupported entries is not implemented yet\n";
 export const COMMIT_FAILURE_TEXT: &const byte = "error: failed to create commit\n";
 
@@ -459,7 +460,11 @@ export fn run_commit() i32 {
         fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
-    const stage_lock: StageFileLock = stage_file_lock_acquire(repo_path_cstr(&stage_path) as &const byte) catch {
+    const stage_lock: StageFileLock = stage_file_lock_acquire(repo_path_cstr(&stage_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.StageFileLockFailed) {
+            fprintf(stderr, "%s" as *byte, COMMIT_STAGE_LOCK_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
         fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };

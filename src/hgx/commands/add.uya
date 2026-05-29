@@ -1,3 +1,6 @@
+use std.async.Future;
+use std.async.block_on;
+use std.async.future_ready_ok;
 use std.io.file.File;
 use std.io.file.file_close;
 use std.io.file.file_open;
@@ -8,6 +11,10 @@ use std.mem.arena.arena_init;
 use std.runtime.get_argc;
 use std.runtime.get_argv;
 use std.string.strlen;
+use std.thread.ThreadPool;
+use std.thread.async_compute;
+use std.thread.thread_pool_new;
+use std.thread.thread_pool_shutdown;
 use std.time.now_ms;
 
 use libc.O_RDONLY;
@@ -16,6 +23,7 @@ use libc.EPERM;
 use libc.errno;
 use libc.free;
 use libc.fprintf;
+use libc.getenv;
 use libc.malloc;
 use libc.readlink;
 use libc.stderr;
@@ -61,6 +69,7 @@ use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
 use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_put_known_id;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
@@ -99,6 +108,13 @@ use workspace.stage_file.stage_file_write;
 const ADD_ARENA_BYTES: usize = 268435456 as usize;
 const ADD_PATHSPEC_ARENA_BYTES: usize = 65536 as usize;
 const ADD_PATH_MAX: usize = 4096;
+const ADD_PARALLEL_WORKERS_DEFAULT: i32 = 4;
+const ADD_PARALLEL_MAX_WORKERS: usize = 4 as usize;
+const ADD_PREPARE_SMALL_PERMISSION: usize = 1 as usize;
+const ADD_PREPARE_SMALL_READ_FAILED: usize = 2 as usize;
+const ADD_PREPARE_SMALL_ALLOC_FAILED: usize = 3 as usize;
+const ADD_PREPARE_SMALL_ENCODE_FAILED: usize = 4 as usize;
+const ADD_PREPARE_SMALL_HASH_FAILED: usize = 5 as usize;
 
 error AddAlloc;
 error AddPathTooLong;
@@ -107,6 +123,7 @@ error AddReadFailed;
 error AddStoreFailed;
 error AddLocalChangeReadFailed;
 error AddLocalChangeWriteFailed;
+error AddStageLockFailed;
 error AddStageReadFailed;
 error AddStageWriteFailed;
 error AddTimeFailed;
@@ -123,6 +140,7 @@ export const ADD_NO_MATCH_TEXT: &const byte = "error: pathspec did not match any
 export const ADD_LARGE_FILE_TEXT: &const byte = "error: add for files larger than 8MB is not implemented yet\n";
 export const ADD_INVALID_PATH_TEXT: &const byte = "error: path is not supported by HyperGit manifest rules\n";
 export const ADD_RESERVED_NAME_TEXT: &const byte = "error: path uses Windows-incompatible names and cannot be staged\n";
+export const ADD_STAGE_LOCK_TEXT: &const byte = "error: staging area is locked by another HyperGit process\n";
 export const ADD_UNSUPPORTED_WORKSPACE_ENTRY_TEXT: &const byte = "error: workspace contains unsupported file types\n";
 export const ADD_SKIP_PERMISSION_TEXT: &const byte = "warning: skipped unreadable path: %s\n";
 export const ADD_SKIP_UNPROCESSABLE_TEXT: &const byte = "warning: skipped unprocessable path: %s\n";
@@ -136,6 +154,17 @@ struct AddFsPath {
 struct AddOwnedBytes {
     raw: &byte,
     len: usize
+}
+
+struct AddPrepareSmallBlobTask {
+    root_fs_path: AddFsPath,
+    file_entry: &WorkspaceFileEntry,
+    base_entry_index: isize
+}
+
+struct AddPreparedSmallBlobResult {
+    object_id: ObjectId,
+    payload: AddOwnedBytes
 }
 
 struct AddCachedObjectResult {
@@ -168,6 +197,16 @@ fn add_fs_path_from_repo_path(path: &RepoPath) !AddFsPath {
     }
     out.bytes[path.len] = 0 as byte;
     out.len = path.len;
+    return out;
+}
+
+fn add_fs_path_clone(path: &AddFsPath) AddFsPath {
+    var out: AddFsPath = AddFsPath{ bytes: [], len: path.len };
+    var i: usize = 0;
+    while i <= path.len {
+        out.bytes[i] = path.bytes[i];
+        i = i + 1 as usize;
+    }
     return out;
 }
 
@@ -230,8 +269,51 @@ fn add_owned_bytes_free(value: &AddOwnedBytes) void {
     }
 }
 
+fn add_parallel_requested_workers() i32 {
+    const raw: &byte = getenv("HGX_ADD_PARALLEL_WORKERS");
+    if raw == null || raw[0] == 0 as byte {
+        return ADD_PARALLEL_WORKERS_DEFAULT;
+    }
+
+    var value: i32 = 0;
+    var i: usize = 0;
+    while raw[i] != 0 as byte {
+        if raw[i] < '0' as byte || raw[i] > '9' as byte {
+            return ADD_PARALLEL_WORKERS_DEFAULT;
+        }
+        value = value * 10 as i32 + (raw[i] - '0' as byte) as i32;
+        i = i + 1 as usize;
+    }
+    if value <= 0 as i32 {
+        return ADD_PARALLEL_WORKERS_DEFAULT;
+    }
+    return value;
+}
+
+fn add_parallel_worker_count(task_count: usize, requested_workers: i32) usize {
+    if requested_workers <= 1 as i32 || task_count <= 1 as usize {
+        return 1 as usize;
+    }
+
+    var worker_count: usize = requested_workers as usize;
+    if worker_count > ADD_PARALLEL_MAX_WORKERS {
+        worker_count = ADD_PARALLEL_MAX_WORKERS;
+    }
+    if worker_count > task_count {
+        worker_count = task_count;
+    }
+    if worker_count == 0 as usize {
+        return 1 as usize;
+    }
+    return worker_count;
+}
+
 fn add_errno_permission() bool {
     return errno == EACCES || errno == EPERM;
+}
+
+fn add_is_parallel_small_blob_candidate(file_entry: &WorkspaceFileEntry) bool {
+    return file_entry.kind == WorkspaceFileKind.Symlink || large_file_uses_small_blob(file_entry.logical_size);
 }
 
 fn add_manifest_path_error_is_invalid(err_id: u32) bool {
@@ -369,6 +451,59 @@ fn add_store_small_blob_bytes(store: &LooseObjectStore, content: &[byte]) !Objec
     return store.put(ObjectKind.SmallBlob, add_owned_bytes_slice(&encoded)) catch {
         return error.AddStoreFailed;
     };
+}
+
+fn add_store_small_blob_encoded(store: &LooseObjectStore, object_id: &ObjectId, encoded: &[byte]) !ObjectId {
+    return loose_store_put_known_id(store, object_id, ObjectKind.SmallBlob, encoded) catch {
+        return error.AddStoreFailed;
+    };
+}
+
+fn add_prepare_small_blob_task_run(task_ptr: usize) usize {
+    const task: &AddPrepareSmallBlobTask = task_ptr as &AddPrepareSmallBlobTask;
+    const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&task.root_fs_path, task.file_entry) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            return ADD_PREPARE_SMALL_PERMISSION;
+        }
+        if @error_id(err) == @error_id(error.AddAlloc) {
+            return ADD_PREPARE_SMALL_ALLOC_FAILED;
+        }
+        return ADD_PREPARE_SMALL_READ_FAILED;
+    };
+    defer {
+        add_owned_bytes_free(&file_bytes);
+    }
+
+    const payload: SmallBlobPayload = add_small_blob_payload_from_bytes(add_owned_bytes_slice(&file_bytes));
+    const encoded: AddOwnedBytes = add_encode_small_blob_payload(&payload) catch |err| {
+        if @error_id(err) == @error_id(error.AddAlloc) {
+            return ADD_PREPARE_SMALL_ALLOC_FAILED;
+        }
+        return ADD_PREPARE_SMALL_ENCODE_FAILED;
+    };
+    const object_id: ObjectId = add_hash_small_blob_encoded(add_owned_bytes_slice(&encoded)) catch |err| {
+        add_owned_bytes_free(&encoded);
+        if @error_id(err) == @error_id(error.AddAlloc) {
+            return ADD_PREPARE_SMALL_ALLOC_FAILED;
+        }
+        return ADD_PREPARE_SMALL_HASH_FAILED;
+    };
+
+    const raw_result: &AddPreparedSmallBlobResult = malloc(@size_of(AddPreparedSmallBlobResult) as usize) as &AddPreparedSmallBlobResult;
+    if raw_result == null {
+        add_owned_bytes_free(&encoded);
+        return ADD_PREPARE_SMALL_ALLOC_FAILED;
+    }
+    raw_result[0] = AddPreparedSmallBlobResult{
+        object_id: object_id,
+        payload: encoded,
+    };
+    return @usize_from_ptr(raw_result as &void);
+}
+
+fn add_prepared_small_blob_result_free(result: &AddPreparedSmallBlobResult) void {
+    add_owned_bytes_free(&result.payload);
+    free(result as &void);
 }
 
 fn add_hash_worktree_object_id(file_entry: &WorkspaceFileEntry, content: &[byte]) !ObjectId {
@@ -637,6 +772,150 @@ fn add_try_reuse_cached_object(
     return AddCachedObjectResult{ hit: true, object_id: object_id };
 }
 
+fn add_record_file_result(
+    existing_local_changes: &LocalChangeList,
+    base_inputs: ManifestLeafInputList,
+    file_entry: &WorkspaceFileEntry,
+    base_entry_index: isize,
+    stored_id: &ObjectId,
+    raw_updates: &StageEntry,
+    update_index: &usize,
+    raw_change_updates: &LocalChange,
+    change_update_index: &usize,
+) void {
+    const existing_local_change_index: isize = add_find_local_change(existing_local_changes, &file_entry.path);
+    var watcher_seq: u64 = 0u64;
+    var reconcile_epoch: u64 = 0u64;
+    if existing_local_change_index >= 0 as isize {
+        watcher_seq = existing_local_changes.ptr[existing_local_change_index as usize].watcher_seq;
+        reconcile_epoch = existing_local_changes.ptr[existing_local_change_index as usize].reconcile_epoch;
+    }
+
+    var base_object: ObjectId = add_zero_object_id();
+    var local_status: ChangeStatus = ChangeStatus.Added;
+    if base_entry_index >= 0 as isize {
+        const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_entry_index as usize];
+        base_object = ObjectId{ hash: base_entry.object_id.hash };
+        local_status = ChangeStatus.Modified;
+        if object_id_compare(stored_id, &base_entry.object_id) == 0 && file_entry.file_mode == base_entry.mode {
+            local_status = ChangeStatus.Materialized;
+        }
+    }
+
+    raw_change_updates[*change_update_index] = LocalChange{
+        path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
+        base_object: ObjectId{ hash: add_hash32_clone(&base_object.hash) },
+        working_hash: add_hash32_clone(&stored_id.hash),
+        status: local_status,
+        last_seen_inode: file_entry.inode,
+        last_seen_mtime_ns: file_entry.mtime_ns,
+        last_seen_logical_size: file_entry.logical_size,
+        watcher_seq: watcher_seq,
+        reconcile_epoch: reconcile_epoch,
+    };
+    *change_update_index = *change_update_index + 1 as usize;
+
+    if base_entry_index >= 0 as isize {
+        const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_entry_index as usize];
+        if local_status == ChangeStatus.Materialized {
+            return;
+        }
+        raw_updates[*update_index] = StageEntry{
+            path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
+            kind: StageEntryKind.Modify,
+            base_object: ObjectId{ hash: base_entry.object_id.hash },
+            has_staged_object: true,
+            staged_object: ObjectId{ hash: stored_id.hash },
+            file_mode: file_entry.file_mode,
+        };
+    } else {
+        raw_updates[*update_index] = StageEntry{
+            path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
+            kind: StageEntryKind.Add,
+            base_object: add_zero_object_id(),
+            has_staged_object: true,
+            staged_object: ObjectId{ hash: stored_id.hash },
+            file_mode: file_entry.file_mode,
+        };
+    }
+    *update_index = *update_index + 1 as usize;
+}
+
+fn add_process_small_blob_batch(
+    pool: &ThreadPool,
+    task_count: usize,
+    tasks: &AddPrepareSmallBlobTask,
+    store: &LooseObjectStore,
+    existing_local_changes: &LocalChangeList,
+    base_inputs: ManifestLeafInputList,
+    raw_updates: &StageEntry,
+    update_index: &usize,
+    raw_change_updates: &LocalChange,
+    change_update_index: &usize,
+    skipped_count: &usize,
+) !void {
+    var ready0: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var ready1: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var ready2: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var ready3: Future<!usize> = future_ready_ok<usize>(0 as usize);
+    var futures: [Future<!usize>: 4] = [ready0, ready1, ready2, ready3];
+
+    var batch_index: usize = 0 as usize;
+    while batch_index < task_count {
+        futures[batch_index] = async_compute<usize>(
+            pool,
+            &add_prepare_small_blob_task_run as &void,
+            @usize_from_ptr((&tasks[batch_index]) as &void),
+        );
+        batch_index = batch_index + 1 as usize;
+    }
+
+    batch_index = 0 as usize;
+    while batch_index < task_count {
+        const file_entry: &WorkspaceFileEntry = tasks[batch_index].file_entry;
+        const status: usize = block_on<usize>(futures[batch_index]) catch {
+            return error.AddStoreFailed;
+        };
+        if status == ADD_PREPARE_SMALL_PERMISSION {
+            add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
+            *skipped_count = *skipped_count + 1 as usize;
+            batch_index = batch_index + 1 as usize;
+            continue;
+        }
+        if status == ADD_PREPARE_SMALL_READ_FAILED || status == ADD_PREPARE_SMALL_ALLOC_FAILED {
+            add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+            *skipped_count = *skipped_count + 1 as usize;
+            batch_index = batch_index + 1 as usize;
+            continue;
+        }
+        if status == ADD_PREPARE_SMALL_ENCODE_FAILED || status == ADD_PREPARE_SMALL_HASH_FAILED {
+            return error.AddStoreFailed;
+        }
+
+        const result: &AddPreparedSmallBlobResult = status as &AddPreparedSmallBlobResult;
+        defer {
+            add_prepared_small_blob_result_free(result);
+        }
+        const stored_id: ObjectId = try add_store_small_blob_encoded(
+            store,
+            &result.object_id,
+            add_owned_bytes_slice(&result.payload),
+        );
+        add_record_file_result(
+            existing_local_changes,
+            ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+            file_entry,
+            tasks[batch_index].base_entry_index,
+            &stored_id,
+            raw_updates,
+            update_index,
+            raw_change_updates,
+            change_update_index,
+        );
+        batch_index = batch_index + 1 as usize;
+    }
+}
+
 fn add_sort_stage_entries(entries: &StageEntry, len: usize) void {
     if len <= 1 as usize {
         return;
@@ -822,7 +1101,10 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
 
     const stage_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STAGE_REL);
     const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
-    const stage_lock: StageFileLock = stage_file_lock_acquire(repo_path_cstr(&stage_path) as &const byte) catch {
+    const stage_lock: StageFileLock = stage_file_lock_acquire(repo_path_cstr(&stage_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.StageFileLockFailed) {
+            return error.AddStageLockFailed;
+        }
         return error.AddStageWriteFailed;
     };
     defer {
@@ -863,31 +1145,87 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     }
 
     const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
+    const effective_parallel_workers: usize = add_parallel_worker_count(matched_count, add_parallel_requested_workers());
 
     var update_index: usize = 0;
     var change_update_index: usize = 0;
     var skipped_count: usize = 0;
-    var file_index: usize = 0;
-    while file_index < scanned_files.len {
-        const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
-        if !manifest_pathspec_matches_any(pathspecs, &file_entry.path) {
-            file_index = file_index + 1;
-            continue;
+    if effective_parallel_workers > 1 as usize {
+        const batch_tasks: &AddPrepareSmallBlobTask = arena_alloc(
+            &arena,
+            @size_of(AddPrepareSmallBlobTask) as usize * effective_parallel_workers,
+        ) as &AddPrepareSmallBlobTask;
+        if batch_tasks == null {
+            return error.AddAlloc;
         }
 
-        const base_entry_index: isize = add_find_base_entry(
-            ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-            &file_entry.path,
-        );
-        const cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(
-            &store,
-            &existing_local_changes,
-            file_entry,
-        );
-        var stored_id: ObjectId = add_zero_object_id();
-        if cached_object.hit {
-            stored_id = cached_object.object_id;
-        } else {
+        var pool: ThreadPool = thread_pool_new(effective_parallel_workers as i32);
+        defer {
+            thread_pool_shutdown(&pool);
+        }
+
+        var pending_count: usize = 0 as usize;
+        var file_index: usize = 0 as usize;
+        while file_index < scanned_files.len {
+            const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
+            if !manifest_pathspec_matches_any(pathspecs, &file_entry.path) {
+                file_index = file_index + 1 as usize;
+                continue;
+            }
+
+            const base_entry_index: isize = add_find_base_entry(
+                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                &file_entry.path,
+            );
+            const cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(
+                &store,
+                &existing_local_changes,
+                file_entry,
+            );
+            if cached_object.hit {
+                add_record_file_result(
+                    &existing_local_changes,
+                    ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                    file_entry,
+                    base_entry_index,
+                    &cached_object.object_id,
+                    raw_updates,
+                    &update_index,
+                    raw_change_updates,
+                    &change_update_index,
+                );
+                file_index = file_index + 1 as usize;
+                continue;
+            }
+
+            if add_is_parallel_small_blob_candidate(file_entry) {
+                batch_tasks[pending_count] = AddPrepareSmallBlobTask{
+                    root_fs_path: add_fs_path_clone(&root_fs_path),
+                    file_entry: file_entry,
+                    base_entry_index: base_entry_index,
+                };
+                pending_count = pending_count + 1 as usize;
+                file_index = file_index + 1 as usize;
+                if pending_count < effective_parallel_workers {
+                    continue;
+                }
+                try add_process_small_blob_batch(
+                    &pool,
+                    pending_count,
+                    batch_tasks,
+                    &store,
+                    &existing_local_changes,
+                    ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                    raw_updates,
+                    &update_index,
+                    raw_change_updates,
+                    &change_update_index,
+                    &skipped_count,
+                );
+                pending_count = 0 as usize;
+                continue;
+            }
+
             const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&root_fs_path, file_entry) catch |err| {
                 if add_error_is_skippable(@error_id(err)) {
                     if @error_id(err) == @error_id(error.RepoPermissionDenied) {
@@ -904,7 +1242,12 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
             defer {
                 add_owned_bytes_free(&file_bytes);
             }
-            stored_id = add_store_worktree_object(&store, &chunk_store, file_entry, add_owned_bytes_slice(&file_bytes)) catch |err| {
+            const stored_id: ObjectId = add_store_worktree_object(
+                &store,
+                &chunk_store,
+                file_entry,
+                add_owned_bytes_slice(&file_bytes),
+            ) catch |err| {
                 if add_error_is_skippable(@error_id(err)) {
                     add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
                     skipped_count = skipped_count + 1 as usize;
@@ -913,66 +1256,97 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 }
                 return err;
             };
+            add_record_file_result(
+                &existing_local_changes,
+                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                file_entry,
+                base_entry_index,
+                &stored_id,
+                raw_updates,
+                &update_index,
+                raw_change_updates,
+                &change_update_index,
+            );
+            file_index = file_index + 1 as usize;
         }
 
-        const existing_local_change_index: isize = add_find_local_change(&existing_local_changes, &file_entry.path);
-        var watcher_seq: u64 = 0u64;
-        var reconcile_epoch: u64 = 0u64;
-        if existing_local_change_index >= 0 as isize {
-            watcher_seq = existing_local_changes.ptr[existing_local_change_index as usize].watcher_seq;
-            reconcile_epoch = existing_local_changes.ptr[existing_local_change_index as usize].reconcile_epoch;
+        if pending_count > 0 as usize {
+            try add_process_small_blob_batch(
+                &pool,
+                pending_count,
+                batch_tasks,
+                &store,
+                &existing_local_changes,
+                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                raw_updates,
+                &update_index,
+                raw_change_updates,
+                &change_update_index,
+                &skipped_count,
+            );
         }
-
-        var base_object: ObjectId = add_zero_object_id();
-        var local_status: ChangeStatus = ChangeStatus.Added;
-        if base_entry_index >= 0 as isize {
-            const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_entry_index as usize];
-            base_object = ObjectId{ hash: base_entry.object_id.hash };
-            local_status = ChangeStatus.Modified;
-            if object_id_compare(&stored_id, &base_entry.object_id) == 0 && file_entry.file_mode == base_entry.mode {
-                local_status = ChangeStatus.Materialized;
-            }
-        }
-
-        raw_change_updates[change_update_index] = LocalChange{
-            path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
-            base_object: ObjectId{ hash: add_hash32_clone(&base_object.hash) },
-            working_hash: add_hash32_clone(&stored_id.hash),
-            status: local_status,
-            last_seen_inode: file_entry.inode,
-            last_seen_mtime_ns: file_entry.mtime_ns,
-            last_seen_logical_size: file_entry.logical_size,
-            watcher_seq: watcher_seq,
-            reconcile_epoch: reconcile_epoch,
-        };
-        change_update_index = change_update_index + 1 as usize;
-
-        if base_entry_index >= 0 as isize {
-            const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_entry_index as usize];
-            if local_status == ChangeStatus.Materialized {
-                file_index = file_index + 1;
+    } else {
+        var file_index: usize = 0 as usize;
+        while file_index < scanned_files.len {
+            const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
+            if !manifest_pathspec_matches_any(pathspecs, &file_entry.path) {
+                file_index = file_index + 1 as usize;
                 continue;
             }
-            raw_updates[update_index] = StageEntry{
-                path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
-                kind: StageEntryKind.Modify,
-                base_object: ObjectId{ hash: base_entry.object_id.hash },
-                has_staged_object: true,
-                staged_object: ObjectId{ hash: stored_id.hash },
-                file_mode: file_entry.file_mode,
-            };
-        } else {
-            raw_updates[update_index] = StageEntry{
-                path: ByteList{ ptr: file_entry.path.ptr, len: file_entry.path.len },
-                kind: StageEntryKind.Add,
-                base_object: add_zero_object_id(),
-                has_staged_object: true,
-                staged_object: ObjectId{ hash: stored_id.hash },
-                file_mode: file_entry.file_mode,
-            };
+
+            const base_entry_index: isize = add_find_base_entry(
+                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                &file_entry.path,
+            );
+            const cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(
+                &store,
+                &existing_local_changes,
+                file_entry,
+            );
+            var stored_id: ObjectId = add_zero_object_id();
+            if cached_object.hit {
+                stored_id = cached_object.object_id;
+            } else {
+                const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&root_fs_path, file_entry) catch |err| {
+                    if add_error_is_skippable(@error_id(err)) {
+                        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                            add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
+                        } else {
+                            add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+                        }
+                        skipped_count = skipped_count + 1 as usize;
+                        file_index = file_index + 1 as usize;
+                        continue;
+                    }
+                    return err;
+                };
+                defer {
+                    add_owned_bytes_free(&file_bytes);
+                }
+                stored_id = add_store_worktree_object(&store, &chunk_store, file_entry, add_owned_bytes_slice(&file_bytes)) catch |err| {
+                    if add_error_is_skippable(@error_id(err)) {
+                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+                        skipped_count = skipped_count + 1 as usize;
+                        file_index = file_index + 1 as usize;
+                        continue;
+                    }
+                    return err;
+                };
+            }
+
+            add_record_file_result(
+                &existing_local_changes,
+                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+                file_entry,
+                base_entry_index,
+                &stored_id,
+                raw_updates,
+                &update_index,
+                raw_change_updates,
+                &change_update_index,
+            );
+            file_index = file_index + 1 as usize;
         }
-        update_index = update_index + 1 as usize;
-        file_index = file_index + 1;
     }
 
     base_index = 0;
@@ -1134,6 +1508,10 @@ export fn run_add() i32 {
         }
         if @error_id(err) == @error_id(error.AddReservedName) {
             fprintf(stderr, "%s" as *byte, ADD_RESERVED_NAME_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.AddStageLockFailed) {
+            fprintf(stderr, "%s" as *byte, ADD_STAGE_LOCK_TEXT);
             return EXIT_RUNTIME_ERROR;
         }
         if @error_id(err) == @error_id(error.AddUnsupportedWorkspaceEntry) {

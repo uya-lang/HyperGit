@@ -321,6 +321,61 @@ fn verify_object_bytes(id: &ObjectId, data: ByteList) !void {
     }
 }
 
+fn loose_store_put_with_id(self: &LooseObjectStore, id: &ObjectId, kind: ObjectKind, payload: &[byte]) !ObjectId {
+    if try self.has(id[0]) {
+        return id[0];
+    }
+
+    var dir_path: StorePath = store_path_empty();
+    var file_path: StorePath = store_path_empty();
+    var temp_path: StorePath = store_path_empty();
+    try build_loose_paths(&self.root, id, &dir_path, &file_path, &temp_path);
+    try loose_store_ensure_dir(&dir_path);
+
+    const total_len: usize = CODEC_ENVELOPE_BYTES + payload.len;
+    const encoded_raw: &byte = malloc(total_len) as &byte;
+    if encoded_raw == null {
+        return error.StoreAlloc;
+    }
+    defer {
+        free(encoded_raw as &void);
+    }
+    const encoded: &[byte] = encoded_raw[0: total_len];
+    var offset: usize = 0;
+    try codec_encode_object(encoded, &offset, object_kind_to_u16(kind), 0 as u16, payload);
+
+    const file: File = file_open(store_path_cstr(&temp_path) as &const byte, (O_WRONLY | O_CREAT | O_EXCL) as i32, S_IRWXU as u32) catch {
+        if loose_store_errno_is_permission() {
+            return error.StorePermissionDenied;
+        }
+        return error.StoreWriteFailed;
+    };
+    defer {
+        _ = file_close(&file) catch {};
+    }
+
+    if (try file_write(&file, encoded.ptr as &const byte, total_len)) != total_len {
+        _ = unlink(store_path_cstr(&temp_path) as &const byte);
+        return error.StoreWriteFailed;
+    }
+
+    _ = file_close(&file) catch {
+        _ = unlink(store_path_cstr(&temp_path) as &const byte);
+        return error.StoreWriteFailed;
+    };
+
+    if rename(store_path_cstr(&temp_path) as &const byte, store_path_cstr(&file_path) as &const byte) != 0 {
+        if try self.has(id[0]) {
+            _ = unlink(store_path_cstr(&temp_path) as &const byte);
+            return id[0];
+        }
+        _ = unlink(store_path_cstr(&temp_path) as &const byte);
+        return error.StorePublishFailed;
+    }
+
+    return id[0];
+}
+
 export struct LooseObjectStore : ObjectStore {
     root: StorePath,
 
@@ -344,58 +399,7 @@ export struct LooseObjectStore : ObjectStore {
 
     fn put(self: &Self, kind: ObjectKind, payload: &[byte]) !ObjectId {
         const id: ObjectId = try hash_object_payload(kind, payload);
-        if try self.has(id) {
-            return id;
-        }
-
-        var dir_path: StorePath = store_path_empty();
-        var file_path: StorePath = store_path_empty();
-        var temp_path: StorePath = store_path_empty();
-        try build_loose_paths(&self.root, &id, &dir_path, &file_path, &temp_path);
-        try loose_store_ensure_dir(&dir_path);
-
-        const total_len: usize = CODEC_ENVELOPE_BYTES + payload.len;
-        const encoded_raw: &byte = malloc(total_len) as &byte;
-        if encoded_raw == null {
-            return error.StoreAlloc;
-        }
-        defer {
-            free(encoded_raw as &void);
-        }
-        const encoded: &[byte] = encoded_raw[0: total_len];
-        var offset: usize = 0;
-        try codec_encode_object(encoded, &offset, object_kind_to_u16(kind), 0 as u16, payload);
-
-        const file: File = file_open(store_path_cstr(&temp_path) as &const byte, (O_WRONLY | O_CREAT | O_EXCL) as i32, S_IRWXU as u32) catch {
-            if loose_store_errno_is_permission() {
-                return error.StorePermissionDenied;
-            }
-            return error.StoreWriteFailed;
-        };
-        defer {
-            _ = file_close(&file) catch {};
-        }
-
-        if (try file_write(&file, encoded.ptr as &const byte, total_len)) != total_len {
-            _ = unlink(store_path_cstr(&temp_path) as &const byte);
-            return error.StoreWriteFailed;
-        }
-
-        _ = file_close(&file) catch {
-            _ = unlink(store_path_cstr(&temp_path) as &const byte);
-            return error.StoreWriteFailed;
-        };
-
-        if rename(store_path_cstr(&temp_path) as &const byte, store_path_cstr(&file_path) as &const byte) != 0 {
-            if try self.has(id) {
-                _ = unlink(store_path_cstr(&temp_path) as &const byte);
-                return id;
-            }
-            _ = unlink(store_path_cstr(&temp_path) as &const byte);
-            return error.StorePublishFailed;
-        }
-
-        return id;
+        return try loose_store_put_with_id(self, &id, kind, payload);
     },
 
     fn open_reader(self: &Self, id: ObjectId) !ObjectReader {
@@ -414,6 +418,10 @@ export fn loose_store_open(root_path: &byte) !LooseObjectStore {
     return LooseObjectStore{
         root: try store_path_from_cstr(root_path),
     };
+}
+
+export fn loose_store_put_known_id(store: &LooseObjectStore, id: &ObjectId, kind: ObjectKind, payload: &[byte]) !ObjectId {
+    return try loose_store_put_with_id(store, id, kind, payload);
 }
 
 export fn loose_store_object_path(store: &LooseObjectStore, id: &ObjectId, out: &[byte]) !usize {

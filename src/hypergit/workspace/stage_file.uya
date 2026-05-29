@@ -9,11 +9,16 @@ use std.string.strlen;
 
 use libc.errno;
 use libc.free;
+use libc.getpid;
 use libc.malloc;
 use libc.rename;
 use libc.sys_close;
+use libc.sys_kill;
 use libc.sys_open;
+use libc.sys_write;
 use libc.unlink;
+use libc.EEXIST;
+use libc.ESRCH;
 use libc.O_CREAT;
 use libc.O_EXCL;
 use libc.O_WRONLY;
@@ -54,6 +59,7 @@ export const STAGE_FILE_MAGIC: u32 = 0x31475348u32;
 export const STAGE_FILE_VERSION: u16 = 1u16;
 const STAGE_FILE_FLAGS: u16 = 0u16;
 const STAGE_FILE_HEADER_BYTES: usize = 56 as usize;
+const STAGE_FILE_LOCK_PID_MAX_BYTES: usize = 32 as usize;
 const STAGE_FILE_MAX_BYTES: usize = 1048576 as usize;
 const STAGE_FILE_PATH_MAX: usize = 4096 as usize;
 
@@ -227,6 +233,112 @@ fn stage_file_path_with_suffix(base: &StageFilePath, suffix: &const byte) !Stage
     return out;
 }
 
+fn stage_file_lock_pid_write(fd: i32, lock_path: &StageFilePath) !void {
+    var buf: [byte: 32] = [];
+    var pid: i32 = getpid();
+    if pid <= 0 as i32 {
+        pid = 0 as i32;
+    }
+
+    var digit_count: usize = 0 as usize;
+    if pid == 0 as i32 {
+        buf[0] = '0' as byte;
+        digit_count = 1 as usize;
+    } else {
+        while pid > 0 as i32 {
+            if digit_count + 1 as usize >= STAGE_FILE_LOCK_PID_MAX_BYTES {
+                _ = unlink(&lock_path.bytes[0] as &const byte);
+                return error.StageFileLockFailed;
+            }
+            buf[digit_count] = ('0' as byte) + (pid % 10 as i32) as byte;
+            pid = pid / 10 as i32;
+            digit_count = digit_count + 1 as usize;
+        }
+        var left: usize = 0 as usize;
+        var right: usize = digit_count - 1 as usize;
+        while left < right {
+            const temp: byte = buf[left];
+            buf[left] = buf[right];
+            buf[right] = temp;
+            left = left + 1 as usize;
+            right = right - 1 as usize;
+        }
+    }
+
+    buf[digit_count] = '\n' as byte;
+    const total_len: usize = digit_count + 1 as usize;
+    const written: isize = sys_write(fd, &buf[0] as *const byte, total_len) catch {
+        _ = unlink(&lock_path.bytes[0] as &const byte);
+        return error.StageFileLockFailed;
+    };
+    if written != total_len as isize {
+        _ = unlink(&lock_path.bytes[0] as &const byte);
+        return error.StageFileLockFailed;
+    }
+}
+
+fn stage_file_lock_pid_read(lock_path: &StageFilePath) i32 {
+    const stream: &FILE = fopen(&lock_path.bytes[0] as &const byte, "r");
+    if stream == null {
+        return 0 as i32;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var buf: [byte: 32] = [];
+    const count: usize = fread(&buf[0], 1 as usize, STAGE_FILE_LOCK_PID_MAX_BYTES - 1 as usize, stream);
+    if count == 0 as usize {
+        return 0 as i32;
+    }
+    buf[count] = 0 as byte;
+
+    var value: i32 = 0 as i32;
+    var saw_digit: bool = false;
+    var i: usize = 0 as usize;
+    while i < count {
+        const ch: byte = buf[i];
+        if ch >= '0' as byte && ch <= '9' as byte {
+            saw_digit = true;
+            value = value * 10 as i32 + (ch - '0' as byte) as i32;
+        } else if ch == '\n' as byte || ch == '\r' as byte || ch == ' ' as byte || ch == '\t' as byte {
+            break;
+        } else {
+            return 0 as i32;
+        }
+        i = i + 1 as usize;
+    }
+
+    if !saw_digit || value <= 0 as i32 {
+        return 0 as i32;
+    }
+    return value;
+}
+
+fn stage_file_lock_pid_is_alive(pid: i32) bool {
+    if pid <= 0 as i32 {
+        return false;
+    }
+    _ = sys_kill(pid as i64, 0 as i32) catch |err| {
+        if @error_id(err) == ESRCH {
+            return false;
+        }
+        return true;
+    };
+    return true;
+}
+
+fn stage_file_lock_reclaim_stale(lock_path: &StageFilePath) bool {
+    const pid: i32 = stage_file_lock_pid_read(lock_path);
+    if pid <= 0 as i32 {
+        return false;
+    }
+    if stage_file_lock_pid_is_alive(pid) {
+        return false;
+    }
+    return unlink(&lock_path.bytes[0] as &const byte) == 0;
+}
+
 export fn stage_file_lock_acquire(path: &const byte) !StageFileLock {
     const final_path: StageFilePath = try stage_file_path_from_cstr(path);
     const lock_path: StageFilePath = try stage_file_path_with_suffix(&final_path, ".lock");
@@ -239,12 +351,19 @@ export fn stage_file_lock_acquire(path: &const byte) !StageFileLock {
             S_IRWXU as i32,
         ) catch |err| {
             if @error_id(err) == EEXIST {
+                if stage_file_lock_reclaim_stale(&lock_path) {
+                    continue;
+                }
                 var pause: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 1000000 };
                 var rem: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
                 _ = sys_nanosleep(&pause, &rem) catch {};
                 attempts = attempts + 1 as usize;
                 continue;
             }
+            return error.StageFileLockFailed;
+        };
+        stage_file_lock_pid_write(lock_fd, &lock_path) catch {
+            _ = sys_close(lock_fd) catch {};
             return error.StageFileLockFailed;
         };
         _ = sys_close(lock_fd) catch {

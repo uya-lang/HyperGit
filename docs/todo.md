@@ -362,16 +362,16 @@
 
 ## 22. Benchmarks
 
-- [ ] 生成 10 万路径 synthetic manifest。
-- [ ] 生成 100 万路径 synthetic manifest。
+- [x] 生成 10 万路径 synthetic manifest。
+- [x] 生成 100 万路径 synthetic manifest。
 - [ ] 基准 manifest lookup。
 - [ ] 基准 manifest diff。
 - [ ] 基准 loose object get。
 - [ ] 基准 segment pack lookup。
 - [ ] 基准 small file commit。
-- [ ] 基准单文件 `hgx add <pathspec>`（大 worktree，小 pathspec）。
-- [ ] 基准目录 `hgx add <pathspec>`（大 worktree，小目录）。
-- [ ] 基准重复 `hgx add` 命中 metadata fast path。
+- [x] 基准单文件 `hgx add <pathspec>`（大 worktree，小 pathspec）。
+- [x] 基准目录 `hgx add <pathspec>`（大 worktree，小目录）。
+- [x] 基准重复 `hgx add` 命中 metadata fast path。
 - [ ] 基准 large file chunk。
 - [ ] 基准 hydrate。
 - [ ] 记录每次基准命令和机器信息。

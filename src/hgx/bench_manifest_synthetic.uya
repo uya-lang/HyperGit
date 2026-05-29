@@ -1,0 +1,240 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.time.now_ms;
+
+use libc.fprintf;
+use libc.free;
+use libc.malloc;
+use libc.stderr;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.manifest_id_encode_hex;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.root.manifest_root_build_and_store;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.manifest_leaf_build;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ManifestEntry;
+use object.types.ManifestNodePayload;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+
+export const BENCH_MANIFEST_USAGE_TEXT: &const byte = "usage: bench_manifest_synthetic <entry-count> [objects-root]\n";
+
+error BenchAlloc;
+error BenchParse;
+
+fn bench_manifest_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn bench_manifest_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(bench_manifest_hash(seed));
+}
+
+fn bench_manifest_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(bench_manifest_object_id(seed));
+}
+
+fn bench_manifest_digit_count(value: usize) usize {
+    var digits: usize = 1 as usize;
+    var current: usize = value;
+    while current >= 10 as usize {
+        current = current / 10 as usize;
+        digits = digits + 1 as usize;
+    }
+    return digits;
+}
+
+fn bench_manifest_parse_usize(text: &byte) !usize {
+    if text == null || text[0] == 0 as byte {
+        return error.BenchParse;
+    }
+
+    var value: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while text[i] != 0 as byte {
+        if text[i] < '0' as byte || text[i] > '9' as byte {
+            return error.BenchParse;
+        }
+        value = value * 10 as usize + (text[i] - '0' as byte) as usize;
+        i = i + 1 as usize;
+    }
+    if value == 0 as usize {
+        return error.BenchParse;
+    }
+    return value;
+}
+
+fn bench_manifest_make_decimal_padded_bytes(arena: &Arena, index: usize, width: usize) !ByteList {
+    const total_len: usize = 1 as usize + width;
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.BenchAlloc;
+    }
+
+    raw[0] = 'f' as byte;
+    var divisor: usize = 1 as usize;
+    var i: usize = 1 as usize;
+    while i < width {
+        divisor = divisor * 10 as usize;
+        i = i + 1 as usize;
+    }
+
+    i = 0 as usize;
+    while i < width {
+        raw[1 as usize + i] = ('0' as byte) + ((index / divisor) % 10 as usize) as byte;
+        if divisor > 1 as usize {
+            divisor = divisor / 10 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: raw, len: total_len };
+}
+
+fn bench_manifest_make_input(arena: &Arena, index: usize, width: usize) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try bench_manifest_make_decimal_padded_bytes(arena, index, width),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: bench_manifest_object_id((index % 200 as usize) as byte),
+        logical_size: index as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: bench_manifest_policy_id((index % 200 as usize) as byte + 20 as byte),
+    };
+}
+
+fn bench_manifest_print_root(id: &ManifestId) !void {
+    var hex: [byte: 65] = [];
+    _ = try manifest_id_encode_hex(id, hex[0: HASH32_HEX_BYTES]);
+    hex[HASH32_HEX_BYTES] = 0 as byte;
+    fprintf(stderr, "root=%s\n" as *byte, &hex[0]);
+}
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    if argc != 2 && argc != 3 {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_USAGE_TEXT);
+        return 1;
+    }
+
+    const total_entries: usize = bench_manifest_parse_usize(get_argv(1)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_USAGE_TEXT);
+        return 1;
+    };
+    var objects_root: &byte = null;
+    if argc == 3 {
+        objects_root = get_argv(2);
+        if objects_root == null || objects_root[0] == 0 as byte {
+            fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_USAGE_TEXT);
+            return 1;
+        }
+    }
+
+    const digits: usize = bench_manifest_digit_count(total_entries - 1 as usize);
+    const path_bytes: usize = total_entries * (1 as usize + digits);
+    const input_bytes: usize = @size_of(ManifestLeafInputEntry) as usize * total_entries + path_bytes + 1048576 as usize;
+    const build_bytes: usize = @size_of(ManifestEntry) as usize * total_entries * 2 as usize +
+        @size_of(usize) as usize * total_entries * 4 as usize +
+        path_bytes * 2 as usize +
+        33554432 as usize;
+
+    const input_storage: &byte = malloc(input_bytes) as &byte;
+    if input_storage == null {
+        return 1;
+    }
+    defer {
+        free(input_storage as &void);
+    }
+    var input_arena: Arena = Arena{ buffer: input_storage, size: 0, used: 0 };
+    arena_init(&input_arena, input_storage, input_bytes);
+
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(
+        &input_arena,
+        @size_of(ManifestLeafInputEntry) as usize * total_entries,
+    ) as &ManifestLeafInputEntry;
+    if raw_inputs == null {
+        return 1;
+    }
+
+    var i: usize = 0 as usize;
+    while i < total_entries {
+        raw_inputs[i] = bench_manifest_make_input(&input_arena, i, digits) catch |err| {
+            fprintf(stderr, "input_build_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+        i = i + 1 as usize;
+    }
+
+    const build_storage: &byte = malloc(build_bytes) as &byte;
+    if build_storage == null {
+        return 1;
+    }
+    defer {
+        free(build_storage as &void);
+    }
+    var build_arena: Arena = Arena{ buffer: build_storage, size: 0, used: 0 };
+    arena_init(&build_arena, build_storage, build_bytes);
+
+    const started_ms: u64 = now_ms() catch |err| {
+        fprintf(stderr, "now_ms_start_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const root_prefix: ByteList = ByteList{ ptr: null, len: 0 };
+    const payload: ManifestNodePayload = manifest_leaf_build(
+        &build_arena,
+        &root_prefix,
+        manifest_leaf_input_list_from_slice(raw_inputs[0: total_entries]),
+    ) catch |err| {
+        fprintf(stderr, "manifest_build_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    if objects_root != null {
+        const store: LooseObjectStore = loose_store_open(objects_root) catch |err| {
+            fprintf(stderr, "store_open_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+        const root_id: ManifestId = manifest_root_build_and_store(
+            &build_arena,
+            &store,
+            manifest_leaf_input_list_from_slice(raw_inputs[0: total_entries]),
+        ) catch |err| {
+            fprintf(stderr, "manifest_store_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+        _ = bench_manifest_print_root(&root_id) catch |err| {
+            fprintf(stderr, "manifest_print_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+    }
+    const finished_ms: u64 = now_ms() catch |err| {
+        fprintf(stderr, "now_ms_finish_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    fprintf(
+        stderr,
+        "entries=%llu payload_entries=%llu elapsed_ms=%llu\n" as *byte,
+        total_entries as u64,
+        payload.entries.len as u64,
+        finished_ms - started_ms,
+    );
+    return 0;
+}
