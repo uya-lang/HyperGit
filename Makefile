@@ -82,6 +82,7 @@ test:
 	./tests/test_add_delete.sh
 	./tests/test_add_large_file.sh
 	./tests/test_add_large_file_small_edit.sh
+	./tests/test_add_symlink.sh
 	./tests/test_commit_first.sh
 	./tests/test_commit_second_parent.sh
 	./tests/test_log_first.sh

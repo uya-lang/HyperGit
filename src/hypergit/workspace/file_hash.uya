@@ -9,6 +9,7 @@ use std.string.strlen;
 use libc.O_RDONLY;
 use libc.free;
 use libc.malloc;
+use libc.readlink;
 use core.codec.codec_hash_payload;
 use core.ids.Hash32;
 use core.ids.ObjectId;
@@ -17,12 +18,13 @@ use object.codec.small_blob_payload_encoded_len;
 use object.hash.hash_object_payload_bytes;
 use large.config.large_file_uses_small_blob;
 use large.prepare.large_prepare_recommended_arena_bytes;
-use large.prepare.prepare_chunked_blob_object_id_default;
 use large.prepare.prepare_chunked_blob_object_id_parallel_default;
 use object.types.ByteList;
 use object.types.FileType;
 use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
+use workspace.scan.WorkspaceFileEntry;
+use workspace.scan.WorkspaceFileKind;
 
 const WORKSPACE_FILE_HASH_PATH_MAX: usize = 4096;
 
@@ -137,6 +139,44 @@ fn workspace_hash_read_file_bytes(path: &WorkspaceFileHashPath, size: usize) !Wo
     return data;
 }
 
+fn workspace_hash_read_symlink_bytes(path: &WorkspaceFileHashPath, size_hint: usize) !WorkspaceOwnedBytes {
+    var capacity: usize = size_hint + 1 as usize;
+    if capacity <= size_hint {
+        return error.WorkspaceFileHashReadFailed;
+    }
+    if capacity == 0 as usize {
+        capacity = 1 as usize;
+    }
+
+    while true {
+        const data: WorkspaceOwnedBytes = try workspace_owned_bytes_alloc(capacity);
+        const read_len: i32 = readlink(&path.bytes[0] as &const byte, data.raw, capacity);
+        if read_len < 0 {
+            workspace_owned_bytes_free(&data);
+            return error.WorkspaceFileHashReadFailed;
+        }
+
+        const actual_len: usize = read_len as usize;
+        if actual_len < capacity {
+            return WorkspaceOwnedBytes{ raw: data.raw, len: actual_len };
+        }
+
+        workspace_owned_bytes_free(&data);
+        capacity = capacity * 2 as usize;
+        if capacity == 0 as usize {
+            return error.WorkspaceFileHashReadFailed;
+        }
+    }
+}
+
+fn workspace_hash_read_entry_bytes(base: &WorkspaceFileHashPath, entry: &WorkspaceFileEntry) !WorkspaceOwnedBytes {
+    const fs_path: WorkspaceFileHashPath = try workspace_hash_path_join(base, &entry.path);
+    if entry.kind == WorkspaceFileKind.Symlink {
+        return try workspace_hash_read_symlink_bytes(&fs_path, entry.logical_size as usize);
+    }
+    return try workspace_hash_read_file_bytes(&fs_path, entry.logical_size as usize);
+}
+
 fn workspace_hash_encode_small_blob(payload: &SmallBlobPayload) !WorkspaceOwnedBytes {
     const total_len: usize = small_blob_payload_encoded_len(payload);
     const encoded: WorkspaceOwnedBytes = try workspace_owned_bytes_alloc(total_len);
@@ -149,32 +189,11 @@ fn workspace_hash_encode_small_blob(payload: &SmallBlobPayload) !WorkspaceOwnedB
     return encoded;
 }
 
-export fn workspace_file_object_id(root_path: &const byte, path: &ByteList, logical_size: u64) !ObjectId {
-    const base: WorkspaceFileHashPath = try workspace_hash_path_from_cstr(root_path);
-    const fs_path: WorkspaceFileHashPath = try workspace_hash_path_join(&base, path);
-    const file_bytes: WorkspaceOwnedBytes = try workspace_hash_read_file_bytes(&fs_path, logical_size as usize);
-    defer {
-        workspace_owned_bytes_free(&file_bytes);
-    }
-
-    if !large_file_uses_small_blob(logical_size) {
-        const scratch_len: usize = try large_prepare_recommended_arena_bytes(logical_size);
-        const scratch: &byte = malloc(scratch_len) as &byte;
-        if scratch == null {
-            return error.WorkspaceFileHashAlloc;
-        }
-        defer {
-            free(scratch as &void);
-        }
-        var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
-        arena_init(&arena, scratch, scratch_len);
-        return try prepare_chunked_blob_object_id_parallel_default(&arena, workspace_owned_bytes_slice(&file_bytes), FileType.Binary);
-    }
-
+fn workspace_hash_small_blob_object_id(content: &[byte]) !ObjectId {
     const payload: SmallBlobPayload = SmallBlobPayload{
-        logical_size: logical_size,
-        content_hash: codec_hash_payload(workspace_owned_bytes_slice(&file_bytes)),
-        payload: ByteList{ ptr: file_bytes.raw, len: file_bytes.len },
+        logical_size: content.len as u64,
+        content_hash: codec_hash_payload(content),
+        payload: ByteList{ ptr: content.ptr, len: content.len },
     };
     const encoded: WorkspaceOwnedBytes = try workspace_hash_encode_small_blob(&payload);
     defer {
@@ -192,6 +211,44 @@ export fn workspace_file_object_id(root_path: &const byte, path: &ByteList, logi
     var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
     arena_init(&arena, scratch, scratch_len);
     return try hash_object_payload_bytes(&arena, ObjectKind.SmallBlob, workspace_owned_bytes_slice(&encoded));
+}
+
+fn workspace_hash_entry_object_id(entry: &WorkspaceFileEntry, content: &[byte]) !ObjectId {
+    if entry.kind != WorkspaceFileKind.Symlink && !large_file_uses_small_blob(entry.logical_size) {
+        const scratch_len: usize = try large_prepare_recommended_arena_bytes(entry.logical_size);
+        const scratch: &byte = malloc(scratch_len) as &byte;
+        if scratch == null {
+            return error.WorkspaceFileHashAlloc;
+        }
+        defer {
+            free(scratch as &void);
+        }
+        var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+        arena_init(&arena, scratch, scratch_len);
+        return try prepare_chunked_blob_object_id_parallel_default(&arena, content, FileType.Binary);
+    }
+    return try workspace_hash_small_blob_object_id(content);
+}
+
+export fn workspace_entry_object_id(root_path: &const byte, entry: &WorkspaceFileEntry) !ObjectId {
+    const base: WorkspaceFileHashPath = try workspace_hash_path_from_cstr(root_path);
+    const file_bytes: WorkspaceOwnedBytes = try workspace_hash_read_entry_bytes(&base, entry);
+    defer {
+        workspace_owned_bytes_free(&file_bytes);
+    }
+    return try workspace_hash_entry_object_id(entry, workspace_owned_bytes_slice(&file_bytes));
+}
+
+export fn workspace_file_object_id(root_path: &const byte, path: &ByteList, logical_size: u64) !ObjectId {
+    const entry: WorkspaceFileEntry = WorkspaceFileEntry{
+        path: ByteList{ ptr: path.ptr, len: path.len },
+        kind: WorkspaceFileKind.Regular,
+        file_mode: 0u32,
+        logical_size: logical_size,
+        inode: 0u64,
+        mtime_ns: 0i64,
+    };
+    return try workspace_entry_object_id(root_path, &entry);
 }
 
 export fn workspace_file_working_hash(root_path: &const byte, path: &ByteList, logical_size: u64) !Hash32 {

@@ -8,9 +8,8 @@ use manifest.path.manifest_path_compare;
 use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
 use object.types.ByteList;
-use workspace.file_hash.workspace_file_object_id;
+use workspace.file_hash.workspace_entry_object_id;
 use workspace.scan.WorkspaceFileEntry;
-use workspace.scan.WorkspaceFileKind;
 use workspace.scan.WorkspaceFileList;
 use workspace.scan.workspace_scan_files;
 use workspace.state.ChangeStatus;
@@ -55,7 +54,7 @@ fn workspace_reconcile_added_change(
     watcher_seq: u64,
     reconcile_epoch: u64,
 ) !LocalChange {
-    const working_object: ObjectId = try workspace_file_object_id(root_path, &entry.path, entry.logical_size);
+    const working_object: ObjectId = try workspace_entry_object_id(root_path, entry);
     return workspace_reconcile_entry_from_base(
         &entry.path,
         workspace_reconcile_zero_object_id(),
@@ -76,10 +75,9 @@ fn workspace_reconcile_materialized_or_modified_change(
     watcher_seq: u64,
     reconcile_epoch: u64,
 ) !LocalChange {
-    const working_object: ObjectId = try workspace_file_object_id(root_path, &entry.path, entry.logical_size);
+    const working_object: ObjectId = try workspace_entry_object_id(root_path, entry);
     var status: ChangeStatus = ChangeStatus.Materialized;
-    if entry.kind != WorkspaceFileKind.Regular ||
-        entry.file_mode != base.mode ||
+    if entry.file_mode != base.mode ||
         object_id_compare(&working_object, &base.object_id) != 0 {
         status = ChangeStatus.Modified;
     }

@@ -13,7 +13,7 @@ use libc.stdout;
 use libc.EACCES;
 use libc.EPERM;
 
-use commands.add.add_worktree_small_blob_id;
+use commands.add.add_worktree_object_id;
 use cli.EXIT_NOT_IMPLEMENTED;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
@@ -42,7 +42,6 @@ use store.repo_layout.repo_path_join_literal;
 use store.repo_layout.repo_read_config;
 use store.repo_layout.repo_path_cstr;
 use workspace.scan.WorkspaceFileEntry;
-use workspace.scan.WorkspaceFileKind;
 use workspace.scan.WorkspaceFileList;
 use workspace.scan.workspace_scan_files;
 use workspace.stage.StageEntry;
@@ -182,10 +181,10 @@ fn status_workspace_matches_manifest(arena: &Arena, root: &RepoPath, manifest_in
                 j = j + 1 as usize;
                 continue;
             }
-            if worktree_entry.kind != WorkspaceFileKind.Regular || worktree_entry.file_mode != manifest_entry.mode {
+            if worktree_entry.file_mode != manifest_entry.mode {
                 return false;
             }
-            const worktree_id: ObjectId = add_worktree_small_blob_id(root, &worktree_entry.path, worktree_entry.logical_size) catch {
+            const worktree_id: ObjectId = add_worktree_object_id(root, worktree_entry) catch {
                 return false;
             };
             if object_id_compare(&worktree_id, &manifest_entry.object_id) != 0 {
@@ -289,9 +288,6 @@ fn status_stage_entry_matches_worktree(root: &RepoPath, entry: &StageEntry, file
     if entry.kind == StageEntryKind.Delete {
         return false;
     }
-    if file_entry.kind != WorkspaceFileKind.Regular {
-        return false;
-    }
     if entry.file_mode != file_entry.file_mode {
         return false;
     }
@@ -299,10 +295,7 @@ fn status_stage_entry_matches_worktree(root: &RepoPath, entry: &StageEntry, file
         return true;
     }
 
-    const worktree_id: ObjectId = add_worktree_small_blob_id(root, &file_entry.path, file_entry.logical_size) catch |err| {
-        if @error_id(err) == @error_id(error.AddLargeFileNotImplemented) || @error_id(err) == @error_id(error.AddSymlinkNotImplemented) {
-            return false;
-        }
+    const worktree_id: ObjectId = add_worktree_object_id(root, file_entry) catch {
         return error.StatusWorkspaceReadFailed;
     };
     return object_id_compare(&worktree_id, &entry.staged_object) == 0;
