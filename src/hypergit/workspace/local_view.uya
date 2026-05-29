@@ -17,12 +17,19 @@ use workspace.state.local_change_list_from_slice;
 error LocalViewAlloc;
 
 fn local_view_find_change(changes: &LocalChangeList, path: &ByteList) isize {
-    var i: usize = 0;
-    while i < changes.len {
-        if manifest_path_compare(&changes.ptr[i].path, path) == 0 {
-            return i as isize;
+    var low: usize = 0 as usize;
+    var high: usize = changes.len;
+    while low < high {
+        const mid: usize = low + ((high - low) / 2 as usize);
+        const cmp: i32 = manifest_path_compare(&changes.ptr[mid].path, path);
+        if cmp < 0 {
+            low = mid + 1 as usize;
+        } else {
+            high = mid;
         }
-        i = i + 1 as usize;
+    }
+    if low < changes.len && manifest_path_compare(&changes.ptr[low].path, path) == 0 {
+        return low as isize;
     }
     return -1 as isize;
 }

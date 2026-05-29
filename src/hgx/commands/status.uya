@@ -35,6 +35,7 @@ use store.repo_layout.repo_read_config;
 use store.repo_layout.repo_path_cstr;
 use workspace.local_change_file.local_change_file_read;
 use workspace.local_view.workspace_local_view_filter_expected_inputs;
+use workspace.local_view.workspace_local_view_find_change;
 use workspace.scan.WorkspaceFileEntry;
 use workspace.scan.WorkspaceFileList;
 use workspace.scan.workspace_scan_files;
@@ -46,6 +47,8 @@ use workspace.stage.stage_empty_snapshot;
 use workspace.stage.stage_zero_commit_id;
 use workspace.stage_file.stage_file_read;
 use workspace.stage_view.stage_view_manifest_inputs_from_snapshot;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
 use workspace.state.LocalChangeList;
 
 const STATUS_ARENA_BYTES: usize = 134217728 as usize;
@@ -254,6 +257,7 @@ fn status_collect_unstaged_changes(
     arena: &Arena,
     root: &RepoPath,
     expected_inputs: &ManifestLeafInputList,
+    stored_local_changes: &LocalChangeList,
     worktree: &WorkspaceFileList,
 ) !StatusChangeList {
     const max_len: usize = expected_inputs.len + worktree.len;
@@ -287,7 +291,11 @@ fn status_collect_unstaged_changes(
         if expected_entry.mode != worktree_entry.file_mode {
             status_append_change(raw, &out_index, &worktree_entry.path, StatusChangeKind.Modified);
         } else {
-            const worktree_id: ObjectId = add_worktree_object_id(root, worktree_entry) catch |err| {
+            const worktree_id: ObjectId = status_worktree_object_id(
+                root,
+                stored_local_changes,
+                worktree_entry,
+            ) catch |err| {
                 if @error_id(err) == @error_id(error.RepoPermissionDenied) {
                     return error.RepoPermissionDenied;
                 }
@@ -311,6 +319,31 @@ fn status_collect_unstaged_changes(
     }
 
     return status_change_list_from_slice(raw[0: out_index]);
+}
+
+fn status_local_change_metadata_matches(change: &LocalChange, file_entry: &WorkspaceFileEntry) bool {
+    return change.last_seen_inode == file_entry.inode &&
+        change.last_seen_mtime_ns == file_entry.mtime_ns &&
+        change.last_seen_logical_size == file_entry.logical_size;
+}
+
+fn status_worktree_object_id(
+    root: &RepoPath,
+    stored_local_changes: &LocalChangeList,
+    worktree_entry: &WorkspaceFileEntry,
+) !ObjectId {
+    const local_change_index: isize = workspace_local_view_find_change(stored_local_changes, &worktree_entry.path);
+    if local_change_index >= 0 as isize {
+        const change: &LocalChange = &stored_local_changes.ptr[local_change_index as usize];
+        if status_local_change_metadata_matches(change, worktree_entry) &&
+            change.status != ChangeStatus.Virtual &&
+            change.status != ChangeStatus.Deleted &&
+            change.status != ChangeStatus.Conflict {
+            return ObjectId{ hash: change.working_hash };
+        }
+    }
+
+    return add_worktree_object_id(root, worktree_entry);
 }
 
 fn status_print_change_line(kind: StatusChangeKind, path: &ByteList) !void {
@@ -459,6 +492,7 @@ export fn run_status() i32 {
         &arena,
         &root,
         &expected_inputs,
+        &stored_local_changes,
         &worktree,
     ) catch |err| {
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {

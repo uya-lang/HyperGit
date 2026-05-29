@@ -63,6 +63,7 @@ test:
 	$(UYA) test src/hypergit/test_workspace_scan.uya
 	$(UYA) test src/hypergit/test_workspace_state_file.uya
 	$(UYA) test src/hypergit/test_local_change_file.uya
+	$(UYA) test src/hypergit/test_local_view.uya
 	$(UYA) test src/hypergit/test_sparse_profile.uya
 	$(UYA) test src/hypergit/test_workspace_reconcile.uya
 	$(UYA) test src/hypergit/test_loose_store.uya

@@ -27,6 +27,7 @@ const WORKSPACE_SCAN_STAT_EXEC_BITS: u32 = 73u32;
 const WORKSPACE_SCAN_MODE_FILE: u32 = 0o100644u32;
 const WORKSPACE_SCAN_MODE_EXECUTABLE: u32 = 0o100755u32;
 const WORKSPACE_SCAN_MODE_SYMLINK: u32 = 0o120000u32;
+const WORKSPACE_SCAN_ENTRY_CHUNK_LEN: usize = 256 as usize;
 
 error WorkspaceScanAlloc;
 error WorkspaceScanRootInvalid;
@@ -60,6 +61,18 @@ export struct WorkspaceFileList {
 struct WorkspaceScanPath {
     bytes: [byte: 4096] = [],
     len: usize = 0
+}
+
+struct WorkspaceScanEntryChunk {
+    next: &WorkspaceScanEntryChunk = null,
+    len: usize = 0,
+    entries: [WorkspaceFileEntry: 256] = [],
+}
+
+struct WorkspaceScanCollector {
+    head: &WorkspaceScanEntryChunk = null,
+    tail: &WorkspaceScanEntryChunk = null,
+    total_count: usize = 0,
 }
 
 export fn workspace_file_list_from_slice(slice: &[WorkspaceFileEntry]) WorkspaceFileList {
@@ -141,6 +154,73 @@ fn workspace_scan_path_join(base: &WorkspaceScanPath, suffix: &[byte]) !Workspac
     out.bytes[pos] = 0 as byte;
     out.len = pos;
     return out;
+}
+
+fn workspace_scan_collector_init() WorkspaceScanCollector {
+    return WorkspaceScanCollector{
+        head: null,
+        tail: null,
+        total_count: 0 as usize,
+    };
+}
+
+fn workspace_scan_collector_alloc_chunk(arena: &Arena) !&WorkspaceScanEntryChunk {
+    const raw: &WorkspaceScanEntryChunk = arena_alloc(arena, @size_of(WorkspaceScanEntryChunk) as usize) as &WorkspaceScanEntryChunk;
+    if raw == null {
+        return error.WorkspaceScanAlloc;
+    }
+    raw[0] = WorkspaceScanEntryChunk{
+        next: null,
+        len: 0 as usize,
+        entries: [],
+    };
+    return raw;
+}
+
+fn workspace_scan_collector_append(arena: &Arena, collector: &WorkspaceScanCollector, entry: &WorkspaceFileEntry) !void {
+    if collector.tail == null || collector.tail.len >= WORKSPACE_SCAN_ENTRY_CHUNK_LEN {
+        const next_chunk: &WorkspaceScanEntryChunk = try workspace_scan_collector_alloc_chunk(arena);
+        if collector.head == null {
+            collector.head = next_chunk;
+        } else {
+            collector.tail.next = next_chunk;
+        }
+        collector.tail = next_chunk;
+    }
+
+    collector.tail.entries[collector.tail.len] = entry[0];
+    collector.tail.len = collector.tail.len + 1 as usize;
+    collector.total_count = collector.total_count + 1 as usize;
+}
+
+fn workspace_scan_collector_flatten(arena: &Arena, collector: &WorkspaceScanCollector) !WorkspaceFileList {
+    if collector.total_count == 0 as usize {
+        return WorkspaceFileList{ ptr: null, len: 0 };
+    }
+
+    const raw_entries: &WorkspaceFileEntry = arena_alloc(
+        arena,
+        @size_of(WorkspaceFileEntry) as usize * collector.total_count,
+    ) as &WorkspaceFileEntry;
+    if raw_entries == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var out_index: usize = 0 as usize;
+    var chunk: &WorkspaceScanEntryChunk = collector.head;
+    while chunk != null {
+        var i: usize = 0 as usize;
+        while i < chunk.len {
+            raw_entries[out_index] = chunk.entries[i];
+            out_index = out_index + 1 as usize;
+            i = i + 1 as usize;
+        }
+        chunk = chunk.next;
+    }
+    if out_index != collector.total_count {
+        return error.WorkspaceScanCountMismatch;
+    }
+    return workspace_file_list_from_slice(raw_entries[0: out_index]);
 }
 
 fn workspace_scan_mode_type(mode: u32) u32 {
@@ -236,6 +316,18 @@ fn workspace_scan_mtime_ns(st: &Stat) i64 {
     return (st.st_mtime * 1000000000i64) + st.st_mtime_nsec;
 }
 
+fn workspace_scan_entry_from_stat(arena: &Arena, relative: &WorkspaceScanPath, st: &Stat) !WorkspaceFileEntry {
+    const normalized_path: ByteList = try manifest_path_normalize(arena, relative.bytes[0: relative.len]);
+    return WorkspaceFileEntry{
+        path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
+        kind: try workspace_scan_kind_from_mode(st.st_mode as u32),
+        file_mode: workspace_scan_canonical_mode(st.st_mode as u32),
+        logical_size: workspace_scan_logical_size(st),
+        inode: workspace_scan_inode(st),
+        mtime_ns: workspace_scan_mtime_ns(st),
+    };
+}
+
 fn workspace_scan_count_files(root: &WorkspaceScanPath, relative: &WorkspaceScanPath) !usize {
     const current_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
     const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
@@ -283,7 +375,12 @@ fn workspace_scan_count_files(root: &WorkspaceScanPath, relative: &WorkspaceScan
     return total;
 }
 
-fn workspace_scan_collect_files(arena: &Arena, root: &WorkspaceScanPath, relative: &WorkspaceScanPath, entries: &WorkspaceFileEntry, next_index: &usize) !void {
+fn workspace_scan_collect_files(
+    arena: &Arena,
+    root: &WorkspaceScanPath,
+    relative: &WorkspaceScanPath,
+    collector: &WorkspaceScanCollector,
+) !void {
     const current_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
     const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
     if dir == null {
@@ -319,20 +416,12 @@ fn workspace_scan_collect_files(arena: &Arena, root: &WorkspaceScanPath, relativ
 
         const mode_type: u32 = workspace_scan_mode_type(st.st_mode as u32);
         if mode_type == WORKSPACE_SCAN_STAT_S_IFDIR {
-            try workspace_scan_collect_files(arena, root, &child_relative, entries, next_index);
+            try workspace_scan_collect_files(arena, root, &child_relative, collector);
             continue;
         }
 
-        const normalized_path: ByteList = try manifest_path_normalize(arena, child_relative.bytes[0: child_relative.len]);
-        entries[*next_index] = WorkspaceFileEntry{
-            path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
-            kind: try workspace_scan_kind_from_mode(st.st_mode as u32),
-            file_mode: workspace_scan_canonical_mode(st.st_mode as u32),
-            logical_size: workspace_scan_logical_size(&st),
-            inode: workspace_scan_inode(&st),
-            mtime_ns: workspace_scan_mtime_ns(&st),
-        };
-        *next_index = *next_index + 1 as usize;
+        const file_entry: WorkspaceFileEntry = try workspace_scan_entry_from_stat(arena, &child_relative, &st);
+        try workspace_scan_collector_append(arena, collector, &file_entry);
     }
     return;
 }
@@ -437,7 +526,12 @@ fn workspace_scan_count_path(root: &WorkspaceScanPath, relative: &WorkspaceScanP
     return 1 as usize;
 }
 
-fn workspace_scan_collect_single(arena: &Arena, root: &WorkspaceScanPath, relative: &WorkspaceScanPath, entries: &WorkspaceFileEntry, next_index: &usize) !void {
+fn workspace_scan_collect_single(
+    arena: &Arena,
+    root: &WorkspaceScanPath,
+    relative: &WorkspaceScanPath,
+    collector: &WorkspaceScanCollector,
+) !void {
     const target_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
     var st: Stat = Stat{};
     _ = sys_lstat(&target_path.bytes[0] as &const byte, &st) catch |err| {
@@ -447,16 +541,32 @@ fn workspace_scan_collect_single(arena: &Arena, root: &WorkspaceScanPath, relati
         return error.WorkspaceScanStatFailed;
     };
 
-    const normalized_path: ByteList = try manifest_path_normalize(arena, relative.bytes[0: relative.len]);
-    entries[*next_index] = WorkspaceFileEntry{
-        path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
-        kind: try workspace_scan_kind_from_mode(st.st_mode as u32),
-        file_mode: workspace_scan_canonical_mode(st.st_mode as u32),
-        logical_size: workspace_scan_logical_size(&st),
-        inode: workspace_scan_inode(&st),
-        mtime_ns: workspace_scan_mtime_ns(&st),
+    const file_entry: WorkspaceFileEntry = try workspace_scan_entry_from_stat(arena, relative, &st);
+    try workspace_scan_collector_append(arena, collector, &file_entry);
+}
+
+fn workspace_scan_collect_pathspec_target(
+    arena: &Arena,
+    root: &WorkspaceScanPath,
+    relative: &WorkspaceScanPath,
+    collector: &WorkspaceScanCollector,
+) !void {
+    if relative.len == 0 as usize {
+        return workspace_scan_collect_files(arena, root, relative, collector);
+    }
+
+    const target_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
+    var st: Stat = Stat{};
+    _ = sys_lstat(&target_path.bytes[0] as &const byte, &st) catch |err| {
+        if @error_id(err) == ENOENT as u32 {
+            return;
+        }
+        return error.WorkspaceScanStatFailed;
     };
-    *next_index = *next_index + 1 as usize;
+    if workspace_scan_mode_type(st.st_mode as u32) == WORKSPACE_SCAN_STAT_S_IFDIR {
+        return workspace_scan_collect_files(arena, root, relative, collector);
+    }
+    return workspace_scan_collect_single(arena, root, relative, collector);
 }
 
 fn workspace_scan_compact_unique_entries(entries: &WorkspaceFileEntry, len: usize) usize {
@@ -479,25 +589,16 @@ fn workspace_scan_compact_unique_entries(entries: &WorkspaceFileEntry, len: usiz
 export fn workspace_scan_files(arena: &Arena, root_path: &const byte) !WorkspaceFileList {
     const root: WorkspaceScanPath = try workspace_scan_path_from_cstr(root_path);
     const empty_relative: WorkspaceScanPath = workspace_scan_path_empty();
-    const file_count: usize = try workspace_scan_count_files(&root, &empty_relative);
-    if file_count == 0 {
-        return WorkspaceFileList{ ptr: null, len: 0 };
+    var collector: WorkspaceScanCollector = workspace_scan_collector_init();
+    try workspace_scan_collect_files(arena, &root, &empty_relative, &collector);
+    const files: WorkspaceFileList = try workspace_scan_collector_flatten(arena, &collector);
+    if files.len == 0 as usize {
+        return files;
     }
 
-    const raw_entries: &WorkspaceFileEntry = arena_alloc(arena, @size_of(WorkspaceFileEntry) as usize * file_count) as &WorkspaceFileEntry;
-    if raw_entries == null {
-        return error.WorkspaceScanAlloc;
-    }
-
-    var next_index: usize = 0;
-    try workspace_scan_collect_files(arena, &root, &empty_relative, raw_entries, &next_index);
-    if next_index != file_count {
-        return error.WorkspaceScanCountMismatch;
-    }
-
-    try workspace_scan_sort_entries(arena, raw_entries, file_count);
-    try workspace_scan_validate_unique_paths(raw_entries, file_count);
-    return workspace_file_list_from_slice(raw_entries[0: file_count]);
+    try workspace_scan_sort_entries(arena, files.ptr, files.len);
+    try workspace_scan_validate_unique_paths(files.ptr, files.len);
+    return files;
 }
 
 export fn workspace_scan_files_for_pathspecs(
@@ -510,54 +611,27 @@ export fn workspace_scan_files_for_pathspecs(
     }
 
     const root: WorkspaceScanPath = try workspace_scan_path_from_cstr(root_path);
-    const empty_relative: WorkspaceScanPath = workspace_scan_path_empty();
-    var total_count: usize = 0 as usize;
+    var collector: WorkspaceScanCollector = workspace_scan_collector_init();
     var i: usize = 0 as usize;
-    while i < pathspecs.len {
-        const relative: WorkspaceScanPath = try workspace_scan_path_from_byte_list(&pathspecs.ptr[i]);
-        total_count = total_count + (try workspace_scan_count_path(&root, &relative));
-        i = i + 1 as usize;
-    }
-    if total_count == 0 as usize {
-        return WorkspaceFileList{ ptr: null, len: 0 };
-    }
-
-    const raw_entries: &WorkspaceFileEntry = arena_alloc(arena, @size_of(WorkspaceFileEntry) as usize * total_count) as &WorkspaceFileEntry;
-    if raw_entries == null {
-        return error.WorkspaceScanAlloc;
-    }
-
-    var next_index: usize = 0 as usize;
-    i = 0 as usize;
     while i < pathspecs.len {
         const pathspec: &ByteList = &pathspecs.ptr[i];
         if pathspec.len == 0 as usize {
-            try workspace_scan_collect_files(arena, &root, &empty_relative, raw_entries, &next_index);
+            const empty_relative: WorkspaceScanPath = workspace_scan_path_empty();
+            try workspace_scan_collect_files(arena, &root, &empty_relative, &collector);
         } else {
             const relative: WorkspaceScanPath = try workspace_scan_path_from_byte_list(pathspec);
-            const target_path: WorkspaceScanPath = try workspace_scan_path_join(&root, relative.bytes[0: relative.len]);
-            var st: Stat = Stat{};
-            _ = sys_lstat(&target_path.bytes[0] as &const byte, &st) catch |err| {
-                if @error_id(err) == ENOENT as u32 {
-                    i = i + 1 as usize;
-                    continue;
-                }
-                return error.WorkspaceScanStatFailed;
-            };
-            if workspace_scan_mode_type(st.st_mode as u32) == WORKSPACE_SCAN_STAT_S_IFDIR {
-                try workspace_scan_collect_files(arena, &root, &relative, raw_entries, &next_index);
-            } else {
-                try workspace_scan_collect_single(arena, &root, &relative, raw_entries, &next_index);
-            }
+            try workspace_scan_collect_pathspec_target(arena, &root, &relative, &collector);
         }
         i = i + 1 as usize;
     }
 
-    if next_index > total_count {
-        return error.WorkspaceScanCountMismatch;
+    const files: WorkspaceFileList = try workspace_scan_collector_flatten(arena, &collector);
+    if files.len == 0 as usize {
+        return files;
     }
-    try workspace_scan_sort_entries(arena, raw_entries, next_index);
-    const compact_len: usize = workspace_scan_compact_unique_entries(raw_entries, next_index);
-    try workspace_scan_validate_unique_paths(raw_entries, compact_len);
-    return workspace_file_list_from_slice(raw_entries[0: compact_len]);
+
+    try workspace_scan_sort_entries(arena, files.ptr, files.len);
+    const compact_len: usize = workspace_scan_compact_unique_entries(files.ptr, files.len);
+    try workspace_scan_validate_unique_paths(files.ptr, compact_len);
+    return workspace_file_list_from_slice(files.ptr[0: compact_len]);
 }

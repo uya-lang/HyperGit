@@ -1,0 +1,178 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.ids.Hash32;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use workspace.local_view.workspace_local_view_filter_expected_inputs;
+use workspace.local_view.workspace_local_view_find_change;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_list_from_slice;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn test_workspace_local_view_find_change_uses_sorted_lookup() !void {
+    var alpha_path: [byte: 9] = ['a' as byte, 'l' as byte, 'p' as byte, 'h' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var beta_path: [byte: 8] = ['b' as byte, 'e' as byte, 't' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var gamma_path: [byte: 9] = ['g' as byte, 'a' as byte, 'm' as byte, 'm' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var zeta_path: [byte: 8] = ['z' as byte, 'e' as byte, 't' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var changes: [LocalChange: 3] = [
+        LocalChange{
+            path: ByteList{ ptr: alpha_path[0: 9].ptr, len: 9 as usize },
+            base_object: object_id_from_hash(make_hash(1 as byte)),
+            working_hash: make_hash(2 as byte),
+            status: ChangeStatus.Materialized,
+            last_seen_inode: 1u64,
+            last_seen_mtime_ns: 2i64,
+            last_seen_logical_size: 3u64,
+            watcher_seq: 4u64,
+            reconcile_epoch: 5u64,
+        },
+        LocalChange{
+            path: ByteList{ ptr: beta_path[0: 8].ptr, len: 8 as usize },
+            base_object: object_id_from_hash(make_hash(6 as byte)),
+            working_hash: make_hash(7 as byte),
+            status: ChangeStatus.Modified,
+            last_seen_inode: 8u64,
+            last_seen_mtime_ns: 9i64,
+            last_seen_logical_size: 10u64,
+            watcher_seq: 11u64,
+            reconcile_epoch: 12u64,
+        },
+        LocalChange{
+            path: ByteList{ ptr: gamma_path[0: 9].ptr, len: 9 as usize },
+            base_object: object_id_from_hash(make_hash(13 as byte)),
+            working_hash: make_hash(14 as byte),
+            status: ChangeStatus.Virtual,
+            last_seen_inode: 0u64,
+            last_seen_mtime_ns: 0i64,
+            last_seen_logical_size: 0u64,
+            watcher_seq: 15u64,
+            reconcile_epoch: 16u64,
+        },
+    ];
+
+    const list: LocalChangeList = local_change_list_from_slice(changes[0: 3]);
+    try expect(workspace_local_view_find_change(&list, &ByteList{ ptr: alpha_path[0: 9].ptr, len: 9 as usize }) == 0 as isize);
+    try expect(workspace_local_view_find_change(&list, &ByteList{ ptr: beta_path[0: 8].ptr, len: 8 as usize }) == 1 as isize);
+    try expect(workspace_local_view_find_change(&list, &ByteList{ ptr: gamma_path[0: 9].ptr, len: 9 as usize }) == 2 as isize);
+    try expect(workspace_local_view_find_change(&list, &ByteList{ ptr: zeta_path[0: 8].ptr, len: 8 as usize }) == -1 as isize);
+}
+
+fn test_workspace_local_view_filter_expected_inputs_excludes_virtual_entries() !void {
+    var alpha_path: [byte: 9] = ['a' as byte, 'l' as byte, 'p' as byte, 'h' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var beta_path: [byte: 8] = ['b' as byte, 'e' as byte, 't' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var gamma_path: [byte: 9] = ['g' as byte, 'a' as byte, 'm' as byte, 'm' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+
+    var inputs: [ManifestLeafInputEntry: 3] = [
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: alpha_path[0: 9].ptr, len: 9 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: object_id_from_hash(make_hash(21 as byte)),
+            logical_size: 5u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(22 as byte))),
+        },
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: beta_path[0: 8].ptr, len: 8 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: object_id_from_hash(make_hash(23 as byte)),
+            logical_size: 4u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(24 as byte))),
+        },
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: gamma_path[0: 9].ptr, len: 9 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: object_id_from_hash(make_hash(25 as byte)),
+            logical_size: 5u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(26 as byte))),
+        },
+    ];
+
+    var changes: [LocalChange: 3] = [
+        LocalChange{
+            path: ByteList{ ptr: alpha_path[0: 9].ptr, len: 9 as usize },
+            base_object: object_id_from_hash(make_hash(31 as byte)),
+            working_hash: make_hash(32 as byte),
+            status: ChangeStatus.Materialized,
+            last_seen_inode: 1u64,
+            last_seen_mtime_ns: 2i64,
+            last_seen_logical_size: 5u64,
+            watcher_seq: 3u64,
+            reconcile_epoch: 4u64,
+        },
+        LocalChange{
+            path: ByteList{ ptr: beta_path[0: 8].ptr, len: 8 as usize },
+            base_object: object_id_from_hash(make_hash(33 as byte)),
+            working_hash: make_hash(34 as byte),
+            status: ChangeStatus.Virtual,
+            last_seen_inode: 0u64,
+            last_seen_mtime_ns: 0i64,
+            last_seen_logical_size: 0u64,
+            watcher_seq: 5u64,
+            reconcile_epoch: 6u64,
+        },
+        LocalChange{
+            path: ByteList{ ptr: gamma_path[0: 9].ptr, len: 9 as usize },
+            base_object: object_id_from_hash(make_hash(35 as byte)),
+            working_hash: make_hash(36 as byte),
+            status: ChangeStatus.Modified,
+            last_seen_inode: 7u64,
+            last_seen_mtime_ns: 8i64,
+            last_seen_logical_size: 5u64,
+            watcher_seq: 9u64,
+            reconcile_epoch: 10u64,
+        },
+    ];
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const inputs_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(inputs[0: 3]);
+    const changes_list: LocalChangeList = local_change_list_from_slice(changes[0: 3]);
+    const filtered: ManifestLeafInputList = try workspace_local_view_filter_expected_inputs(
+        &arena,
+        &inputs_list,
+        &changes_list,
+    );
+
+    try expect(filtered.len == 2 as usize);
+    try expect(filtered.ptr[0].path.len == 9 as usize);
+    try expect(filtered.ptr[0].path.ptr[0] == 'a' as byte);
+    try expect(filtered.ptr[1].path.len == 9 as usize);
+    try expect(filtered.ptr[1].path.ptr[0] == 'g' as byte);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Local View Tests");
+    run_test("workspace local view find change uses sorted lookup", test_workspace_local_view_find_change_uses_sorted_lookup);
+    run_test("workspace local view filter expected inputs excludes virtual entries", test_workspace_local_view_filter_expected_inputs_excludes_virtual_entries);
+    return test_suite_end();
+}
