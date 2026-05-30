@@ -13,7 +13,9 @@ use std.time.now_ms;
 
 use libc.O_RDONLY;
 use libc.EACCES;
+use libc.ENOENT;
 use libc.EPERM;
+use libc.Stat;
 use libc.errno;
 use libc.fflush;
 use libc.free;
@@ -38,6 +40,7 @@ use libc.pthread_yield;
 use libc.readlink;
 use libc.sched_getaffinity;
 use libc.stderr;
+use libc.stat;
 use libc.stdout;
 use libc.STDERR_FILENO;
 use libc.STDOUT_FILENO;
@@ -46,8 +49,10 @@ use cli.EXIT_NOT_IMPLEMENTED;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
 use cli.EXIT_USAGE_ERROR;
+use crypto.blake3.hypergit_blake3_digest;
 use core.ids.CommitId;
 use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
 use core.ids.ObjectId;
 use core.ids.commit_id_compare;
 use core.ids.hash32_compare;
@@ -75,6 +80,7 @@ use object.codec.chunked_blob_payload_to_canonical;
 use object.codec.encode_small_blob_payload;
 use object.codec.decode_commit_object;
 use object.codec.small_blob_payload_encoded_len;
+use object.hash.HASH_DOMAIN_SMALL_BLOB;
 use object.hash.hash_object_payload_bytes;
 use object.small_blob.small_blob_content_hash;
 use object.types.ByteList;
@@ -126,6 +132,9 @@ const ADD_PATH_MAX: usize = 4096;
 const ADD_PARALLEL_WORKERS_DEFAULT: i32 = 2;
 const ADD_PARALLEL_MAX_WORKERS: usize = 64 as usize;
 const ADD_PARALLEL_CPU_MASK_BYTES: usize = 128 as usize;
+const ADD_SMALL_BLOB_FAST_MAX_BYTES: usize = 4096 as usize;
+const ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES: usize = ADD_SMALL_BLOB_FAST_MAX_BYTES + 64 as usize;
+const ADD_SMALL_BLOB_FAST_HASH_BYTES: usize = ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES + 128 as usize;
 const ADD_PROGRESS_MIN_FILES: usize = 4096 as usize;
 const ADD_PROGRESS_INTERVAL_FILES: usize = 4096 as usize;
 const ADD_PROGRESS_MIN_BYTES: u64 = 1073741824u64;
@@ -162,6 +171,7 @@ error AddLargeFileNotImplemented;
 error AddInvalidPath;
 error AddReservedName;
 error AddUnsupportedWorkspaceEntry;
+error AddFastPathUnavailable;
 
 export const ADD_USAGE_TEXT: &const byte = "error: add requires at least one pathspec\n";
 export const ADD_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
@@ -297,6 +307,18 @@ struct AddProfileState {
     large_blob_misses: usize,
     parallel_batches: usize,
     workers: usize
+}
+
+struct AddFileVersion {
+    valid: bool,
+    exists: bool,
+    dev: i64,
+    ino: i64,
+    size: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64
 }
 
 struct AddCompletionQueue {
@@ -683,6 +705,127 @@ fn add_read_workspace_entry_bytes(root_fs_path: &AddFsPath, file_entry: &Workspa
     return try add_read_file_bytes(&fs_path, file_entry.logical_size as usize);
 }
 
+fn add_read_file_bytes_into(path: &AddFsPath, output: &[byte]) !void {
+    const file: File = file_open(&path.bytes[0] as &const byte, O_RDONLY as i32, 0u32) catch |err| {
+        if @error_id(err) == @error_id(error.PermissionDenied) ||
+            @error_id(err) == EACCES as u32 ||
+            @error_id(err) == EPERM as u32 {
+            return error.RepoPermissionDenied;
+        }
+        return error.AddReadFailed;
+    };
+    defer {
+        _ = file_close(&file) catch {};
+    }
+
+    var read_total: usize = 0;
+    while read_total < output.len {
+        const chunk: isize = file_read(&file, &output.ptr[read_total], output.len - read_total);
+        if chunk <= 0 {
+            return error.AddReadFailed;
+        }
+        read_total = read_total + chunk as usize;
+    }
+}
+
+fn add_varuint_encoded_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1 as usize;
+    while temp >= 128u64 {
+        temp = temp >> 7;
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn add_small_blob_fast_payload_len(content_len: usize) usize {
+    return 8 as usize + HASH32_BYTES + add_varuint_encoded_len(content_len as u64) + content_len;
+}
+
+fn add_can_fast_regular_small_blob(file_entry: &WorkspaceFileEntry) bool {
+    if file_entry.kind != WorkspaceFileKind.Regular {
+        return false;
+    }
+    if !large_file_uses_small_blob(file_entry.logical_size) {
+        return false;
+    }
+    return file_entry.logical_size <= ADD_SMALL_BLOB_FAST_MAX_BYTES as u64;
+}
+
+fn add_hash_small_blob_encoded_fast(encoded: &[byte]) !ObjectId {
+    const domain_len: usize = strlen(HASH_DOMAIN_SMALL_BLOB);
+    const total_len: usize = domain_len + 1 as usize + encoded.len;
+    if total_len > ADD_SMALL_BLOB_FAST_HASH_BYTES {
+        return error.AddFastPathUnavailable;
+    }
+
+    var scratch: [byte: ADD_SMALL_BLOB_FAST_HASH_BYTES] = [];
+    var i: usize = 0 as usize;
+    while i < domain_len {
+        scratch[i] = HASH_DOMAIN_SMALL_BLOB[i];
+        i = i + 1 as usize;
+    }
+    scratch[domain_len] = 0 as byte;
+    i = 0 as usize;
+    while i < encoded.len {
+        scratch[domain_len + 1 as usize + i] = encoded.ptr[i];
+        i = i + 1 as usize;
+    }
+
+    var hash: Hash32 = Hash32{ bytes: [] };
+    hypergit_blake3_digest(scratch[0: total_len], hash.bytes[0: HASH32_BYTES]);
+    return object_id_from_hash(hash);
+}
+
+fn add_store_small_blob_stack_timed(
+    store: &LooseObjectStore,
+    content: &[byte],
+    measure_timing: bool,
+) !AddStoredObjectResult {
+    const payload_len: usize = add_small_blob_fast_payload_len(content.len);
+    if payload_len > ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES {
+        return error.AddFastPathUnavailable;
+    }
+
+    var encoded_buf: [byte: ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES] = [];
+    const payload: SmallBlobPayload = add_small_blob_payload_from_bytes(content);
+    var offset: usize = 0 as usize;
+    try encode_small_blob_payload(encoded_buf[0: payload_len], &offset, &payload);
+    if offset != payload_len {
+        return error.AddStoreFailed;
+    }
+
+    const hash_started_ms: u64 = add_maybe_now_ms(measure_timing);
+    const object_id: ObjectId = try add_hash_small_blob_encoded_fast(encoded_buf[0: payload_len]);
+    const hash_elapsed_ms: u64 = add_elapsed_ms_since(hash_started_ms);
+
+    const store_started_ms: u64 = add_maybe_now_ms(measure_timing);
+    const stored_id: ObjectId = try add_store_small_blob_encoded(store, &object_id, encoded_buf[0: payload_len]);
+    return AddStoredObjectResult{
+        object_id: stored_id,
+        hash_elapsed_ms: hash_elapsed_ms,
+        prepare_elapsed_ms: 0u64,
+        store_elapsed_ms: add_elapsed_ms_since(store_started_ms),
+    };
+}
+
+fn add_store_regular_small_blob_fast(
+    store: &LooseObjectStore,
+    root_fs_path: &AddFsPath,
+    file_entry: &WorkspaceFileEntry,
+    measure_timing: bool,
+) !AddStoredObjectResult {
+    if !add_can_fast_regular_small_blob(file_entry) {
+        return error.AddFastPathUnavailable;
+    }
+
+    const size: usize = file_entry.logical_size as usize;
+    var content_buf: [byte: ADD_SMALL_BLOB_FAST_MAX_BYTES] = [];
+    const fs_path: AddFsPath = try add_fs_path_join(root_fs_path, file_entry.path.ptr[0: file_entry.path.len]);
+    try add_read_file_bytes_into(&fs_path, content_buf[0: size]);
+    return try add_store_small_blob_stack_timed(store, content_buf[0: size], measure_timing);
+}
+
 fn add_encode_small_blob_payload(payload: &SmallBlobPayload) !AddOwnedBytes {
     const total_len: usize = small_blob_payload_encoded_len(payload);
     const encoded: AddOwnedBytes = try add_owned_bytes_alloc(total_len);
@@ -878,6 +1021,9 @@ fn add_store_worktree_object(
     measure_timing: bool,
 ) !AddStoredObjectResult {
     if file_entry.kind == WorkspaceFileKind.Symlink || large_file_uses_small_blob(file_entry.logical_size) {
+        if file_entry.kind == WorkspaceFileKind.Regular && content.len <= ADD_SMALL_BLOB_FAST_MAX_BYTES {
+            return try add_store_small_blob_stack_timed(store, content, measure_timing);
+        }
         return try add_store_small_blob_bytes_timed(store, content, measure_timing);
     }
 
@@ -1000,9 +1146,50 @@ fn add_completion_queue_wait_pop(queue: &AddCompletionQueue) usize {
     return slot;
 }
 
+fn add_store_object_task_result(stored: &AddStoredObjectResult, prepare_elapsed_ms: u64) usize {
+    const raw_result: &AddStoredObjectResult = malloc(@size_of(AddStoredObjectResult) as usize) as &AddStoredObjectResult;
+    if raw_result == null {
+        return ADD_STORE_OBJECT_FATAL;
+    }
+    raw_result[0] = AddStoredObjectResult{
+        object_id: ObjectId{ hash: stored.object_id.hash },
+        hash_elapsed_ms: stored.hash_elapsed_ms,
+        prepare_elapsed_ms: prepare_elapsed_ms,
+        store_elapsed_ms: stored.store_elapsed_ms,
+    };
+    return @usize_from_ptr(raw_result as &void);
+}
+
 fn add_store_object_task_run(task_ptr: usize) usize {
     const task: &AddStoreObjectTask = task_ptr as &AddStoreObjectTask;
     const object_started_ms: u64 = add_maybe_now_ms(task.measure_prepare_timing);
+
+    if add_can_fast_regular_small_blob(task.file_entry) {
+        const stored_fast: AddStoredObjectResult = add_store_regular_small_blob_fast(
+            task.store,
+            task.root_fs_path,
+            task.file_entry,
+            task.measure_object_timing,
+        ) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                return ADD_STORE_OBJECT_PERMISSION;
+            }
+            if @error_id(err) == @error_id(error.AddReadFailed) ||
+                @error_id(err) == @error_id(error.AddAlloc) {
+                return ADD_STORE_OBJECT_UNPROCESSABLE;
+            }
+            return ADD_STORE_OBJECT_FATAL;
+        };
+        var fast_prepare_elapsed_ms: u64 = 0u64;
+        if task.measure_prepare_timing {
+            const object_total_ms: u64 = add_elapsed_ms_since(object_started_ms);
+            if object_total_ms > stored_fast.store_elapsed_ms {
+                fast_prepare_elapsed_ms = object_total_ms - stored_fast.store_elapsed_ms;
+            }
+        }
+        return add_store_object_task_result(&stored_fast, fast_prepare_elapsed_ms);
+    }
+
     const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(task.root_fs_path, task.file_entry) catch |err| {
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
             return ADD_STORE_OBJECT_PERMISSION;
@@ -1042,17 +1229,7 @@ fn add_store_object_task_run(task_ptr: usize) usize {
         }
     }
 
-    const raw_result: &AddStoredObjectResult = malloc(@size_of(AddStoredObjectResult) as usize) as &AddStoredObjectResult;
-    if raw_result == null {
-        return ADD_STORE_OBJECT_FATAL;
-    }
-    raw_result[0] = AddStoredObjectResult{
-        object_id: ObjectId{ hash: stored.object_id.hash },
-        hash_elapsed_ms: stored.hash_elapsed_ms,
-        prepare_elapsed_ms: prepare_elapsed_ms,
-        store_elapsed_ms: stored.store_elapsed_ms,
-    };
-    return @usize_from_ptr(raw_result as &void);
+    return add_store_object_task_result(&stored, prepare_elapsed_ms);
 }
 
 fn add_stored_object_result_free(result: &AddStoredObjectResult) void {
@@ -1562,6 +1739,78 @@ fn add_arena_restore(arena: &Arena, used: usize) void {
     arena.last_aligned = 0 as usize;
 }
 
+fn add_file_version_invalid() AddFileVersion {
+    return AddFileVersion{
+        valid: false,
+        exists: false,
+        dev: 0i64,
+        ino: 0i64,
+        size: 0i64,
+        mtime: 0i64,
+        mtime_nsec: 0i64,
+        ctime: 0i64,
+        ctime_nsec: 0i64,
+    };
+}
+
+fn add_file_version_missing() AddFileVersion {
+    return AddFileVersion{
+        valid: true,
+        exists: false,
+        dev: 0i64,
+        ino: 0i64,
+        size: 0i64,
+        mtime: 0i64,
+        mtime_nsec: 0i64,
+        ctime: 0i64,
+        ctime_nsec: 0i64,
+    };
+}
+
+fn add_file_version_from_stat(st: &Stat) AddFileVersion {
+    return AddFileVersion{
+        valid: true,
+        exists: true,
+        dev: st.st_dev,
+        ino: st.st_ino,
+        size: st.st_size,
+        mtime: st.st_mtime,
+        mtime_nsec: st.st_mtime_nsec,
+        ctime: st.st_ctime,
+        ctime_nsec: st.st_ctime_nsec,
+    };
+}
+
+fn add_local_change_file_version(path: &RepoPath) AddFileVersion {
+    var st: Stat = Stat{};
+    if stat(repo_path_cstr(path) as &const byte, &st) != 0 {
+        if errno == ENOENT {
+            return add_file_version_missing();
+        }
+        return add_file_version_invalid();
+    }
+    return add_file_version_from_stat(&st);
+}
+
+fn add_file_version_equal(left: &AddFileVersion, right: &AddFileVersion) bool {
+    if !left.valid || !right.valid {
+        return false;
+    }
+    if left.exists != right.exists {
+        return false;
+    }
+    if !left.exists {
+        return true;
+    }
+    return left.dev == right.dev &&
+        left.ino == right.ino &&
+        left.size == right.size &&
+        left.mtime == right.mtime &&
+        left.mtime_nsec == right.mtime_nsec &&
+        left.ctime == right.ctime &&
+        left.ctime_nsec == right.ctime_nsec;
+}
+
 fn add_load_existing_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapshot {
     const snapshot: StageSnapshot = stage_file_read(repo_path_cstr(stage_path) as &const byte, arena) catch |err| {
         if @error_id(err) == @error_id(error.StageFileNotFound) {
@@ -1964,8 +2213,26 @@ fn add_sort_stage_entries_insertion(entries: &StageEntry, len: usize) void {
     }
 }
 
+fn add_stage_entries_are_sorted(entries: &StageEntry, len: usize) bool {
+    if len <= 1 as usize {
+        return true;
+    }
+
+    var i: usize = 1 as usize;
+    while i < len {
+        if manifest_path_compare(&entries[i - 1 as usize].path, &entries[i].path) > 0 {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
 fn add_sort_stage_entries(entries: &StageEntry, len: usize) void {
     if len <= 1 as usize {
+        return;
+    }
+    if add_stage_entries_are_sorted(entries, len) {
         return;
     }
 
@@ -2063,8 +2330,26 @@ fn add_sort_local_changes_insertion(changes: &LocalChange, len: usize) void {
     }
 }
 
+fn add_local_changes_are_sorted(changes: &LocalChange, len: usize) bool {
+    if len <= 1 as usize {
+        return true;
+    }
+
+    var i: usize = 1 as usize;
+    while i < len {
+        if manifest_path_compare(&changes[i - 1 as usize].path, &changes[i].path) > 0 {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
 fn add_sort_local_changes(changes: &LocalChange, len: usize) void {
     if len <= 1 as usize {
+        return;
+    }
+    if add_local_changes_are_sorted(changes, len) {
         return;
     }
 
@@ -2273,14 +2558,21 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
             free(processed_results as &void);
         }
     }
-    const process_arena_used: usize = arena.used;
 
+    const local_change_cache_arena_used: usize = arena.used;
     var cached_local_changes: LocalChangeList = LocalChangeList{ ptr: null, len: 0 };
+    var cached_local_change_version: AddFileVersion = add_file_version_invalid();
+    var cached_local_change_reusable: bool = false;
     if matched_count > 0 as usize {
+        const local_change_version_before: AddFileVersion = add_local_change_file_version(&local_change_path);
         const local_read_started_ms: u64 = add_maybe_now_ms(profile.enabled);
         cached_local_changes = try add_load_local_changes(&local_change_path, &arena);
         add_profile_add_elapsed(&profile.local_change_read_elapsed_ms, local_read_started_ms);
+        const local_change_version_after: AddFileVersion = add_local_change_file_version(&local_change_path);
+        cached_local_change_reusable = add_file_version_equal(&local_change_version_before, &local_change_version_after);
+        cached_local_change_version = local_change_version_after;
     }
+    const process_arena_used: usize = arena.used;
 
     const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
     const effective_parallel_workers: usize = add_parallel_worker_count(matched_count, add_parallel_requested_workers());
@@ -2540,12 +2832,26 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         stage_file_lock_release(&stage_lock);
     }
 
+    var use_cached_local_changes: bool = false;
+    if cached_local_change_reusable {
+        const current_local_change_version: AddFileVersion = add_local_change_file_version(&local_change_path);
+        use_cached_local_changes = add_file_version_equal(&cached_local_change_version, &current_local_change_version);
+    }
+    if !use_cached_local_changes {
+        add_arena_restore(&arena, local_change_cache_arena_used);
+    }
+
     const stage_read_started_ms: u64 = add_maybe_now_ms(profile.enabled);
     const existing_snapshot: StageSnapshot = try add_load_existing_snapshot(&stage_path, &arena);
     add_profile_add_elapsed(&profile.stage_read_elapsed_ms, stage_read_started_ms);
-    const local_read_started_ms: u64 = add_maybe_now_ms(profile.enabled);
-    const existing_local_changes: LocalChangeList = try add_load_local_changes(&local_change_path, &arena);
-    add_profile_add_elapsed(&profile.local_change_read_elapsed_ms, local_read_started_ms);
+    var existing_local_changes: LocalChangeList = LocalChangeList{ ptr: null, len: 0 };
+    if use_cached_local_changes {
+        existing_local_changes = cached_local_changes;
+    } else {
+        const local_read_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+        existing_local_changes = try add_load_local_changes(&local_change_path, &arena);
+        add_profile_add_elapsed(&profile.local_change_read_elapsed_ms, local_read_started_ms);
+    }
     const base_manifest_started_ms: u64 = add_maybe_now_ms(profile.enabled);
     const base_inputs: ManifestLeafInputList = try add_load_base_inputs(
         &arena,

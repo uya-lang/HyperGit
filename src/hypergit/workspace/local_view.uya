@@ -34,6 +34,30 @@ fn local_view_find_change(changes: &LocalChangeList, path: &ByteList) isize {
     return -1 as isize;
 }
 
+fn local_view_inputs_are_sorted(inputs: &ManifestLeafInputList) bool {
+    if inputs.len <= 1 as usize {
+        return true;
+    }
+    var i: usize = 1 as usize;
+    while i < inputs.len {
+        if manifest_path_compare(&inputs.ptr[i - 1 as usize].path, &inputs.ptr[i].path) >= 0 {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn local_view_change_at_or_after(changes: &LocalChangeList, path: &ByteList, index: &usize) &LocalChange {
+    while *index < changes.len && manifest_path_compare(&changes.ptr[*index].path, path) < 0 {
+        *index = *index + 1 as usize;
+    }
+    if *index < changes.len && manifest_path_compare(&changes.ptr[*index].path, path) == 0 {
+        return &changes.ptr[*index];
+    }
+    return null as &LocalChange;
+}
+
 fn local_view_should_include_expected(changes: &LocalChangeList, path: &ByteList) bool {
     const index: isize = local_view_find_change(changes, path);
     if index < 0 as isize {
@@ -50,11 +74,35 @@ fn local_view_should_include_target(profile: &SparseProfile, changes: &LocalChan
     return sparse_profile_matches(profile, path);
 }
 
+fn local_view_should_include_expected_linear(changes: &LocalChangeList, path: &ByteList, index: &usize) bool {
+    const change: &LocalChange = local_view_change_at_or_after(changes, path, index);
+    if change == null {
+        return true;
+    }
+    return change.status != ChangeStatus.Virtual;
+}
+
+fn local_view_should_include_target_linear(profile: &SparseProfile, changes: &LocalChangeList, path: &ByteList, index: &usize) bool {
+    const change: &LocalChange = local_view_change_at_or_after(changes, path, index);
+    if change != null {
+        return change.status != ChangeStatus.Virtual;
+    }
+    return sparse_profile_matches(profile, path);
+}
+
 fn local_view_filter_manifest_expected(arena: &Arena, inputs: &ManifestLeafInputList, changes: &LocalChangeList) !ManifestLeafInputList {
+    const sorted_inputs: bool = local_view_inputs_are_sorted(inputs);
     var count: usize = 0;
     var i: usize = 0;
+    var change_index: usize = 0 as usize;
     while i < inputs.len {
-        if local_view_should_include_expected(changes, &inputs.ptr[i].path) {
+        var include: bool = false;
+        if sorted_inputs {
+            include = local_view_should_include_expected_linear(changes, &inputs.ptr[i].path, &change_index);
+        } else {
+            include = local_view_should_include_expected(changes, &inputs.ptr[i].path);
+        }
+        if include {
             count = count + 1 as usize;
         }
         i = i + 1 as usize;
@@ -70,8 +118,15 @@ fn local_view_filter_manifest_expected(arena: &Arena, inputs: &ManifestLeafInput
 
     var out_index: usize = 0;
     i = 0;
+    change_index = 0 as usize;
     while i < inputs.len {
-        if local_view_should_include_expected(changes, &inputs.ptr[i].path) {
+        var include: bool = false;
+        if sorted_inputs {
+            include = local_view_should_include_expected_linear(changes, &inputs.ptr[i].path, &change_index);
+        } else {
+            include = local_view_should_include_expected(changes, &inputs.ptr[i].path);
+        }
+        if include {
             raw_inputs[out_index] = inputs.ptr[i];
             out_index = out_index + 1 as usize;
         }
@@ -81,10 +136,18 @@ fn local_view_filter_manifest_expected(arena: &Arena, inputs: &ManifestLeafInput
 }
 
 fn local_view_filter_manifest_target(arena: &Arena, inputs: &ManifestLeafInputList, profile: &SparseProfile, changes: &LocalChangeList) !ManifestLeafInputList {
+    const sorted_inputs: bool = local_view_inputs_are_sorted(inputs);
     var count: usize = 0;
     var i: usize = 0;
+    var change_index: usize = 0 as usize;
     while i < inputs.len {
-        if local_view_should_include_target(profile, changes, &inputs.ptr[i].path) {
+        var include: bool = false;
+        if sorted_inputs {
+            include = local_view_should_include_target_linear(profile, changes, &inputs.ptr[i].path, &change_index);
+        } else {
+            include = local_view_should_include_target(profile, changes, &inputs.ptr[i].path);
+        }
+        if include {
             count = count + 1 as usize;
         }
         i = i + 1 as usize;
@@ -100,8 +163,15 @@ fn local_view_filter_manifest_target(arena: &Arena, inputs: &ManifestLeafInputLi
 
     var out_index: usize = 0;
     i = 0;
+    change_index = 0 as usize;
     while i < inputs.len {
-        if local_view_should_include_target(profile, changes, &inputs.ptr[i].path) {
+        var include: bool = false;
+        if sorted_inputs {
+            include = local_view_should_include_target_linear(profile, changes, &inputs.ptr[i].path, &change_index);
+        } else {
+            include = local_view_should_include_target(profile, changes, &inputs.ptr[i].path);
+        }
+        if include {
             raw_inputs[out_index] = inputs.ptr[i];
             out_index = out_index + 1 as usize;
         }

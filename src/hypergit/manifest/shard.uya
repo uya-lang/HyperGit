@@ -328,6 +328,27 @@ export fn manifest_shard_split(arena: &Arena, payload: &ManifestNodePayload) !Ma
         return error.ManifestAlloc;
     }
 
+    if !manifest_shard_is_internal(payload) {
+        var cursor: usize = 0 as usize;
+        var out_len: usize = 0 as usize;
+        while cursor < payload.entries.len {
+            var count: usize = MANIFEST_LEAF_TARGET_ENTRIES;
+            if cursor + count > payload.entries.len {
+                count = payload.entries.len - cursor;
+            }
+            const chunk: ManifestShardChunk = ManifestShardChunk{
+                entry_start: cursor,
+                entry_count: count,
+                child_start: 0 as usize,
+                child_count: 0 as usize,
+            };
+            out_payloads[out_len] = try manifest_shard_clone_chunk(arena, payload, &chunk);
+            out_len = out_len + 1 as usize;
+            cursor = cursor + count;
+        }
+        return ManifestNodePayloadList{ ptr: out_payloads, len: out_len };
+    }
+
     const order: ManifestShardOrder = try manifest_shard_build_order(arena, payload);
     var cursor: usize = 0;
     var out_len: usize = 0;

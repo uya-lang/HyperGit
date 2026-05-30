@@ -243,6 +243,21 @@ fn sort_leaf_indexes(arena: &Arena, inputs: &ManifestLeafInputList) !&usize {
     return indexes;
 }
 
+fn leaf_inputs_are_sorted(inputs: &ManifestLeafInputList) bool {
+    if inputs.len <= 1 as usize {
+        return true;
+    }
+
+    var i: usize = 1 as usize;
+    while i < inputs.len {
+        if manifest_path_compare(&inputs.ptr[i - 1 as usize].path, &inputs.ptr[i].path) >= 0 {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
 fn sort_child_indexes(arena: &Arena, inputs: &ManifestChildInputList) !&usize {
     const bytes_len: usize = @size_of(usize) as usize * inputs.len;
     const indexes: &usize = arena_alloc(arena, bytes_len) as &usize;
@@ -314,7 +329,11 @@ export fn manifest_leaf_build(arena: &Arena, prefix: &ByteList, inputs: Manifest
 
     const copied_prefix: ByteList = try arena_copy_byte_list(arena, prefix);
     const level: u16 = try path_segment_count(prefix);
-    const sorted_indexes: &usize = try sort_leaf_indexes(arena, &inputs);
+    const already_sorted: bool = leaf_inputs_are_sorted(&inputs);
+    var sorted_indexes: &usize = null;
+    if !already_sorted {
+        sorted_indexes = try sort_leaf_indexes(arena, &inputs);
+    }
     const raw_entries: &ManifestEntry = arena_alloc(arena, @size_of(ManifestEntry) as usize * inputs.len) as &ManifestEntry;
     if raw_entries == null {
         return error.ManifestAlloc;
@@ -323,7 +342,13 @@ export fn manifest_leaf_build(arena: &Arena, prefix: &ByteList, inputs: Manifest
     var previous_path: ByteList = ByteList{ ptr: null, len: 0 };
     var i: usize = 0;
     while i < inputs.len {
-        const input_index: usize = sorted_indexes[i];
+        var input_index: usize = i;
+        if !already_sorted {
+            if sorted_indexes == null {
+                return error.ManifestAlloc;
+            }
+            input_index = sorted_indexes[i];
+        }
         const input: &ManifestLeafInputEntry = &inputs.ptr[input_index];
         const suffix: ByteList = try path_suffix_after_prefix(&input.path, prefix);
 
