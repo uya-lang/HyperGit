@@ -138,6 +138,9 @@ const ADD_SMALL_BLOB_FAST_HASH_BYTES: usize = ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES 
 const ADD_PROGRESS_MIN_FILES: usize = 4096 as usize;
 const ADD_PROGRESS_INTERVAL_FILES: usize = 4096 as usize;
 const ADD_PROGRESS_MIN_BYTES: u64 = 1073741824u64;
+// Tiny-file first-add is metadata-bound; inter-file parallelism amplifies open/write contention.
+const ADD_PARALLEL_TINY_SMALL_BLOB_MIN_FILES: usize = 4096 as usize;
+const ADD_PARALLEL_TINY_SMALL_BLOB_AVG_BYTES: u64 = 64u64;
 const ADD_PREPARE_SMALL_PERMISSION: usize = 1 as usize;
 const ADD_PREPARE_SMALL_READ_FAILED: usize = 2 as usize;
 const ADD_PREPARE_SMALL_ALLOC_FAILED: usize = 3 as usize;
@@ -571,23 +574,23 @@ fn add_parallel_default_requested_workers() i32 {
     return detected as i32;
 }
 
-fn add_parallel_requested_workers() i32 {
+fn add_parallel_env_requested_workers() i32 {
     const raw: &byte = getenv("HGX_ADD_PARALLEL_WORKERS");
     if raw == null || raw[0] == 0 as byte {
-        return add_parallel_default_requested_workers();
+        return 0;
     }
 
     var value: i32 = 0;
     var i: usize = 0;
     while raw[i] != 0 as byte {
         if raw[i] < '0' as byte || raw[i] > '9' as byte {
-            return add_parallel_default_requested_workers();
+            return 0;
         }
         value = value * 10 as i32 + (raw[i] - '0' as byte) as i32;
         i = i + 1 as usize;
     }
     if value <= 0 as i32 {
-        return add_parallel_default_requested_workers();
+        return 0;
     }
     return value;
 }
@@ -614,12 +617,76 @@ export fn add_parallel_worker_count_for_test(task_count: usize, requested_worker
     return add_parallel_worker_count(task_count, requested_workers);
 }
 
+fn add_parallel_should_use_serial_tiny_inputs(task_count: usize, total_bytes: u64, all_small_blob_candidates: bool) bool {
+    if !all_small_blob_candidates {
+        return false;
+    }
+    if task_count < ADD_PARALLEL_TINY_SMALL_BLOB_MIN_FILES {
+        return false;
+    }
+    return total_bytes <= task_count as u64 * ADD_PARALLEL_TINY_SMALL_BLOB_AVG_BYTES;
+}
+
+fn add_parallel_worker_count_for_inputs(
+    task_count: usize,
+    total_bytes: u64,
+    all_small_blob_candidates: bool,
+    requested_workers: i32,
+    explicit_request: bool,
+) usize {
+    if !explicit_request && add_parallel_should_use_serial_tiny_inputs(task_count, total_bytes, all_small_blob_candidates) {
+        return 1 as usize;
+    }
+    return add_parallel_worker_count(task_count, requested_workers);
+}
+
+export fn add_parallel_worker_count_for_inputs_for_test(
+    task_count: usize,
+    total_bytes: u64,
+    all_small_blob_candidates: bool,
+    requested_workers: i32,
+    explicit_request: bool,
+) usize {
+    return add_parallel_worker_count_for_inputs(
+        task_count,
+        total_bytes,
+        all_small_blob_candidates,
+        requested_workers,
+        explicit_request,
+    );
+}
+
 fn add_errno_permission() bool {
     return errno == EACCES || errno == EPERM;
 }
 
 fn add_is_parallel_small_blob_candidate(file_entry: &WorkspaceFileEntry) bool {
     return file_entry.kind == WorkspaceFileKind.Symlink || large_file_uses_small_blob(file_entry.logical_size);
+}
+
+fn add_all_files_are_parallel_small_blob_candidates(files: &WorkspaceFileList) bool {
+    var i: usize = 0 as usize;
+    while i < files.len {
+        if !add_is_parallel_small_blob_candidate(&files.ptr[i]) {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn add_effective_parallel_worker_count(files: &WorkspaceFileList, total_bytes: u64) usize {
+    const env_requested: i32 = add_parallel_env_requested_workers();
+    if env_requested > 0 as i32 {
+        return add_parallel_worker_count_for_inputs(files.len, total_bytes, true, env_requested, true);
+    }
+    return add_parallel_worker_count_for_inputs(
+        files.len,
+        total_bytes,
+        add_all_files_are_parallel_small_blob_candidates(files),
+        add_parallel_default_requested_workers(),
+        false,
+    );
 }
 
 fn add_manifest_path_error_is_invalid(err_id: u32) bool {
@@ -2575,7 +2642,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     const process_arena_used: usize = arena.used;
 
     const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
-    const effective_parallel_workers: usize = add_parallel_worker_count(matched_count, add_parallel_requested_workers());
+    const effective_parallel_workers: usize = add_effective_parallel_worker_count(&scanned_files, progress.total_bytes);
     profile.workers = effective_parallel_workers;
     const object_timing_enabled: bool = progress.print_path_timings || profile.enabled;
 

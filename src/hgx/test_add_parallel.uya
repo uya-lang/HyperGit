@@ -4,6 +4,7 @@ use std.testing.run_test;
 use std.testing.test_suite_begin;
 use std.testing.test_suite_end;
 
+use commands.add.add_parallel_worker_count_for_inputs_for_test;
 use commands.add.add_parallel_worker_count_for_test;
 
 fn test_add_parallel_worker_count_stays_serial_for_single_task() !void {
@@ -26,6 +27,46 @@ fn test_add_parallel_worker_count_caps_to_hard_limit() !void {
     try expect(add_parallel_worker_count_for_test(128 as usize, 128) == 64 as usize);
 }
 
+fn test_add_parallel_worker_count_serializes_many_tiny_small_blobs_by_default() !void {
+    try expect(add_parallel_worker_count_for_inputs_for_test(
+        200000 as usize,
+        1000000u64,
+        true,
+        44,
+        false,
+    ) == 1 as usize);
+}
+
+fn test_add_parallel_worker_count_honors_explicit_tiny_override() !void {
+    try expect(add_parallel_worker_count_for_inputs_for_test(
+        200000 as usize,
+        1000000u64,
+        true,
+        8,
+        true,
+    ) == 8 as usize);
+}
+
+fn test_add_parallel_worker_count_keeps_parallelism_for_larger_inputs() !void {
+    try expect(add_parallel_worker_count_for_inputs_for_test(
+        4096 as usize,
+        266240u64,
+        true,
+        8,
+        false,
+    ) == 8 as usize);
+}
+
+fn test_add_parallel_worker_count_keeps_parallelism_for_mixed_inputs() !void {
+    try expect(add_parallel_worker_count_for_inputs_for_test(
+        200000 as usize,
+        1000000u64,
+        false,
+        8,
+        false,
+    ) == 8 as usize);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Add Parallel Tests");
     run_test("single task stays serial", test_add_parallel_worker_count_stays_serial_for_single_task);
@@ -33,5 +74,9 @@ export fn main() i32 {
     run_test("parallelism is capped", test_add_parallel_worker_count_caps_requested_parallelism);
     run_test("parallelism is capped by task count", test_add_parallel_worker_count_caps_to_available_tasks);
     run_test("parallelism is capped by hard limit", test_add_parallel_worker_count_caps_to_hard_limit);
+    run_test("many tiny small blobs default to serial", test_add_parallel_worker_count_serializes_many_tiny_small_blobs_by_default);
+    run_test("explicit tiny override is honored", test_add_parallel_worker_count_honors_explicit_tiny_override);
+    run_test("larger small blobs keep parallelism", test_add_parallel_worker_count_keeps_parallelism_for_larger_inputs);
+    run_test("mixed inputs keep parallelism", test_add_parallel_worker_count_keeps_parallelism_for_mixed_inputs);
     return test_suite_end();
 }
