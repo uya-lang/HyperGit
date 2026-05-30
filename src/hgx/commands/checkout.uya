@@ -27,6 +27,7 @@ use libc.mkdir;
 use libc.remove;
 use libc.stat;
 use libc.stderr;
+use libc.unlink;
 use libc.EACCES;
 use libc.EEXIST;
 use libc.EPERM;
@@ -42,7 +43,9 @@ use core.ids.HASH32_HEX_BYTES;
 use core.ids.ObjectId;
 use core.ids.commit_id_decode_hex;
 use large.chunk_store.ChunkStore;
+use large.chunk_store.ChunkStoreBytes;
 use large.chunk_store.chunk_store_open;
+use large.chunk_store.chunk_store_get;
 use large.range_read.chunked_blob_read_range;
 use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_path_compare;
@@ -54,6 +57,7 @@ use object.codec.decode_commit_object;
 use object.codec.decode_object_kind;
 use object.codec.decode_small_blob_object;
 use object.types.ByteList;
+use object.types.ChunkRef;
 use object.types.ChunkedBlobPayload;
 use object.types.CommitPayload;
 use object.types.ObjectKind;
@@ -110,9 +114,11 @@ use workspace.state_file.workspace_state_file_read;
 use workspace.state_file.workspace_state_file_write;
 use syscall.sys_lstat;
 
-const CHECKOUT_ARENA_BYTES: usize = 33554432 as usize;
+const CHECKOUT_ARENA_BYTES: usize = 268435456 as usize;
+const CHECKOUT_TASK_ARENA_BYTES: usize = 33554432 as usize;
 const CHECKOUT_PATH_MAX: usize = 4096 as usize;
 const CHECKOUT_PARALLEL_WORKERS: usize = 4 as usize;
+const CHECKOUT_SYS_SYMLINK: i64 = 88;
 const CHECKOUT_STAT_S_IFMT: u32 = 61440u32;
 const CHECKOUT_STAT_S_IFDIR: u32 = 16384u32;
 const CHECKOUT_STAT_S_IFLNK: u32 = 40960u32;
@@ -382,6 +388,12 @@ fn checkout_reject_symlink_target(path: &CheckoutFsPath) !void {
     }
 }
 
+fn checkout_create_symlink(target: &const byte, linkpath: &const byte) !void {
+    _ = @syscall(CHECKOUT_SYS_SYMLINK, target as i64, linkpath as i64) catch {
+        return error.CheckoutWriteFailed;
+    };
+}
+
 fn checkout_ensure_parent_dirs(path: &CheckoutFsPath) !void {
     var buf: CheckoutFsPath = *path;
     var i: usize = 1 as usize;
@@ -420,6 +432,176 @@ fn checkout_ensure_parent_dirs(path: &CheckoutFsPath) !void {
     }
 }
 
+fn checkout_write_symlink_to_path(path: &CheckoutFsPath, target_ptr: &byte, target_len: usize) !void {
+    if target_len >= CHECKOUT_PATH_MAX {
+        return error.CheckoutPathTooLong;
+    }
+    if target_len > 0 as usize && target_ptr == null {
+        return error.CheckoutWriteFailed;
+    }
+
+    var target_cstr: [byte: CHECKOUT_PATH_MAX] = [];
+    var i: usize = 0;
+    while i < target_len {
+        if target_ptr[i] == 0 as byte {
+            return error.CheckoutWriteFailed;
+        }
+        target_cstr[i] = target_ptr[i];
+        i = i + 1 as usize;
+    }
+    target_cstr[target_len] = 0 as byte;
+
+    try checkout_reject_symlink_parents(path);
+    try checkout_ensure_parent_dirs(path);
+    if unlink(&path.bytes[0] as &const byte) != 0 && errno != ENOENT {
+        if checkout_errno_permission() {
+            return error.CheckoutPermissionDenied;
+        }
+        return error.CheckoutWriteFailed;
+    }
+    try checkout_create_symlink(&target_cstr[0] as &const byte, &path.bytes[0] as &const byte);
+}
+
+fn checkout_open_regular_file_for_write(path: &CheckoutFsPath, file_mode: u32) !File {
+    try checkout_reject_symlink_parents(path);
+    try checkout_ensure_parent_dirs(path);
+    try checkout_reject_symlink_target(path);
+    const fs_mode: u32 = file_mode & 0o777u32;
+    return file_open(&path.bytes[0] as &const byte, O_WRONLY | O_CREAT | O_TRUNC, fs_mode) catch {
+        if checkout_errno_permission() {
+            return error.CheckoutPermissionDenied;
+        }
+        return error.CheckoutWriteFailed;
+    };
+}
+
+fn checkout_write_open_file_bytes(file: &File, bytes: &byte, len: usize) !void {
+    if len == 0 as usize {
+        return;
+    }
+    if bytes == null {
+        return error.CheckoutWriteFailed;
+    }
+    const written: usize = file_write(file, bytes as &const byte, len) catch {
+        return error.CheckoutWriteFailed;
+    };
+    if written != len {
+        return error.CheckoutWriteFailed;
+    }
+}
+
+fn checkout_write_small_blob_to_path(path: &CheckoutFsPath, output_ptr: &byte, output_len: usize, file_mode: u32) !void {
+    const file: File = try checkout_open_regular_file_for_write(path, file_mode);
+    defer {
+        file_close(&file) catch {};
+    }
+    try checkout_write_open_file_bytes(&file, output_ptr, output_len);
+}
+
+fn checkout_map_chunk_store_error(err_id: u32) !void {
+    if err_id == @error_id(error.ChunkStorePermissionDenied) {
+        return error.CheckoutPermissionDenied;
+    }
+    if err_id == @error_id(error.ChunkStoreAlloc) {
+        return error.CheckoutAlloc;
+    }
+    return error.CheckoutFailure;
+}
+
+fn checkout_read_chunk(arena: &Arena, chunk_store: &ChunkStore, chunk: &ChunkRef) !ChunkStoreBytes {
+    const stored: ChunkStoreBytes = chunk_store_get(chunk_store, &chunk.storage_id, arena) catch |err| {
+        try checkout_map_chunk_store_error(@error_id(err));
+        return error.CheckoutFailure;
+    };
+    if stored.bytes.len < chunk.logical_size as usize {
+        return error.CheckoutFailure;
+    }
+    return stored;
+}
+
+fn checkout_chunked_blob_full_bytes(arena: &Arena, chunk_store: &ChunkStore, payload: &ChunkedBlobPayload) !ByteList {
+    return chunked_blob_read_range(arena, chunk_store, payload, 0u64, payload.logical_size) catch |err| {
+        if @error_id(err) == @error_id(error.LargeRangeAlloc) {
+            return error.CheckoutAlloc;
+        }
+        if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
+            return error.CheckoutPermissionDenied;
+        }
+        if @error_id(err) == @error_id(error.ChunkStoreAlloc) {
+            return error.CheckoutAlloc;
+        }
+        return error.CheckoutFailure;
+    };
+}
+
+fn checkout_chunked_blob_scratch_bytes(payload: &ChunkedBlobPayload) usize {
+    var want: usize = CHECKOUT_TASK_ARENA_BYTES;
+    var i: usize = 0 as usize;
+    while i < payload.chunks.len {
+        const chunk: &ChunkRef = &payload.chunks.ptr[i];
+        const logical_size: usize = chunk.logical_size as usize;
+        if logical_size > want {
+            want = logical_size;
+        }
+        const stored_size: usize = chunk.stored_size as usize;
+        if stored_size > want {
+            want = stored_size;
+        }
+        i = i + 1 as usize;
+    }
+    if want == 0 as usize {
+        return 1 as usize;
+    }
+    return want;
+}
+
+fn checkout_write_chunked_blob_to_path(chunk_store: &ChunkStore, path: &CheckoutFsPath, payload: &ChunkedBlobPayload, file_mode: u32) !void {
+    const file: File = try checkout_open_regular_file_for_write(path, file_mode);
+    defer {
+        file_close(&file) catch {};
+    }
+
+    if payload.chunks.len == 0 as usize {
+        if payload.logical_size != 0u64 {
+            return error.CheckoutFailure;
+        }
+        return;
+    }
+
+    const scratch_len: usize = checkout_chunked_blob_scratch_bytes(payload);
+    const scratch: &byte = malloc(scratch_len) as &byte;
+    if scratch == null {
+        return error.CheckoutAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+    var chunk_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+
+    var expected_offset: u64 = 0u64;
+    var i: usize = 0 as usize;
+    while i < payload.chunks.len {
+        const chunk: &ChunkRef = &payload.chunks.ptr[i];
+        if chunk.offset != expected_offset {
+            return error.CheckoutFailure;
+        }
+        if chunk.logical_size as u64 > payload.logical_size - expected_offset {
+            return error.CheckoutFailure;
+        }
+
+        arena_init(&chunk_arena, scratch, scratch_len);
+        const stored: ChunkStoreBytes = try checkout_read_chunk(&chunk_arena, chunk_store, chunk);
+        try checkout_write_open_file_bytes(&file, stored.bytes.ptr, chunk.logical_size as usize);
+
+        expected_offset = expected_offset + chunk.logical_size as u64;
+        i = i + 1 as usize;
+    }
+
+    if expected_offset != payload.logical_size {
+        return error.CheckoutFailure;
+    }
+}
+
 fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, chunk_store: &ChunkStore, path: &CheckoutFsPath, action: &CheckoutAction) !void {
     const object_bytes: ObjectBytes = store.get(action.object_id, arena) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
@@ -432,7 +614,7 @@ fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, chunk_st
         return error.CheckoutFailure;
     };
     offset = 0 as usize;
-    var output: ByteList = ByteList{ ptr: null, len: 0 };
+    const is_symlink: bool = checkout_path_mode_kind(action.file_mode) == CHECKOUT_STAT_S_IFLNK;
     if kind == ObjectKind.SmallBlob {
         const payload: SmallBlobPayload = decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
             return error.CheckoutFailure;
@@ -440,7 +622,12 @@ fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, chunk_st
         if offset != object_bytes.bytes.len {
             return error.CheckoutFailure;
         }
-        output = ByteList{ ptr: payload.payload.ptr, len: payload.payload.len };
+        if is_symlink {
+            try checkout_write_symlink_to_path(path, payload.payload.ptr, payload.payload.len);
+            return;
+        }
+        try checkout_write_small_blob_to_path(path, payload.payload.ptr, payload.payload.len, action.file_mode);
+        return;
     } else if kind == ObjectKind.ChunkedBlob {
         const payload: ChunkedBlobPayload = decode_chunked_blob_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
             return error.CheckoutFailure;
@@ -448,28 +635,18 @@ fn checkout_write_blob_to_path(arena: &Arena, store: &LooseObjectStore, chunk_st
         if offset != object_bytes.bytes.len {
             return error.CheckoutFailure;
         }
-        output = try chunked_blob_read_range(arena, chunk_store, &payload, 0u64, payload.logical_size);
+        if is_symlink {
+            if payload.logical_size >= CHECKOUT_PATH_MAX as u64 {
+                return error.CheckoutPathTooLong;
+            }
+            const output: ByteList = try checkout_chunked_blob_full_bytes(arena, chunk_store, &payload);
+            try checkout_write_symlink_to_path(path, output.ptr, output.len);
+            return;
+        }
+        try checkout_write_chunked_blob_to_path(chunk_store, path, &payload, action.file_mode);
+        return;
     } else {
         return error.CheckoutFailure;
-    }
-    try checkout_reject_symlink_parents(path);
-    try checkout_ensure_parent_dirs(path);
-    try checkout_reject_symlink_target(path);
-    const fs_mode: u32 = action.file_mode & 0o777u32;
-    const file: File = file_open(&path.bytes[0] as &const byte, O_WRONLY | O_CREAT | O_TRUNC, fs_mode) catch {
-        if checkout_errno_permission() {
-            return error.CheckoutPermissionDenied;
-        }
-        return error.CheckoutWriteFailed;
-    };
-    defer {
-        file_close(&file) catch {};
-    }
-    const written: usize = file_write(&file, output.ptr as &const byte, output.len) catch {
-        return error.CheckoutWriteFailed;
-    };
-    if written != output.len {
-        return error.CheckoutWriteFailed;
     }
 }
 
@@ -534,7 +711,7 @@ fn checkout_apply_task_run(task_bits: usize) usize {
         return CHECKOUT_TASK_FAILURE;
     };
 
-    const arena_storage: &byte = malloc(CHECKOUT_ARENA_BYTES) as &byte;
+    const arena_storage: &byte = malloc(CHECKOUT_TASK_ARENA_BYTES) as &byte;
     if arena_storage == null {
         return CHECKOUT_TASK_ALLOC;
     }
@@ -542,7 +719,7 @@ fn checkout_apply_task_run(task_bits: usize) usize {
         free(arena_storage as &void);
     }
     var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
-    arena_init(&arena, arena_storage, CHECKOUT_ARENA_BYTES);
+    arena_init(&arena, arena_storage, CHECKOUT_TASK_ARENA_BYTES);
 
     const action: CheckoutAction = CheckoutAction{
         kind: task.kind,
@@ -577,6 +754,36 @@ export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &Re
     }
 
     if write_count == 0 as usize {
+        return;
+    }
+
+    if write_count >= 1 as usize {
+        const chunk_store: ChunkStore = chunk_store_open(repo_path_cstr(&chunk_store_root)) catch |err| {
+            if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
+                return error.CheckoutPermissionDenied;
+            }
+            return error.CheckoutFailure;
+        };
+
+        const write_arena_storage: &byte = malloc(CHECKOUT_TASK_ARENA_BYTES) as &byte;
+        if write_arena_storage == null {
+            return error.CheckoutAlloc;
+        }
+        defer {
+            free(write_arena_storage as &void);
+        }
+
+        var write_arena: Arena = Arena{ buffer: write_arena_storage, size: 0, used: 0 };
+        i = 0;
+        while i < plan.actions.len {
+            const action: &CheckoutAction = &plan.actions.ptr[i];
+            if action.kind == CheckoutActionKind.WriteFile {
+                arena_init(&write_arena, write_arena_storage, CHECKOUT_TASK_ARENA_BYTES);
+                const fs_path: CheckoutFsPath = try checkout_fs_path_join(&root_path, &action.path);
+                try checkout_write_blob_to_path(&write_arena, store, &chunk_store, &fs_path, action);
+            }
+            i = i + 1 as usize;
+        }
         return;
     }
 

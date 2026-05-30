@@ -1,4 +1,4 @@
-UYA ?= $(HOME)/uya/uya/bin/uya
+UYA ?= $(if $(wildcard $(HOME)/xyglasses/uya/bin/uya),$(HOME)/xyglasses/uya/bin/uya,$(HOME)/uya/uya/bin/uya)
 SRC := src/hgx/main.uya
 BIN := bin/hgx
 C99 := build/hgx.c
@@ -8,9 +8,7 @@ C99 := build/hgx.c
 check:
 	$(UYA) check $(SRC)
 
-build: $(BIN)
-
-$(BIN): $(SRC)
+build:
 	mkdir -p bin
 	$(UYA) build $(SRC) -o $(BIN)
 

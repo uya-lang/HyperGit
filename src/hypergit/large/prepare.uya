@@ -272,18 +272,14 @@ export fn prepare_chunked_blob_repository_with_workers(
     file_type: FileType,
     worker_count: i32,
 ) !LargePreparedChunkedBlob {
+    _ = worker_count;
     const chunks: LargeChunkList = try cdc_chunk_bytes_default(arena, logical_bytes);
     const raw_parts: &[ChunkedBlobPart] = try large_prepare_alloc_parts(arena, chunks.len);
 
-    const effective_workers: usize = large_prepare_parallel_worker_count(chunks.len, worker_count);
-    if effective_workers <= 1 as usize {
-        var i: usize = 0 as usize;
-        while i < chunks.len {
-            raw_parts.ptr[i] = try large_prepare_part_from_chunk(arena, &chunks.ptr[i]);
-            i = i + 1 as usize;
-        }
-    } else {
-        try large_prepare_fill_parts_parallel(arena, LargeChunkList{ ptr: chunks.ptr, len: chunks.len }, raw_parts, effective_workers as i32);
+    var i: usize = 0 as usize;
+    while i < chunks.len {
+        raw_parts.ptr[i] = try large_prepare_part_from_chunk(arena, &chunks.ptr[i]);
+        i = i + 1 as usize;
     }
 
     const parts: ChunkedBlobPartList = chunked_blob_part_list_from_slice(raw_parts);
