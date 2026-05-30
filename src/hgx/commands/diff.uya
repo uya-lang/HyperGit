@@ -33,9 +33,8 @@ use large.prepare.prepare_chunked_blob_repository_default;
 use manifest.flat_diff.ManifestFlatDiffEntry;
 use manifest.flat_diff.ManifestFlatDiffEntryKind;
 use manifest.flat_diff.ManifestFlatDiffEntryList;
-use manifest.flat_diff.manifest_flat_diff;
 use manifest.flat_diff.manifest_flat_diff_parallel;
-use manifest.load.manifest_load_flatten;
+use manifest.load.manifest_load_flatten_pathspecs;
 use manifest.path.manifest_bytes_is_utf8;
 use manifest.path.manifest_path_normalize;
 use manifest.query.ManifestPathspecList;
@@ -64,6 +63,7 @@ use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
 use store.repo_layout.REPO_PATH_MAX;
 use store.repo_layout.RepoConfig;
 use store.repo_layout.RepoPath;
@@ -71,10 +71,15 @@ use store.repo_layout.repo_find_root_from_cwd;
 use store.repo_layout.repo_path_cstr;
 use store.repo_layout.repo_path_join_literal;
 use store.repo_layout.repo_read_config;
+use workspace.local_change_file.local_change_file_read;
+use workspace.local_view.workspace_local_view_find_change;
 use workspace.scan.WorkspaceFileEntry;
 use workspace.scan.WorkspaceFileKind;
 use workspace.scan.WorkspaceFileList;
-use workspace.scan.workspace_scan_files;
+use workspace.scan.workspace_scan_files_for_pathspecs;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
 use std.io.file.File;
 use std.io.file.file_close;
 use std.io.file.file_open;
@@ -364,13 +369,35 @@ fn diff_commit_payload(arena: &Arena, store: &LooseObjectStore, commit_id: &Comm
     return payload;
 }
 
-fn diff_manifest_inputs_from_commit(arena: &Arena, store: &LooseObjectStore, commit_id: &CommitId) !ManifestLeafInputList {
+fn diff_manifest_inputs_from_commit(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    commit_id: &CommitId,
+    pathspecs: ManifestPathspecList,
+) !ManifestLeafInputList {
     const payload: CommitPayload = try diff_commit_payload(arena, store, commit_id);
-    return manifest_load_flatten(arena, store, &payload.manifest_root) catch |err| {
+    return manifest_load_flatten_pathspecs(
+        arena,
+        store,
+        &payload.manifest_root,
+        ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+    ) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
             return error.StorePermissionDenied;
         }
         return error.DiffStoreFailed;
+    };
+}
+
+fn diff_load_local_changes(root: &RepoPath, arena: &Arena) !LocalChangeList {
+    const local_change_path: RepoPath = repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL) catch {
+        return error.DiffPathTooLong;
+    };
+    return local_change_file_read(arena, repo_path_cstr(&local_change_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.LocalChangeFileNotFound) {
+            return LocalChangeList{ ptr: null, len: 0 };
+        }
+        return error.DiffReadFailed;
     };
 }
 
@@ -528,6 +555,34 @@ fn diff_hash_workspace_object_id(logical_size: u64, content: &DiffOwnedBytes) !O
     return try diff_hash_workspace_large_file_bytes(logical_size, content);
 }
 
+fn diff_local_change_metadata_matches(change: &LocalChange, file_entry: &WorkspaceFileEntry) bool {
+    return change.last_seen_inode == file_entry.inode &&
+        change.last_seen_mtime_ns == file_entry.mtime_ns &&
+        change.last_seen_logical_size == file_entry.logical_size;
+}
+
+fn diff_try_cached_workspace_object_id(
+    stored_local_changes: &LocalChangeList,
+    file_entry: &WorkspaceFileEntry,
+    out: &ObjectId,
+) bool {
+    const local_change_index: isize = workspace_local_view_find_change(stored_local_changes, &file_entry.path);
+    if local_change_index < 0 as isize {
+        return false;
+    }
+
+    const change: &LocalChange = &stored_local_changes.ptr[local_change_index as usize];
+    if !diff_local_change_metadata_matches(change, file_entry) ||
+        change.status == ChangeStatus.Virtual ||
+        change.status == ChangeStatus.Deleted ||
+        change.status == ChangeStatus.Conflict {
+        return false;
+    }
+
+    *out = ObjectId{ hash: change.working_hash };
+    return true;
+}
+
 fn diff_workspace_entry_kind(entry: &WorkspaceFileEntry) !EntryKind {
     if entry.kind == WorkspaceFileKind.Symlink {
         return error.DiffUnsupportedWorkspaceEntry;
@@ -541,8 +596,17 @@ fn diff_workspace_entry_kind(entry: &WorkspaceFileEntry) !EntryKind {
     return EntryKind.File;
 }
 
-fn diff_workspace_inputs(arena: &Arena, root: &RepoPath) !ManifestLeafInputList {
-    const worktree: WorkspaceFileList = workspace_scan_files(arena, repo_path_cstr(root) as &const byte) catch |err| {
+fn diff_workspace_inputs(
+    arena: &Arena,
+    root: &RepoPath,
+    pathspecs: ManifestPathspecList,
+    stored_local_changes: &LocalChangeList,
+) !ManifestLeafInputList {
+    const worktree: WorkspaceFileList = workspace_scan_files_for_pathspecs(
+        arena,
+        repo_path_cstr(root) as &const byte,
+        ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+    ) catch |err| {
         if @error_id(err) == @error_id(error.WorkspaceScanPermissionDenied) {
             return error.RepoPermissionDenied;
         }
@@ -561,16 +625,21 @@ fn diff_workspace_inputs(arena: &Arena, root: &RepoPath) !ManifestLeafInputList 
     var i: usize = 0;
     while i < worktree.len {
         const entry: &WorkspaceFileEntry = &worktree.ptr[i];
-        const fs_path: DiffFsPath = try diff_fs_path_join(&root_path, &entry.path);
-        const file_bytes: DiffOwnedBytes = try diff_read_file_bytes(&fs_path, entry.logical_size as usize);
-        defer {
-            diff_owned_bytes_free(&file_bytes);
+        const entry_kind: EntryKind = try diff_workspace_entry_kind(entry);
+        var object_id: ObjectId = ObjectId{ hash: Hash32{ bytes: [] } };
+        if !diff_try_cached_workspace_object_id(stored_local_changes, entry, &object_id) {
+            const fs_path: DiffFsPath = try diff_fs_path_join(&root_path, &entry.path);
+            const file_bytes: DiffOwnedBytes = try diff_read_file_bytes(&fs_path, entry.logical_size as usize);
+            defer {
+                diff_owned_bytes_free(&file_bytes);
+            }
+            object_id = try diff_hash_workspace_object_id(entry.logical_size, &file_bytes);
         }
         raw_inputs[i] = ManifestLeafInputEntry{
             path: ByteList{ ptr: entry.path.ptr, len: entry.path.len },
-            kind: try diff_workspace_entry_kind(entry),
+            kind: entry_kind,
             mode: entry.file_mode,
-            object_id: try diff_hash_workspace_object_id(entry.logical_size, &file_bytes),
+            object_id: ObjectId{ hash: object_id.hash },
             logical_size: entry.logical_size,
             content_type: ContentType.Unknown,
             policy_id: placeholder_policy_id(),
@@ -1170,6 +1239,7 @@ export fn run_diff() i32 {
     var right_inputs: ManifestLeafInputList = ManifestLeafInputList{ ptr: null, len: 0 };
     var left_source: DiffInputSourceKind = DiffInputSourceKind.Store;
     var right_source: DiffInputSourceKind = DiffInputSourceKind.Store;
+    var stored_local_changes: LocalChangeList = LocalChangeList{ ptr: null, len: 0 };
 
     if invocation.kind == DiffInvocationKind.CommitToCommit {
         const left_commit: CommitId = diff_resolve_commit_spec(&root, &config, invocation.left_spec) catch |err| {
@@ -1196,7 +1266,12 @@ export fn run_diff() i32 {
             fprintf(stderr, "%s" as *byte, DIFF_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
         };
-        left_inputs = diff_manifest_inputs_from_commit(&arena, &store, &left_commit) catch |err| {
+        left_inputs = diff_manifest_inputs_from_commit(
+            &arena,
+            &store,
+            &left_commit,
+            ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+        ) catch |err| {
             if @error_id(err) == @error_id(error.StorePermissionDenied) {
                 fprintf(stderr, "%s" as *byte, DIFF_PERMISSION_TEXT);
                 return EXIT_RUNTIME_ERROR;
@@ -1204,7 +1279,12 @@ export fn run_diff() i32 {
             fprintf(stderr, "%s" as *byte, DIFF_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
         };
-        right_inputs = diff_manifest_inputs_from_commit(&arena, &store, &right_commit) catch |err| {
+        right_inputs = diff_manifest_inputs_from_commit(
+            &arena,
+            &store,
+            &right_commit,
+            ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+        ) catch |err| {
             if @error_id(err) == @error_id(error.StorePermissionDenied) {
                 fprintf(stderr, "%s" as *byte, DIFF_PERMISSION_TEXT);
                 return EXIT_RUNTIME_ERROR;
@@ -1230,7 +1310,12 @@ export fn run_diff() i32 {
                 fprintf(stderr, "%s" as *byte, DIFF_FAILURE_TEXT);
                 return EXIT_RUNTIME_ERROR;
             };
-            left_inputs = diff_manifest_inputs_from_commit(&arena, &store, &head_commit) catch |err| {
+            left_inputs = diff_manifest_inputs_from_commit(
+                &arena,
+                &store,
+                &head_commit,
+                ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+            ) catch |err| {
                 if @error_id(err) == @error_id(error.StorePermissionDenied) {
                     fprintf(stderr, "%s" as *byte, DIFF_PERMISSION_TEXT);
                     return EXIT_RUNTIME_ERROR;
@@ -1239,7 +1324,20 @@ export fn run_diff() i32 {
                 return EXIT_RUNTIME_ERROR;
             };
         }
-        right_inputs = diff_workspace_inputs(&arena, &root) catch |err| {
+        stored_local_changes = diff_load_local_changes(&root, &arena) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, DIFF_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, DIFF_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        right_inputs = diff_workspace_inputs(
+            &arena,
+            &root,
+            ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+            &stored_local_changes,
+        ) catch |err| {
             if @error_id(err) == @error_id(error.RepoPermissionDenied) {
                 fprintf(stderr, "%s" as *byte, DIFF_PERMISSION_TEXT);
                 return EXIT_RUNTIME_ERROR;

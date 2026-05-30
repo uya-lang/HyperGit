@@ -101,6 +101,7 @@ test:
 	./tests/test_diff_delete.sh
 	./tests/test_diff_modify.sh
 	./tests/test_diff_pathspec.sh
+	./tests/test_diff_pathspec_scan.sh
 	./tests/test_diff_binary.sh
 	./tests/test_diff_large_file.sh
 	./tests/test_checkout_content.sh
