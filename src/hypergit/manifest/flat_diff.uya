@@ -2,12 +2,12 @@ use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 use std.async.Future;
 use std.async.block_on;
-use std.async.future_ready_ok;
 use std.thread.ThreadPool;
 use std.thread.async_compute;
 use std.thread.thread_pool_new;
 use std.thread.thread_pool_shutdown;
 
+use core.parallel.parallel_worker_count;
 use core.ids.object_id_compare;
 use core.ids.policy_id_compare;
 use manifest.path.manifest_path_compare;
@@ -19,8 +19,6 @@ use object.types.ByteList;
 
 error ManifestFlatDiffAlloc;
 error ManifestFlatDiffAsyncFailed;
-
-const MANIFEST_FLAT_DIFF_MAX_PARALLEL_WORKERS: usize = 4 as usize;
 
 export enum ManifestFlatDiffEntryKind {
     Added,
@@ -394,13 +392,7 @@ export fn manifest_flat_diff_parallel(
         return try manifest_flat_diff(arena, left, right, pathspecs);
     }
 
-    var parallel_workers: usize = worker_count as usize;
-    if parallel_workers > MANIFEST_FLAT_DIFF_MAX_PARALLEL_WORKERS {
-        parallel_workers = MANIFEST_FLAT_DIFF_MAX_PARALLEL_WORKERS;
-    }
-    if parallel_workers > shards.len {
-        parallel_workers = shards.len;
-    }
+    const parallel_workers: usize = parallel_worker_count(shards.len, worker_count, 0 as usize);
     if parallel_workers <= 1 as usize {
         return try manifest_flat_diff(arena, left, right, pathspecs);
     }
@@ -432,11 +424,10 @@ export fn manifest_flat_diff_parallel(
         thread_pool_shutdown(&pool);
     }
 
-    var ready0: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready1: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready2: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready3: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var futures: [Future<!usize>: 4] = [ready0, ready1, ready2, ready3];
+    const futures: &Future<!usize> = arena_alloc(arena, @size_of(Future<!usize>) as usize * parallel_workers) as &Future<!usize>;
+    if futures == null {
+        return error.ManifestFlatDiffAlloc;
+    }
 
     var total_len: usize = 0;
     var offset: usize = 0;

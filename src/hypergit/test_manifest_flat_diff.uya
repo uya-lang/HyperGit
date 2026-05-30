@@ -91,26 +91,32 @@ fn expect_flat_diff_lists_equal(actual: &ManifestFlatDiffEntryList, expected: &M
 }
 
 fn test_manifest_flat_diff_parallel_matches_serial_across_root_shards() !void {
-    var arena_buf: [byte: 32768] = [];
+    var arena_buf: [byte: 49152] = [];
     var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
-    arena_init(&arena, &arena_buf[0], 32768 as usize);
+    arena_init(&arena, &arena_buf[0], 49152 as usize);
 
     const left_readme: ManifestLeafInputEntry = try make_input(&arena, "README.md", 10 as byte);
-    const left_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 11 as byte);
-    const left_src_b: ManifestLeafInputEntry = try make_input(&arena, "src/b.uya", 12 as byte);
-    const left_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 13 as byte);
-    const left_vendor: ManifestLeafInputEntry = try make_input(&arena, "vendor/a.bin", 14 as byte);
-    var left_entries: [ManifestLeafInputEntry: 5] = [left_readme, left_src_a, left_src_b, left_tests, left_vendor];
+    const left_app: ManifestLeafInputEntry = try make_input(&arena, "app/main.uya", 11 as byte);
+    const left_docs: ManifestLeafInputEntry = try make_input(&arena, "docs/readme.md", 12 as byte);
+    const left_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 13 as byte);
+    const left_src_b: ManifestLeafInputEntry = try make_input(&arena, "src/b.uya", 14 as byte);
+    const left_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 15 as byte);
+    const left_tools: ManifestLeafInputEntry = try make_input(&arena, "tools/ci.sh", 16 as byte);
+    const left_vendor: ManifestLeafInputEntry = try make_input(&arena, "vendor/a.bin", 17 as byte);
+    var left_entries: [ManifestLeafInputEntry: 8] = [left_readme, left_app, left_docs, left_src_a, left_src_b, left_tests, left_tools, left_vendor];
 
     const right_readme: ManifestLeafInputEntry = try make_input(&arena, "README.md", 10 as byte);
-    const right_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 21 as byte);
-    const right_src_c: ManifestLeafInputEntry = try make_input(&arena, "src/c.uya", 22 as byte);
-    const right_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 13 as byte);
-    const right_vendor: ManifestLeafInputEntry = try make_input(&arena, "vendor/b.bin", 23 as byte);
-    var right_entries: [ManifestLeafInputEntry: 5] = [right_readme, right_src_a, right_src_c, right_tests, right_vendor];
+    const right_app: ManifestLeafInputEntry = try make_input(&arena, "app/main.uya", 21 as byte);
+    const right_docs: ManifestLeafInputEntry = try make_input(&arena, "docs/readme.md", 12 as byte);
+    const right_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 22 as byte);
+    const right_src_c: ManifestLeafInputEntry = try make_input(&arena, "src/c.uya", 23 as byte);
+    const right_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 15 as byte);
+    const right_tools: ManifestLeafInputEntry = try make_input(&arena, "tools/release.sh", 24 as byte);
+    const right_vendor: ManifestLeafInputEntry = try make_input(&arena, "vendor/b.bin", 25 as byte);
+    var right_entries: [ManifestLeafInputEntry: 8] = [right_readme, right_app, right_docs, right_src_a, right_src_c, right_tests, right_tools, right_vendor];
 
-    const left_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(left_entries[0: 5]);
-    const right_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(right_entries[0: 5]);
+    const left_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(left_entries[0: 8]);
+    const right_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(right_entries[0: 8]);
     var no_specs: [ByteList: 1] = [ByteList{ ptr: null, len: 0 }];
 
     const serial: ManifestFlatDiffEntryList = try manifest_flat_diff(
@@ -124,7 +130,7 @@ fn test_manifest_flat_diff_parallel_matches_serial_across_root_shards() !void {
         &left_list,
         &right_list,
         manifest_pathspec_list_from_slice(no_specs[0: 0]),
-        4,
+        8,
     );
 
     try expect_flat_diff_lists_equal(&parallel, &serial);

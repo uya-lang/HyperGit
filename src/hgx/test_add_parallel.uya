@@ -24,7 +24,7 @@ fn test_add_parallel_worker_count_caps_to_available_tasks() !void {
 }
 
 fn test_add_parallel_worker_count_caps_to_hard_limit() !void {
-    try expect(add_parallel_worker_count_for_test(128 as usize, 128) == 64 as usize);
+    try expect(add_parallel_worker_count_for_test(2048 as usize, 2048) == 1024 as usize);
 }
 
 fn test_add_parallel_worker_count_serializes_many_tiny_small_blobs_by_default() !void {

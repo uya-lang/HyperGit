@@ -24,6 +24,7 @@ use core.ids.HASH32_HEX_BYTES;
 use core.ids.commit_id_decode_hex;
 use core.ids.hash32_compare;
 use core.ids.object_id_from_hash;
+use core.parallel.parallel_default_requested_workers;
 use core.policy.placeholder_policy_id;
 use large.config.large_file_uses_small_blob;
 use large.prepare.LargePreparedChunkedBlob;
@@ -87,7 +88,7 @@ use std.io.file.file_read;
 
 const DIFF_ARENA_BYTES: usize = 33554432 as usize;
 const DIFF_PATHSPEC_ARENA_BYTES: usize = 1048576 as usize;
-const DIFF_PARALLEL_MANIFEST_WORKERS: i32 = 4;
+const DIFF_PARALLEL_MANIFEST_WORKERS_DEFAULT: i32 = 2;
 const DIFF_FILE_MODE_EXEC_BITS: u32 = 73u32;
 const DIFF_FILE_MODE_TYPE_MASK: u32 = 61440u32;
 const DIFF_FILE_MODE_SYMLINK: u32 = 40960u32;
@@ -1363,7 +1364,7 @@ export fn run_diff() i32 {
         &left_inputs,
         &right_inputs,
         pathspecs,
-        DIFF_PARALLEL_MANIFEST_WORKERS,
+        parallel_default_requested_workers(DIFF_PARALLEL_MANIFEST_WORKERS_DEFAULT),
     ) catch {
         fprintf(stderr, "%s" as *byte, DIFF_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;

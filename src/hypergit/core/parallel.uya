@@ -1,0 +1,60 @@
+use libc.sched_getaffinity;
+
+const PARALLEL_CPU_MASK_BYTES: usize = 128 as usize;
+
+export const PARALLEL_WORKERS_UNBOUNDED: usize = 0 as usize;
+
+fn parallel_count_mask_bits(mask: &[byte]) usize {
+    var total: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < mask.len {
+        var value: u32 = mask.ptr[i] as u32;
+        while value != 0u32 {
+            total = total + (value & 1u32) as usize;
+            value = value >> 1;
+        }
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn parallel_fallback_worker_count(fallback_workers: i32) usize {
+    if fallback_workers <= 0 as i32 {
+        return 1 as usize;
+    }
+    return fallback_workers as usize;
+}
+
+export fn parallel_detected_worker_count(fallback_workers: i32) usize {
+    var mask: [byte: PARALLEL_CPU_MASK_BYTES] = [];
+    if sched_getaffinity(0i64, PARALLEL_CPU_MASK_BYTES, &mask[0] as &void) < 0 {
+        return parallel_fallback_worker_count(fallback_workers);
+    }
+    const detected: usize = parallel_count_mask_bits(mask[0: PARALLEL_CPU_MASK_BYTES]);
+    if detected == 0 as usize {
+        return parallel_fallback_worker_count(fallback_workers);
+    }
+    return detected;
+}
+
+export fn parallel_default_requested_workers(fallback_workers: i32) i32 {
+    return parallel_detected_worker_count(fallback_workers) as i32;
+}
+
+export fn parallel_worker_count(task_count: usize, requested_workers: i32, max_workers: usize) usize {
+    if requested_workers <= 1 as i32 || task_count <= 1 as usize {
+        return 1 as usize;
+    }
+
+    var worker_count: usize = requested_workers as usize;
+    if max_workers != PARALLEL_WORKERS_UNBOUNDED && worker_count > max_workers {
+        worker_count = max_workers;
+    }
+    if worker_count > task_count {
+        worker_count = task_count;
+    }
+    if worker_count == 0 as usize {
+        return 1 as usize;
+    }
+    return worker_count;
+}

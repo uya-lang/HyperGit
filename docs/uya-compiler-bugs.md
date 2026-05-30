@@ -8,18 +8,20 @@
 - `return some_void_call() catch { ... }` 条目：`docs/repros/uya_void_return_catch_elides_call.uya` 现在构建并运行后返回 `0`，调用不再被错误省略。
 - `error enum wrapper` 条目：`docs/repros/uya_error_enum_wrapper_invalid_c.uya` 现在构建并运行后返回 `0`，错误联合重包场景未再触发 C 后端异常。
 - `uyagin AsyncHandler` 首请求崩溃条目：`docs/repros/uya_uyagin_async_handler_request_crash.uya` 现在能返回 `ok` 响应，未再复现 `Segmentation fault`；当前行为是服务保持运行，需由外部终止。
-- `git interop` 编译器崩溃条目：`~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya` 当前通过，2 个测试均成功。
+- `git interop` 编译器崩溃条目：`~/uya/uya/bin/uya test src/hypergit/test_git_interop.uya` 当前通过，5 个测试均成功。
 - `decode_object_kind` `invalid initializer` 条目：`~/uya/uya/bin/uya test src/hypergit/test_object_codec.uya` 当前通过；`docs/repros/uya_decode_object_kind_invalid_c.uya` 这个独立文件目前由于模块根不匹配，已经不是一个有效的 standalone repro。
 
 为防止这些模式回归，仓库现在有显式回归测试 `src/hypergit/test_compiler_regressions.uya`，并已接入 `Makefile test`。
 本次复验中，`~/uya/uya/bin/uya test src/hypergit/test_compiler_regressions.uya` 也通过，4 个场景全部为 `OK`，其中包含 `error enum wrapper` 重包错误联合的历史回归。
+另外，编译器仓库现在有专门的 C99 回归脚本 `tests/verify_c99_struct_array_and_typed_route_regressions.sh`，并已接入 `make check`，用于覆盖本页这两个 2026-05-31 修复掉的 codegen 回归。
+2026-05-31 补充复验：在 `~/uya/uya` 执行 `make uya` 重建默认自举编译器后，`./tests/verify_c99_struct_array_and_typed_route_regressions.sh` 也直接通过，因此这两个 C99 codegen 回归已经落到主线 `bin/uya`，不再只依赖 `bin/uya-hosted`。
 
 ## Array field copy in a struct literal generates a pointer-to-byte initializer
 
-- Current status (2026-05-30): 当前仍可复现。C99 smoke 过程中，`src/hgx/commands/diff.uya` 原本使用 `Hash32{ bytes: id.bytes }` 克隆数组字段，C 后端生成 `bytes = id->bytes`，宿主 C 编译器报警。项目代码已改为显式逐字节复制以规避该问题。
-- Trigger command: `~/uya/uya/bin/uya build docs/repros/uya_array_field_copy_generates_pointer_initializer.uya -o /tmp/uya_array_field_copy_generates_pointer_initializer && /tmp/uya_array_field_copy_generates_pointer_initializer; echo $?`
+- Current status (2026-05-31): 不再复现。使用当前工作区源码重建后的 `~/uya/uya/bin/uya` 重新验证，`docs/repros/uya_array_field_copy_generates_pointer_initializer.uya` 现在可直接构建并运行成功，退出码为 `0`，宿主 C 编译阶段也不再出现 `-Wint-conversion` 警告。
+- Validation command: `~/uya/uya/bin/uya build docs/repros/uya_array_field_copy_generates_pointer_initializer.uya -o /tmp/uya_array_field_copy_generates_pointer_initializer && /tmp/uya_array_field_copy_generates_pointer_initializer; echo $?`
 - Expected behavior: build has no C warning, and the program exits `0` because both copied bytes match the source hash.
-- Actual behavior: generated C initializes the first byte of the fixed array from a pointer expression, emits `-Wint-conversion`, and the program exits non-zero.
+- Historical failure behavior: generated C initialized the first byte of the fixed array from a pointer expression, emitted `-Wint-conversion`, and the program exited non-zero.
 
 Error excerpt:
 
@@ -195,10 +197,10 @@ export fn main() i32 {
 
 ## `Engine.GET_T<T>` typed route registration generates invalid C
 
-- Current status (2026-05-30): 当前仍可复现。HyperGit HTTP remote smoke test 修复过程中尝试用 `engine.GET_T<HttpRemoteCapabilitiesHandler>(...)` / `POST_T<...>(...)` 避免 handler interface 生命周期问题，C99 后端生成未实例化的 `uya_Engine_add_typed_H` 调用，宿主 C 编译失败。
-- Trigger command: `~/uya/uya/bin/uya build docs/repros/uya_uyagin_typed_route_generic_invalid_c.uya -o /tmp/uya_uyagin_typed_route_generic_invalid_c`
+- Current status (2026-05-31): 不再复现。使用当前工作区源码重建后的 `~/uya/uya/bin/uya` 重新验证，`docs/repros/uya_uyagin_typed_route_generic_invalid_c.uya` 现在可直接构建成功，`GET_T<TypedHandler>` 会继续单态化到 `Engine.add_typed<TypedHandler>` 与 `uyagin_route_store_typed_handler<TypedHandler>`。
+- Validation command: `~/uya/uya/bin/uya build docs/repros/uya_uyagin_typed_route_generic_invalid_c.uya -o /tmp/uya_uyagin_typed_route_generic_invalid_c`
 - Expected behavior: build succeeds, because `GET_T<TypedHandler>` should monomorphize through `Engine.add_typed<TypedHandler>` and store the typed handler in the route.
-- Actual behavior: generated `std/http/uyagin.c` references `uya_Engine_add_typed_H`, then fails with `implicit declaration of function` and `invalid initializer`.
+- Historical failure behavior: generated `std/http/uyagin.c` referenced `uya_Engine_add_typed_H`, then failed with `implicit declaration of function` and `invalid initializer`.
 
 Error excerpt:
 

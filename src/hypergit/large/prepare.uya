@@ -12,7 +12,8 @@ use std.thread.thread_pool_shutdown;
 
 use libc.free;
 use libc.malloc;
-use libc.sched_getaffinity;
+use core.parallel.parallel_default_requested_workers;
+use core.parallel.parallel_worker_count;
 use core.ids.ObjectId;
 use large.chunk_hash.ChunkHashes;
 use large.chunk_hash.chunk_hash_plain;
@@ -35,8 +36,6 @@ error LargePrepareAlloc;
 error LargePrepareAsyncFailed;
 
 export const LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT: i32 = 2;
-const LARGE_PREPARE_MAX_PARALLEL_WORKERS: usize = 2 as usize;
-const LARGE_PREPARE_CPU_MASK_BYTES: usize = 128 as usize;
 const LARGE_PREPARE_MAX_ASYNC_INFLIGHT: usize = 16 as usize;
 const LARGE_PREPARE_TASK_OK: usize = 0 as usize;
 const LARGE_PREPARE_TASK_SCRATCH_ALLOC_FAILED: usize = 1 as usize;
@@ -75,59 +74,8 @@ fn large_prepare_hash_scratch_bytes(max_chunk_bytes: usize) usize {
     return max_chunk_bytes + 256 as usize;
 }
 
-fn large_prepare_count_mask_bits(mask: &[byte]) usize {
-    var total: usize = 0 as usize;
-    var i: usize = 0 as usize;
-    while i < mask.len {
-        var value: u32 = mask.ptr[i] as u32;
-        while value != 0u32 {
-            total = total + (value & 1u32) as usize;
-            if total >= LARGE_PREPARE_MAX_PARALLEL_WORKERS {
-                return LARGE_PREPARE_MAX_PARALLEL_WORKERS;
-            }
-            value = value >> 1;
-        }
-        i = i + 1 as usize;
-    }
-    return total;
-}
-
-fn large_prepare_detected_worker_count() usize {
-    var mask: [byte: 128] = [];
-    if sched_getaffinity(0i64, LARGE_PREPARE_CPU_MASK_BYTES, &mask[0] as &void) < 0 {
-        return LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT as usize;
-    }
-    const detected: usize = large_prepare_count_mask_bits(mask[0: LARGE_PREPARE_CPU_MASK_BYTES]);
-    if detected == 0 as usize {
-        return LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT as usize;
-    }
-    return detected;
-}
-
 fn large_prepare_default_requested_workers() i32 {
-    const detected: usize = large_prepare_detected_worker_count();
-    if detected == 0 as usize {
-        return LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT;
-    }
-    return detected as i32;
-}
-
-fn large_prepare_parallel_worker_count(chunk_count: usize, requested_workers: i32) usize {
-    if requested_workers <= 1 as i32 || chunk_count <= 1 as usize {
-        return 1 as usize;
-    }
-
-    var worker_count: usize = requested_workers as usize;
-    if worker_count > LARGE_PREPARE_MAX_PARALLEL_WORKERS {
-        worker_count = LARGE_PREPARE_MAX_PARALLEL_WORKERS;
-    }
-    if worker_count > chunk_count {
-        worker_count = chunk_count;
-    }
-    if worker_count == 0 as usize {
-        return 1 as usize;
-    }
-    return worker_count;
+    return parallel_default_requested_workers(LARGE_PREPARE_PARALLEL_WORKERS_DEFAULT);
 }
 
 fn large_prepare_part_from_chunk(arena: &Arena, chunk: &LargeChunk) !ChunkedBlobPart {
@@ -192,26 +140,27 @@ fn large_prepare_hash_task_run(task_ptr: usize) usize {
 
 fn large_prepare_fill_parts_parallel(
     arena: &Arena,
-    chunks: LargeChunkList,
+    chunks: &LargeChunk,
+    chunk_count: usize,
     raw_parts: &[ChunkedBlobPart],
     requested_workers: i32,
 ) !void {
-    const worker_count: usize = large_prepare_parallel_worker_count(chunks.len, requested_workers);
+    const worker_count: usize = parallel_worker_count(chunk_count, requested_workers, 0 as usize);
     if worker_count <= 1 as usize {
         return error.LargePrepareAsyncFailed;
     }
 
-    const tasks: &LargePrepareHashTask = arena_alloc(arena, @size_of(LargePrepareHashTask) as usize * chunks.len) as &LargePrepareHashTask;
+    const tasks: &LargePrepareHashTask = arena_alloc(arena, @size_of(LargePrepareHashTask) as usize * chunk_count) as &LargePrepareHashTask;
     if tasks == null {
         return error.LargePrepareAlloc;
     }
     var task_index: usize = 0 as usize;
-    while task_index < chunks.len {
+    while task_index < chunk_count {
         tasks[task_index] = LargePrepareHashTask{
-            chunk: &chunks.ptr[task_index],
+            chunk: &chunks[task_index],
             parts: raw_parts.ptr,
             part_index: task_index,
-            scratch_bytes: large_prepare_hash_scratch_bytes(chunks.ptr[task_index].bytes.len),
+            scratch_bytes: large_prepare_hash_scratch_bytes(chunks[task_index].bytes.len),
         };
         task_index = task_index + 1 as usize;
     }
@@ -221,7 +170,7 @@ fn large_prepare_fill_parts_parallel(
         thread_pool_shutdown(&pool);
     }
 
-    const batch_count: usize = large_prepare_async_batch_count(chunks.len, worker_count);
+    const batch_count: usize = large_prepare_async_batch_count(chunk_count, worker_count);
     const futures: &Future<!usize> = malloc(@size_of(Future<!usize>) as usize * batch_count) as &Future<!usize>;
     if futures == null {
         return error.LargePrepareAlloc;
@@ -231,10 +180,10 @@ fn large_prepare_fill_parts_parallel(
     }
 
     var start_index: usize = 0 as usize;
-    while start_index < chunks.len {
+    while start_index < chunk_count {
         var current_batch: usize = batch_count;
-        if current_batch > chunks.len - start_index {
-            current_batch = chunks.len - start_index;
+        if current_batch > chunk_count - start_index {
+            current_batch = chunk_count - start_index;
         }
 
         var batch_index: usize = 0 as usize;

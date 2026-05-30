@@ -4,7 +4,6 @@ use std.io.file.file_open;
 use std.io.file.file_write;
 use std.async.Future;
 use std.async.block_on;
-use std.async.future_ready_ok;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 use std.mem.arena.arena_init;
@@ -42,6 +41,8 @@ use core.ids.CommitId;
 use core.ids.HASH32_HEX_BYTES;
 use core.ids.ObjectId;
 use core.ids.commit_id_decode_hex;
+use core.parallel.parallel_default_requested_workers;
+use core.parallel.parallel_worker_count;
 use large.chunk_store.ChunkStore;
 use large.chunk_store.ChunkStoreBytes;
 use large.chunk_store.chunk_store_open;
@@ -117,7 +118,7 @@ use syscall.sys_lstat;
 const CHECKOUT_ARENA_BYTES: usize = 268435456 as usize;
 const CHECKOUT_TASK_ARENA_BYTES: usize = 33554432 as usize;
 const CHECKOUT_PATH_MAX: usize = 4096 as usize;
-const CHECKOUT_PARALLEL_WORKERS: usize = 4 as usize;
+const CHECKOUT_PARALLEL_WORKERS_DEFAULT: i32 = 2;
 const CHECKOUT_SYS_SYMLINK: i64 = 88;
 const CHECKOUT_STAT_S_IFMT: u32 = 61440u32;
 const CHECKOUT_STAT_S_IFDIR: u32 = 16384u32;
@@ -757,7 +758,7 @@ export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &Re
         return;
     }
 
-    if write_count >= 1 as usize {
+    if write_count == 1 as usize {
         const chunk_store: ChunkStore = chunk_store_open(repo_path_cstr(&chunk_store_root)) catch |err| {
             if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
                 return error.CheckoutPermissionDenied;
@@ -815,20 +816,29 @@ export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &Re
         return;
     }
 
-    var worker_count: usize = write_count;
-    if worker_count > CHECKOUT_PARALLEL_WORKERS {
-        worker_count = CHECKOUT_PARALLEL_WORKERS;
+    const worker_count: usize = parallel_worker_count(
+        write_count,
+        parallel_default_requested_workers(CHECKOUT_PARALLEL_WORKERS_DEFAULT),
+        0 as usize,
+    );
+    if worker_count <= 1 as usize {
+        i = 0 as usize;
+        while i < write_count {
+            try checkout_apply_task_status(checkout_apply_task_run(@usize_from_ptr((&tasks[i]) as &void)));
+            i = i + 1 as usize;
+        }
+        return;
     }
+
     var pool: ThreadPool = thread_pool_new(worker_count as i32);
     defer {
         thread_pool_shutdown(&pool);
     }
 
-    var ready0: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready1: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready2: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready3: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var futures: [Future<!usize>: 4] = [ready0, ready1, ready2, ready3];
+    const futures: &Future<!usize> = arena_alloc(arena, @size_of(Future<!usize>) as usize * worker_count) as &Future<!usize>;
+    if futures == null {
+        return error.CheckoutAlloc;
+    }
 
     var offset: usize = 0;
     while offset < write_count {

@@ -6,7 +6,6 @@ use std.io.file.fread;
 use std.io.file.fwrite;
 use std.async.Future;
 use std.async.block_on;
-use std.async.future_ready_ok;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 use std.mem.arena.arena_init;
@@ -46,6 +45,8 @@ use core.ids.ObjectId;
 use core.ids.HASH32_BYTES;
 use core.ids.object_id_from_hash;
 use core.ids.object_id_compare;
+use core.parallel.parallel_default_requested_workers;
+use core.parallel.parallel_worker_count;
 use object.types.ByteList;
 use object.types.ObjectKind;
 use object.types.object_kind_from_u16;
@@ -73,7 +74,7 @@ export const SEGMENT_PACK_MAX_BYTES: usize = 67108864 as usize;
 const SEGMENT_PACK_HEADER_CRC_OFFSET: usize = 60 as usize;
 const PACK_INDEX_HEADER_CRC_OFFSET: usize = 40 as usize;
 const SEGMENT_PACK_MAX_RECORD_BYTES: usize = 4294967295 as usize;
-const SEGMENT_PACK_READ_PARALLEL_WORKERS: usize = 4 as usize;
+const SEGMENT_PACK_READ_PARALLEL_WORKERS_DEFAULT: i32 = 2;
 const SEGMENT_PACK_VALIDATE_OK: usize = 0 as usize;
 const SEGMENT_PACK_VALIDATE_INVALID: usize = 1 as usize;
 const SEGMENT_PACK_VALIDATE_READ_FAILED: usize = 2 as usize;
@@ -392,10 +393,11 @@ fn segment_pack_validate_records_parallel(arena: &Arena, input: &[byte], records
         return;
     }
 
-    var worker_count: usize = records.len;
-    if worker_count > SEGMENT_PACK_READ_PARALLEL_WORKERS {
-        worker_count = SEGMENT_PACK_READ_PARALLEL_WORKERS;
-    }
+    const worker_count: usize = parallel_worker_count(
+        records.len,
+        parallel_default_requested_workers(SEGMENT_PACK_READ_PARALLEL_WORKERS_DEFAULT),
+        0 as usize,
+    );
     if worker_count <= 1 as usize {
         var single_index: usize = 0 as usize;
         while single_index < records.len {
@@ -434,11 +436,10 @@ fn segment_pack_validate_records_parallel(arena: &Arena, input: &[byte], records
         thread_pool_shutdown(&pool);
     }
 
-    var ready0: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready1: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready2: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var ready3: Future<!usize> = future_ready_ok<usize>(0 as usize);
-    var futures: [Future<!usize>: 4] = [ready0, ready1, ready2, ready3];
+    const futures: &Future<!usize> = arena_alloc(arena, @size_of(Future<!usize>) as usize * worker_count) as &Future<!usize>;
+    if futures == null {
+        return error.SegmentPackAlloc;
+    }
 
     task_index = 0 as usize;
     while task_index < worker_count {

@@ -38,7 +38,6 @@ use libc.pthread_mutex_unlock;
 use libc.pthread_mutexattr_t;
 use libc.pthread_yield;
 use libc.readlink;
-use libc.sched_getaffinity;
 use libc.stderr;
 use libc.stat;
 use libc.stdout;
@@ -58,6 +57,8 @@ use core.ids.commit_id_compare;
 use core.ids.hash32_compare;
 use core.ids.object_id_compare;
 use core.ids.object_id_from_hash;
+use core.parallel.parallel_default_requested_workers;
+use core.parallel.parallel_worker_count;
 use large.config.large_file_uses_small_blob;
 use large.chunk_store.ChunkStore;
 use large.chunk_store.ChunkStorePutResult;
@@ -130,8 +131,7 @@ const ADD_ARENA_BYTES: usize = 268435456 as usize;
 const ADD_PATHSPEC_ARENA_BYTES: usize = 65536 as usize;
 const ADD_PATH_MAX: usize = 4096;
 const ADD_PARALLEL_WORKERS_DEFAULT: i32 = 2;
-const ADD_PARALLEL_MAX_WORKERS: usize = 64 as usize;
-const ADD_PARALLEL_CPU_MASK_BYTES: usize = 128 as usize;
+const ADD_PARALLEL_MAX_WORKERS: usize = 1024 as usize;
 const ADD_SMALL_BLOB_FAST_MAX_BYTES: usize = 4096 as usize;
 const ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES: usize = ADD_SMALL_BLOB_FAST_MAX_BYTES + 64 as usize;
 const ADD_SMALL_BLOB_FAST_HASH_BYTES: usize = ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES + 128 as usize;
@@ -537,41 +537,8 @@ fn add_owned_bytes_free(value: &AddOwnedBytes) void {
     }
 }
 
-fn add_parallel_count_mask_bits(mask: &[byte]) usize {
-    var total: usize = 0 as usize;
-    var i: usize = 0 as usize;
-    while i < mask.len {
-        var value: u32 = mask.ptr[i] as u32;
-        while value != 0u32 {
-            total = total + (value & 1u32) as usize;
-            if total >= ADD_PARALLEL_MAX_WORKERS {
-                return ADD_PARALLEL_MAX_WORKERS;
-            }
-            value = value >> 1;
-        }
-        i = i + 1 as usize;
-    }
-    return total;
-}
-
-fn add_parallel_detected_worker_count() usize {
-    var mask: [byte: ADD_PARALLEL_CPU_MASK_BYTES] = [];
-    if sched_getaffinity(0i64, ADD_PARALLEL_CPU_MASK_BYTES, &mask[0] as &void) < 0 {
-        return ADD_PARALLEL_WORKERS_DEFAULT as usize;
-    }
-    const detected: usize = add_parallel_count_mask_bits(mask[0: ADD_PARALLEL_CPU_MASK_BYTES]);
-    if detected == 0 as usize {
-        return ADD_PARALLEL_WORKERS_DEFAULT as usize;
-    }
-    return detected;
-}
-
 fn add_parallel_default_requested_workers() i32 {
-    const detected: usize = add_parallel_detected_worker_count();
-    if detected == 0 as usize {
-        return ADD_PARALLEL_WORKERS_DEFAULT;
-    }
-    return detected as i32;
+    return parallel_default_requested_workers(ADD_PARALLEL_WORKERS_DEFAULT);
 }
 
 fn add_parallel_env_requested_workers() i32 {
@@ -596,21 +563,7 @@ fn add_parallel_env_requested_workers() i32 {
 }
 
 fn add_parallel_worker_count(task_count: usize, requested_workers: i32) usize {
-    if requested_workers <= 1 as i32 || task_count <= 1 as usize {
-        return 1 as usize;
-    }
-
-    var worker_count: usize = requested_workers as usize;
-    if worker_count > ADD_PARALLEL_MAX_WORKERS {
-        worker_count = ADD_PARALLEL_MAX_WORKERS;
-    }
-    if worker_count > task_count {
-        worker_count = task_count;
-    }
-    if worker_count == 0 as usize {
-        return 1 as usize;
-    }
-    return worker_count;
+    return parallel_worker_count(task_count, requested_workers, ADD_PARALLEL_MAX_WORKERS);
 }
 
 export fn add_parallel_worker_count_for_test(task_count: usize, requested_workers: i32) usize {
