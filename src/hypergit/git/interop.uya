@@ -5,29 +5,41 @@ use std.io.file.FILE;
 use std.io.file.fclose;
 use std.io.file.fopen;
 use std.io.file.fread;
+use std.io.file.fwrite;
 
 use libc.Stat;
 use libc.remove;
 use libc.stat;
 use libc.system;
 use libc.tmpnam;
+use core.ids.CommitId;
 use core.ids.ObjectId;
 use core.ids.ManifestId;
 use core.policy.placeholder_policy_id;
+use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_bytes_is_utf8;
 use manifest.path.manifest_path_normalize;
 use manifest.root.manifest_root_build_and_store;
 use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
 use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.commit_build.commit_object_build_and_store;
+use object.codec.decode_small_blob_object;
 use object.codec.small_blob_payload_to_canonical;
 use object.small_blob.small_blob_payload_from_bytes;
+use object.types.BloomFilter;
 use object.types.ByteList;
+use object.types.CommitIdList;
+use object.types.CommitPayload;
 use object.types.ContentType;
 use object.types.EntryKind;
+use object.types.Identity;
+use object.types.ModuleBitmap;
 use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
+use object.types.commit_id_list_from_slice;
 use store.loose_store.LooseObjectStore;
+use store.object_store.ObjectBytes;
 
 const GIT_INTEROP_PATH_MAX: usize = 4096;
 const GIT_INTEROP_OID_HEX_BYTES: usize = 40 as usize;
@@ -58,6 +70,32 @@ export struct GitTreeEntryPrototype {
 export struct GitTreeEntryPrototypeList {
     ptr: &GitTreeEntryPrototype,
     len: usize
+}
+
+export struct GitCommitParentListPrototype {
+    ptr: &ByteList,
+    len: usize
+}
+
+export struct GitCommitPrototype {
+    oid_hex: ByteList,
+    tree_hex: ByteList,
+    parents: GitCommitParentListPrototype,
+    author: Identity,
+    committer: Identity,
+    message: ByteList,
+    timestamp_ms: i64
+}
+
+export struct GitCommitImportPrototype {
+    commit_id: CommitId,
+    manifest_root: ManifestId,
+    generation: u64
+}
+
+export struct GitTreeExportPrototype {
+    tree_hex: ByteList,
+    entry_count: usize
 }
 
 struct GitInteropPath {
@@ -144,6 +182,16 @@ fn git_interop_arena_bytes(arena: &Arena, len: usize) !&[byte] {
     return raw[0: len];
 }
 
+fn git_interop_copy_bytes(arena: &Arena, src: &[byte]) !ByteList {
+    const out: &[byte] = try git_interop_arena_bytes(arena, src.len);
+    var i: usize = 0 as usize;
+    while i < src.len {
+        out.ptr[i] = src.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
 fn git_interop_read_file(arena: &Arena, path: &const byte) !ByteList {
     var st: Stat = Stat{};
     if stat(path, &st) != 0 {
@@ -162,6 +210,21 @@ fn git_interop_read_file(arena: &Arena, path: &const byte) !ByteList {
         return error.GitInteropReadFailed;
     }
     return ByteList{ ptr: out.ptr, len: size };
+}
+
+fn git_interop_write_file(path: &GitInteropPath, content: &[byte]) !void {
+    const stream: &FILE = fopen(git_interop_path_cstr(path) as &const byte, "w");
+    if stream == null {
+        return error.GitInteropReadFailed;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+    if content.len > 0 as usize {
+        if fwrite(content.ptr as &const byte, 1 as usize, content.len, stream) != content.len {
+            return error.GitInteropReadFailed;
+        }
+    }
 }
 
 fn git_interop_tmp_path() !GitInteropPath {
@@ -205,6 +268,58 @@ fn git_interop_command_capture_ls_tree(git_dir: &[byte], tree_hex: &[byte], outp
     }
 }
 
+fn git_interop_command_read_tree_empty(git_dir: &[byte]) !void {
+    var cmd: GitInteropPath = git_interop_path_empty();
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("git --git-dir='"));
+    try git_interop_path_append_bytes(&cmd, git_dir);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("' read-tree --empty"));
+    if system(git_interop_path_cstr(&cmd) as &const byte) != 0 {
+        return error.GitInteropGitCommandFailed;
+    }
+}
+
+fn git_interop_command_hash_object(git_dir: &[byte], input: &GitInteropPath, output: &GitInteropPath) !void {
+    var cmd: GitInteropPath = git_interop_path_empty();
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("git --git-dir='"));
+    try git_interop_path_append_bytes(&cmd, git_dir);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("' hash-object -w '"));
+    try git_interop_path_append_bytes(&cmd, input.bytes[0: input.len]);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("' >'"));
+    try git_interop_path_append_bytes(&cmd, output.bytes[0: output.len]);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("'"));
+    if system(git_interop_path_cstr(&cmd) as &const byte) != 0 {
+        return error.GitInteropGitCommandFailed;
+    }
+}
+
+fn git_interop_command_update_index(git_dir: &[byte], mode: &const byte, oid_hex: &[byte], path: &[byte]) !void {
+    var cmd: GitInteropPath = git_interop_path_empty();
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("git --git-dir='"));
+    try git_interop_path_append_bytes(&cmd, git_dir);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("' update-index --add --cacheinfo "));
+    try git_interop_path_append_bytes(&cmd, (mode as &byte)[0: strlen(mode)]);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes(" '"));
+    try git_interop_path_append_bytes(&cmd, oid_hex);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("' '"));
+    try git_interop_path_append_bytes(&cmd, path);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("'"));
+    if system(git_interop_path_cstr(&cmd) as &const byte) != 0 {
+        return error.GitInteropGitCommandFailed;
+    }
+}
+
+fn git_interop_command_write_tree(git_dir: &[byte], output: &GitInteropPath) !void {
+    var cmd: GitInteropPath = git_interop_path_empty();
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("git --git-dir='"));
+    try git_interop_path_append_bytes(&cmd, git_dir);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("' write-tree >'"));
+    try git_interop_path_append_bytes(&cmd, output.bytes[0: output.len]);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("'"));
+    if system(git_interop_path_cstr(&cmd) as &const byte) != 0 {
+        return error.GitInteropGitCommandFailed;
+    }
+}
+
 fn git_interop_slice_eq_literal(slice: &[byte], literal: &const byte) bool {
     const expected: &[byte] = (literal as &byte)[0: strlen(literal)];
     if slice.len != expected.len {
@@ -218,6 +333,49 @@ fn git_interop_slice_eq_literal(slice: &[byte], literal: &const byte) bool {
         i = i + 1 as usize;
     }
     return true;
+}
+
+fn git_interop_slice_starts_with_literal(slice: &[byte], literal: &const byte) bool {
+    const expected: &[byte] = (literal as &byte)[0: strlen(literal)];
+    if slice.len < expected.len {
+        return false;
+    }
+    var i: usize = 0 as usize;
+    while i < expected.len {
+        if slice.ptr[i] != expected.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn git_interop_trim_newline(slice: &[byte]) &[byte] {
+    if slice.len > 0 as usize && slice.ptr[slice.len - 1 as usize] == '\n' as byte {
+        return slice.ptr[0: slice.len - 1 as usize];
+    }
+    return slice;
+}
+
+fn git_interop_parse_i64_prefix(slice: &[byte]) !i64 {
+    if slice.len == 0 as usize {
+        return error.GitInteropTreeParseFailed;
+    }
+    var sign: i64 = 1i64;
+    var i: usize = 0 as usize;
+    if slice.ptr[0] == '-' as byte {
+        sign = -1i64;
+        i = 1 as usize;
+    }
+    if i >= slice.len || slice.ptr[i] < '0' as byte || slice.ptr[i] > '9' as byte {
+        return error.GitInteropTreeParseFailed;
+    }
+    var value: i64 = 0i64;
+    while i < slice.len && slice.ptr[i] >= '0' as byte && slice.ptr[i] <= '9' as byte {
+        value = value * 10i64 + (slice.ptr[i] - '0' as byte) as i64;
+        i = i + 1 as usize;
+    }
+    return value * sign;
 }
 
 fn git_interop_mode_to_entry(mode: &[byte], kind: &EntryKind, file_mode: &u32) !void {
@@ -239,6 +397,16 @@ fn git_interop_mode_to_entry(mode: &[byte], kind: &EntryKind, file_mode: &u32) !
     return error.GitInteropUnsupportedObjectType;
 }
 
+fn git_interop_entry_kind_to_git_mode(kind: EntryKind) &const byte {
+    if kind == EntryKind.Executable {
+        return "100755" as &const byte;
+    }
+    if kind == EntryKind.Symlink {
+        return "120000" as &const byte;
+    }
+    return "100644" as &const byte;
+}
+
 fn git_interop_tree_content_type(content: &[byte]) ContentType {
     if manifest_bytes_is_utf8(content) {
         return ContentType.Utf8Text;
@@ -257,6 +425,69 @@ fn git_interop_count_tree_entries(raw: &[byte]) usize {
         i = i + 1 as usize;
     }
     return count;
+}
+
+fn git_interop_count_commit_parent_lines(raw: &[byte]) usize {
+    var count: usize = 0 as usize;
+    var cursor: usize = 0 as usize;
+    while cursor < raw.len {
+        const line_start: usize = cursor;
+        while cursor < raw.len && raw.ptr[cursor] != '\n' as byte {
+            cursor = cursor + 1 as usize;
+        }
+        const line: &[byte] = raw.ptr[line_start: cursor - line_start];
+        if line.len == 0 as usize {
+            break;
+        }
+        if git_interop_slice_starts_with_literal(line, "parent ") {
+            count = count + 1 as usize;
+        }
+        if cursor < raw.len {
+            cursor = cursor + 1 as usize;
+        }
+    }
+    return count;
+}
+
+fn git_interop_parse_identity(arena: &Arena, line: &[byte], timestamp_ms: &i64) !Identity {
+    var lt: usize = 0 as usize;
+    while lt < line.len && line.ptr[lt] != '<' as byte {
+        lt = lt + 1 as usize;
+    }
+    if lt == line.len {
+        return error.GitInteropTreeParseFailed;
+    }
+    var gt: usize = lt + 1 as usize;
+    while gt < line.len && line.ptr[gt] != '>' as byte {
+        gt = gt + 1 as usize;
+    }
+    if gt == line.len {
+        return error.GitInteropTreeParseFailed;
+    }
+
+    var name_len: usize = lt;
+    if name_len > 0 as usize && line.ptr[name_len - 1 as usize] == ' ' as byte {
+        name_len = name_len - 1 as usize;
+    }
+    var time_start: usize = gt + 1 as usize;
+    while time_start < line.len && line.ptr[time_start] == ' ' as byte {
+        time_start = time_start + 1 as usize;
+    }
+    const seconds: i64 = try git_interop_parse_i64_prefix(line.ptr[time_start: line.len - time_start]);
+    *timestamp_ms = seconds * 1000i64;
+
+    return Identity{
+        name: try git_interop_copy_bytes(arena, line.ptr[0: name_len]),
+        email: try git_interop_copy_bytes(arena, line.ptr[lt + 1 as usize: gt - lt - 1 as usize]),
+    };
+}
+
+fn git_interop_empty_bloom() BloomFilter {
+    return BloomFilter{ bytes: ByteList{ ptr: null, len: 0 } };
+}
+
+fn git_interop_empty_module_bitmap() ModuleBitmap {
+    return ModuleBitmap{ bytes: ByteList{ ptr: null, len: 0 } };
 }
 
 
@@ -409,4 +640,210 @@ export fn git_tree_to_manifest_prototype(arena: &Arena, store: &LooseObjectStore
         i = i + 1 as usize;
     }
     return try manifest_root_build_and_store(arena, store, manifest_leaf_input_list_from_slice(manifest_inputs[0: entries.len]));
+}
+
+export fn git_read_commit_prototype(arena: &Arena, git_dir: &[byte], commit_hex: &[byte]) !GitCommitPrototype {
+    const loose_path: GitInteropPath = try git_interop_loose_object_path(git_dir, commit_hex);
+    var st: Stat = Stat{};
+    if stat(git_interop_path_cstr(&loose_path) as &const byte, &st) != 0 {
+        return error.GitInteropLooseObjectMissing;
+    }
+
+    const type_path: GitInteropPath = try git_interop_tmp_path();
+    const data_path: GitInteropPath = try git_interop_tmp_path();
+    defer {
+        _ = remove(git_interop_path_cstr(&type_path) as &const byte);
+        _ = remove(git_interop_path_cstr(&data_path) as &const byte);
+    }
+
+    try git_interop_command_capture(git_dir, commit_hex, "t", &type_path);
+    try git_interop_command_capture(git_dir, commit_hex, "p", &data_path);
+
+    const type_bytes: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&type_path) as &const byte);
+    if type_bytes.len < 6 as usize || !git_interop_slice_eq_literal(type_bytes.ptr[0: 6], "commit") {
+        return error.GitInteropUnsupportedObjectType;
+    }
+
+    const raw: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&data_path) as &const byte);
+    const parent_count: usize = git_interop_count_commit_parent_lines(raw.ptr[0: raw.len]);
+    var parents: &ByteList = null;
+    if parent_count > 0 as usize {
+        parents = arena_alloc(arena, @size_of(ByteList) as usize * parent_count) as &ByteList;
+        if parents == null {
+            return error.GitInteropAlloc;
+        }
+    }
+
+    var oid_copy: ByteList = try git_interop_copy_bytes(arena, commit_hex);
+    var tree_hex: ByteList = ByteList{ ptr: null, len: 0 };
+    var author: Identity = Identity{ name: ByteList{ ptr: null, len: 0 }, email: ByteList{ ptr: null, len: 0 } };
+    var committer: Identity = Identity{ name: ByteList{ ptr: null, len: 0 }, email: ByteList{ ptr: null, len: 0 } };
+    var timestamp_ms: i64 = 0i64;
+    var parent_index: usize = 0 as usize;
+    var message_start: usize = raw.len;
+    var cursor: usize = 0 as usize;
+    while cursor < raw.len {
+        const line_start: usize = cursor;
+        while cursor < raw.len && raw.ptr[cursor] != '\n' as byte {
+            cursor = cursor + 1 as usize;
+        }
+        const line: &[byte] = raw.ptr[line_start: cursor - line_start];
+        var next_cursor: usize = cursor;
+        if cursor < raw.len {
+            next_cursor = cursor + 1 as usize;
+        }
+        if line.len == 0 as usize {
+            message_start = next_cursor;
+            break;
+        }
+        if git_interop_slice_starts_with_literal(line, "tree ") {
+            if line.len < 5 as usize + GIT_INTEROP_OID_HEX_BYTES {
+                return error.GitInteropTreeParseFailed;
+            }
+            tree_hex = try git_interop_copy_bytes(arena, line.ptr[5 as usize: GIT_INTEROP_OID_HEX_BYTES]);
+        } else if git_interop_slice_starts_with_literal(line, "parent ") {
+            if line.len < 7 as usize + GIT_INTEROP_OID_HEX_BYTES || parent_index >= parent_count {
+                return error.GitInteropTreeParseFailed;
+            }
+            if parents == null {
+                return error.GitInteropTreeParseFailed;
+            }
+            parents[parent_index] = try git_interop_copy_bytes(arena, line.ptr[7 as usize: GIT_INTEROP_OID_HEX_BYTES]);
+            parent_index = parent_index + 1 as usize;
+        } else if git_interop_slice_starts_with_literal(line, "author ") {
+            author = try git_interop_parse_identity(arena, line.ptr[7 as usize: line.len - 7 as usize], &timestamp_ms);
+        } else if git_interop_slice_starts_with_literal(line, "committer ") {
+            var committer_timestamp_ms: i64 = 0i64;
+            committer = try git_interop_parse_identity(arena, line.ptr[10 as usize: line.len - 10 as usize], &committer_timestamp_ms);
+        }
+        cursor = next_cursor;
+    }
+
+    if tree_hex.len != GIT_INTEROP_OID_HEX_BYTES || author.name.ptr == null || committer.name.ptr == null {
+        return error.GitInteropTreeParseFailed;
+    }
+    const message: ByteList = try git_interop_copy_bytes(arena, raw.ptr[message_start: raw.len - message_start]);
+    return GitCommitPrototype{
+        oid_hex: oid_copy,
+        tree_hex: tree_hex,
+        parents: GitCommitParentListPrototype{ ptr: parents, len: parent_index },
+        author: author,
+        committer: committer,
+        message: message,
+        timestamp_ms: timestamp_ms,
+    };
+}
+
+export fn git_import_commit_prototype(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], commit_hex: &[byte]) !GitCommitImportPrototype {
+    const commit: GitCommitPrototype = try git_read_commit_prototype(arena, git_dir, commit_hex);
+    var parent_ids: &CommitId = null;
+    if commit.parents.len > 0 as usize {
+        parent_ids = arena_alloc(arena, @size_of(CommitId) as usize * commit.parents.len) as &CommitId;
+        if parent_ids == null {
+            return error.GitInteropAlloc;
+        }
+    }
+
+    var max_parent_generation: u64 = 0u64;
+    var i: usize = 0 as usize;
+    if commit.parents.len > 0 as usize {
+        const git_parent_ptr: &ByteList = commit.parents.ptr;
+        const parent_id_ptr: &CommitId = parent_ids;
+        if git_parent_ptr == null || parent_id_ptr == null {
+            return error.GitInteropTreeParseFailed;
+        }
+        while i < commit.parents.len {
+            const parent_import: GitCommitImportPrototype = try git_import_commit_prototype(arena, store, git_dir, git_parent_ptr[i].ptr[0: git_parent_ptr[i].len]);
+            parent_id_ptr[i] = parent_import.commit_id;
+            if parent_import.generation > max_parent_generation {
+                max_parent_generation = parent_import.generation;
+            }
+            i = i + 1 as usize;
+        }
+    }
+
+    const manifest_root: ManifestId = try git_tree_to_manifest_prototype(arena, store, git_dir, commit.tree_hex.ptr[0: commit.tree_hex.len]);
+    var parents: CommitIdList = CommitIdList{ ptr: null, len: 0 };
+    if commit.parents.len > 0 as usize {
+        const parent_id_ptr: &CommitId = parent_ids;
+        if parent_id_ptr == null {
+            return error.GitInteropTreeParseFailed;
+        }
+        parents = commit_id_list_from_slice(parent_id_ptr[0: commit.parents.len]);
+    }
+    const payload: CommitPayload = CommitPayload{
+        parents: parents,
+        author: commit.author,
+        committer: commit.committer,
+        message: commit.message,
+        timestamp_ms: commit.timestamp_ms,
+        manifest_root: manifest_root,
+        changed_path_bloom: git_interop_empty_bloom(),
+        module_bitmap: git_interop_empty_module_bitmap(),
+        generation: max_parent_generation + 1u64,
+    };
+    const commit_id: CommitId = try commit_object_build_and_store(arena, store, &payload);
+    return GitCommitImportPrototype{
+        commit_id: commit_id,
+        manifest_root: manifest_root,
+        generation: payload.generation,
+    };
+}
+
+export fn git_commit_to_hypergit_commit_prototype(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], commit_hex: &[byte]) !CommitId {
+    const imported: GitCommitImportPrototype = try git_import_commit_prototype(arena, store, git_dir, commit_hex);
+    return imported.commit_id;
+}
+
+fn git_interop_load_small_blob_payload(arena: &Arena, store: &LooseObjectStore, object_id: ObjectId) !SmallBlobPayload {
+    const object_bytes: ObjectBytes = try store.get(object_id, arena);
+    var offset: usize = 0 as usize;
+    const payload: SmallBlobPayload = try decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    if offset != object_bytes.bytes.len {
+        return error.GitInteropReadFailed;
+    }
+    return payload;
+}
+
+export fn hypergit_manifest_to_git_tree_prototype(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], manifest_id: &ManifestId) !GitTreeExportPrototype {
+    const entries: ManifestLeafInputList = try manifest_load_flatten(arena, store, manifest_id);
+    try git_interop_command_read_tree_empty(git_dir);
+
+    const blob_path: GitInteropPath = try git_interop_tmp_path();
+    const oid_path: GitInteropPath = try git_interop_tmp_path();
+    const tree_path: GitInteropPath = try git_interop_tmp_path();
+    defer {
+        _ = remove(git_interop_path_cstr(&blob_path) as &const byte);
+        _ = remove(git_interop_path_cstr(&oid_path) as &const byte);
+        _ = remove(git_interop_path_cstr(&tree_path) as &const byte);
+    }
+
+    var i: usize = 0 as usize;
+    while i < entries.len {
+        const entry: &ManifestLeafInputEntry = &entries.ptr[i];
+        const payload: SmallBlobPayload = try git_interop_load_small_blob_payload(arena, store, entry.object_id);
+        try git_interop_write_file(&blob_path, payload.payload.ptr[0: payload.payload.len]);
+        try git_interop_command_hash_object(git_dir, &blob_path, &oid_path);
+        const oid_file: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&oid_path) as &const byte);
+        const oid_hex: &[byte] = git_interop_trim_newline(oid_file.ptr[0: oid_file.len]);
+        try git_interop_command_update_index(
+            git_dir,
+            git_interop_entry_kind_to_git_mode(entry.kind),
+            oid_hex,
+            entry.path.ptr[0: entry.path.len],
+        );
+        i = i + 1 as usize;
+    }
+
+    try git_interop_command_write_tree(git_dir, &tree_path);
+    const tree_file: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&tree_path) as &const byte);
+    const tree_hex_slice: &[byte] = git_interop_trim_newline(tree_file.ptr[0: tree_file.len]);
+    if tree_hex_slice.len != GIT_INTEROP_OID_HEX_BYTES {
+        return error.GitInteropTreeParseFailed;
+    }
+    const tree_hex: ByteList = try git_interop_copy_bytes(arena, tree_hex_slice);
+    return GitTreeExportPrototype{
+        tree_hex: tree_hex,
+        entry_count: entries.len,
+    };
 }

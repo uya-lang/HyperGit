@@ -376,7 +376,7 @@ fn test_http_remote_capabilities_and_routes() !void {
     }
 
     try assert_eq_i32(server.engine.route_count, 5);
-    try assert_eq_i32(server.engine.middleware_count, 1);
+    try assert_eq_i32(server.engine.middleware_count, 0);
     try expect(server.engine.limits.max_body_bytes == 1024 as usize);
 
     var arena_buf: [byte: 2048] = [];

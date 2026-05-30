@@ -158,6 +158,8 @@ export struct HttpRemoteServer {
     runtime: &HttpRemoteRuntime
 }
 
+var HTTP_REMOTE_ACTIVE_RUNTIME: &HttpRemoteRuntime = null;
+
 export struct HttpRemoteObjectIdList {
     ptr: &ObjectId,
     len: usize
@@ -1231,57 +1233,78 @@ fn http_remote_push_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future
     return ctx.bytes(Status.OK, http_remote_literal_slice(HTTP_REMOTE_BINARY_CONTENT_TYPE), out[0: offset]);
 }
 
-struct HttpRemoteAuthHandler : AsyncHandler {
-    runtime: &HttpRemoteRuntime,
-
-    @async_fn
-    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
-        return try @await http_remote_auth_future(self.runtime, ctx);
-    }
-}
-
 struct HttpRemoteCapabilitiesHandler : AsyncHandler {
-    runtime: &HttpRemoteRuntime,
-
     @async_fn
     fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
-        return try @await http_remote_capabilities_future(self.runtime, ctx);
+        const runtime: &HttpRemoteRuntime = HTTP_REMOTE_ACTIVE_RUNTIME;
+        if runtime == null {
+            return try @await ctx.string(Status.InternalServerError, "internal server error\n");
+        }
+        _ = try @await http_remote_auth_future(runtime, ctx);
+        if ctx.aborted || ctx.wrote {
+            return 0;
+        }
+        return try @await http_remote_capabilities_future(runtime, ctx);
     }
 }
 
 struct HttpRemoteObjectBatchHandler : AsyncHandler {
-    runtime: &HttpRemoteRuntime,
-
     @async_fn
     fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
-        return try @await http_remote_object_batch_future(self.runtime, ctx);
+        const runtime: &HttpRemoteRuntime = HTTP_REMOTE_ACTIVE_RUNTIME;
+        if runtime == null {
+            return try @await ctx.string(Status.InternalServerError, "internal server error\n");
+        }
+        _ = try @await http_remote_auth_future(runtime, ctx);
+        if ctx.aborted || ctx.wrote {
+            return 0;
+        }
+        return try @await http_remote_object_batch_future(runtime, ctx);
     }
 }
 
 struct HttpRemoteManifestQueryHandler : AsyncHandler {
-    runtime: &HttpRemoteRuntime,
-
     @async_fn
     fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
-        return try @await http_remote_manifest_query_future(self.runtime, ctx);
+        const runtime: &HttpRemoteRuntime = HTTP_REMOTE_ACTIVE_RUNTIME;
+        if runtime == null {
+            return try @await ctx.string(Status.InternalServerError, "internal server error\n");
+        }
+        _ = try @await http_remote_auth_future(runtime, ctx);
+        if ctx.aborted || ctx.wrote {
+            return 0;
+        }
+        return try @await http_remote_manifest_query_future(runtime, ctx);
     }
 }
 
 struct HttpRemoteFetchHandler : AsyncHandler {
-    runtime: &HttpRemoteRuntime,
-
     @async_fn
     fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
-        return try @await http_remote_fetch_future(self.runtime, ctx);
+        const runtime: &HttpRemoteRuntime = HTTP_REMOTE_ACTIVE_RUNTIME;
+        if runtime == null {
+            return try @await ctx.string(Status.InternalServerError, "internal server error\n");
+        }
+        _ = try @await http_remote_auth_future(runtime, ctx);
+        if ctx.aborted || ctx.wrote {
+            return 0;
+        }
+        return try @await http_remote_fetch_future(runtime, ctx);
     }
 }
 
 struct HttpRemotePushHandler : AsyncHandler {
-    runtime: &HttpRemoteRuntime,
-
     @async_fn
     fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
-        return try @await http_remote_push_future(self.runtime, ctx);
+        const runtime: &HttpRemoteRuntime = HTTP_REMOTE_ACTIVE_RUNTIME;
+        if runtime == null {
+            return try @await ctx.string(Status.InternalServerError, "internal server error\n");
+        }
+        _ = try @await http_remote_auth_future(runtime, ctx);
+        if ctx.aborted || ctx.wrote {
+            return 0;
+        }
+        return try @await http_remote_push_future(runtime, ctx);
     }
 }
 
@@ -1359,15 +1382,13 @@ fn http_remote_runtime_new(repo_root: &[byte], default_branch: &[byte], auth_tok
     return raw;
 }
 
-fn http_remote_register_routes(engine: &Engine, runtime: &HttpRemoteRuntime) !void {
+fn http_remote_register_routes(engine: &Engine) !void {
     engine.UseRecovery();
-    const auth_handler: AsyncHandler = HttpRemoteAuthHandler{ runtime: runtime };
-    const capabilities_handler: AsyncHandler = HttpRemoteCapabilitiesHandler{ runtime: runtime };
-    const object_batch_handler: AsyncHandler = HttpRemoteObjectBatchHandler{ runtime: runtime };
-    const manifest_query_handler: AsyncHandler = HttpRemoteManifestQueryHandler{ runtime: runtime };
-    const fetch_handler: AsyncHandler = HttpRemoteFetchHandler{ runtime: runtime };
-    const push_handler: AsyncHandler = HttpRemotePushHandler{ runtime: runtime };
-    try engine.Use(auth_handler);
+    const capabilities_handler: AsyncHandler = HttpRemoteCapabilitiesHandler{};
+    const object_batch_handler: AsyncHandler = HttpRemoteObjectBatchHandler{};
+    const manifest_query_handler: AsyncHandler = HttpRemoteManifestQueryHandler{};
+    const fetch_handler: AsyncHandler = HttpRemoteFetchHandler{};
+    const push_handler: AsyncHandler = HttpRemotePushHandler{};
     try engine.GET(http_remote_literal_slice(HTTP_REMOTE_CAPABILITIES_ROUTE), capabilities_handler);
     try engine.POST(http_remote_literal_slice(HTTP_REMOTE_OBJECT_BATCH_ROUTE), object_batch_handler);
     try engine.POST(http_remote_literal_slice(HTTP_REMOTE_MANIFEST_QUERY_ROUTE), manifest_query_handler);
@@ -1394,7 +1415,9 @@ export fn http_remote_server_listen_loopback_repo(port: u16, repo_root: &[byte],
     uyagin_set_limits(&engine, limits);
 
     const runtime: &HttpRemoteRuntime = try http_remote_runtime_new(repo_root, default_branch, auth_token, limit_body_bytes);
-    http_remote_register_routes(&engine, runtime) catch |err| {
+    HTTP_REMOTE_ACTIVE_RUNTIME = runtime;
+    http_remote_register_routes(&engine) catch |err| {
+        HTTP_REMOTE_ACTIVE_RUNTIME = null;
         free(runtime as &void);
         return err;
     };
@@ -1412,6 +1435,9 @@ export fn http_remote_server_close(server: &HttpRemoteServer) void {
     }
     var http_server: HttpServer = server.listener.server;
     http_server_close(&http_server);
+    if HTTP_REMOTE_ACTIVE_RUNTIME == server.runtime {
+        HTTP_REMOTE_ACTIVE_RUNTIME = null;
+    }
     if server.runtime != null {
         free(server.runtime as &void);
         server.runtime = null;

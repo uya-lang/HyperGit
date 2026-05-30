@@ -1,0 +1,444 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.time.now_ms;
+
+use libc.fprintf;
+use libc.free;
+use libc.malloc;
+use libc.stderr;
+use core.ids.Hash32;
+use core.ids.ManifestId;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.query.ManifestLookupKind;
+use manifest.query.ManifestLookupResult;
+use manifest.query.manifest_lookup_path;
+use manifest.root.manifest_root_build_and_store;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.codec.decode_manifest_node_object;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use object.types.ManifestNodePayload;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+
+export const BENCH_MANIFEST_LOOKUP_USAGE_TEXT: &const byte =
+    "usage: bench_manifest_lookup <entry-count> <lookup-count> <objects-root>\n";
+
+const BENCH_GROUP_COUNT: usize = 20 as usize;
+const BENCH_ITERATIONS: usize = 3 as usize;
+const BENCH_LOOKUP_ARENA_BYTES: usize = 8388608 as usize;
+const BENCH_LOOKUP_MAX_DEPTH: usize = 32 as usize;
+
+error BenchLookupAlloc;
+error BenchLookupParse;
+error BenchLookupDepth;
+error BenchLookupUnexpectedResult;
+
+struct BenchLookupMeasure {
+    avg_ms: u64,
+    found: usize
+}
+
+fn bench_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn bench_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(bench_hash(seed));
+}
+
+fn bench_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(bench_object_id(seed));
+}
+
+fn bench_parse_usize(text: &byte) !usize {
+    if text == null || text[0] == 0 as byte {
+        return error.BenchLookupParse;
+    }
+
+    var value: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while text[i] != 0 as byte {
+        if text[i] < '0' as byte || text[i] > '9' as byte {
+            return error.BenchLookupParse;
+        }
+        value = value * 10 as usize + (text[i] - '0' as byte) as usize;
+        i = i + 1 as usize;
+    }
+    if value == 0 as usize {
+        return error.BenchLookupParse;
+    }
+    return value;
+}
+
+fn bench_group_count(total_entries: usize) usize {
+    if total_entries < BENCH_GROUP_COUNT {
+        return total_entries;
+    }
+    return BENCH_GROUP_COUNT;
+}
+
+fn bench_files_per_group(total_entries: usize, group_count: usize) usize {
+    return (total_entries + group_count - 1 as usize) / group_count;
+}
+
+fn bench_make_u32_decimal_fixed(raw: &byte, width: usize, value: usize) void {
+    var divisor: usize = 1 as usize;
+    var i: usize = 1 as usize;
+    while i < width {
+        divisor = divisor * 10 as usize;
+        i = i + 1 as usize;
+    }
+
+    i = 0 as usize;
+    while i < width {
+        raw[i] = ('0' as byte) + ((value / divisor) % 10 as usize) as byte;
+        if divisor > 1 as usize {
+            divisor = divisor / 10 as usize;
+        }
+        i = i + 1 as usize;
+    }
+}
+
+fn bench_make_path(arena: &Arena, total_entries: usize, index: usize) !ByteList {
+    const group_count: usize = bench_group_count(total_entries);
+    const files_per_group: usize = bench_files_per_group(total_entries, group_count);
+    const group_index: usize = index / files_per_group;
+    const file_index: usize = index % files_per_group;
+    const total_len: usize = 24 as usize;
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.BenchLookupAlloc;
+    }
+
+    raw[0] = 's' as byte;
+    raw[1] = 'r' as byte;
+    raw[2] = 'c' as byte;
+    raw[3] = '/' as byte;
+    raw[4] = 'p' as byte;
+    raw[5] = 'k' as byte;
+    raw[6] = 'g' as byte;
+    bench_make_u32_decimal_fixed(&raw[7], 2 as usize, group_index);
+    raw[9] = '/' as byte;
+    raw[10] = 'f' as byte;
+    raw[11] = 'i' as byte;
+    raw[12] = 'l' as byte;
+    raw[13] = 'e' as byte;
+    bench_make_u32_decimal_fixed(&raw[14], 6 as usize, file_index);
+    raw[20] = '.' as byte;
+    raw[21] = 't' as byte;
+    raw[22] = 'x' as byte;
+    raw[23] = 't' as byte;
+    return ByteList{ ptr: raw, len: total_len };
+}
+
+fn bench_make_missing_path(arena: &Arena, group_index: usize) !ByteList {
+    const total_len: usize = 24 as usize;
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.BenchLookupAlloc;
+    }
+
+    raw[0] = 's' as byte;
+    raw[1] = 'r' as byte;
+    raw[2] = 'c' as byte;
+    raw[3] = '/' as byte;
+    raw[4] = 'p' as byte;
+    raw[5] = 'k' as byte;
+    raw[6] = 'g' as byte;
+    bench_make_u32_decimal_fixed(&raw[7], 2 as usize, group_index);
+    raw[9] = '/' as byte;
+    raw[10] = 'f' as byte;
+    raw[11] = 'i' as byte;
+    raw[12] = 'l' as byte;
+    raw[13] = 'e' as byte;
+    bench_make_u32_decimal_fixed(&raw[14], 6 as usize, 999999 as usize);
+    raw[20] = '.' as byte;
+    raw[21] = 't' as byte;
+    raw[22] = 'x' as byte;
+    raw[23] = 't' as byte;
+    return ByteList{ ptr: raw, len: total_len };
+}
+
+fn bench_make_input(arena: &Arena, total_entries: usize, index: usize) !ManifestLeafInputEntry {
+    return ManifestLeafInputEntry{
+        path: try bench_make_path(arena, total_entries, index),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: bench_object_id((index % 200 as usize) as byte),
+        logical_size: index as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: bench_policy_id((index % 200 as usize) as byte + 20 as byte),
+    };
+}
+
+fn bench_decode_manifest_node(arena: &Arena, store: &LooseObjectStore, id: &ManifestId) !ManifestNodePayload {
+    const object_bytes: ObjectBytes = store.get(id.id, arena) catch {
+        return error.BenchLookupUnexpectedResult;
+    };
+    var offset: usize = 0 as usize;
+    return decode_manifest_node_object(arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
+        return error.BenchLookupUnexpectedResult;
+    };
+}
+
+fn bench_lookup_path_recursive(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    id: &ManifestId,
+    path: &ByteList,
+    depth: usize,
+) !bool {
+    if depth >= BENCH_LOOKUP_MAX_DEPTH {
+        return error.BenchLookupDepth;
+    }
+
+    const payload: ManifestNodePayload = try bench_decode_manifest_node(arena, store, id);
+    const lookup: ManifestLookupResult = manifest_lookup_path(&payload, path) catch {
+        return false;
+    };
+    if lookup.kind == ManifestLookupKind.Entry {
+        return true;
+    }
+    if lookup.kind == ManifestLookupKind.Missing {
+        return false;
+    }
+    return try bench_lookup_path_recursive(
+        arena,
+        store,
+        &payload.children.ptr[lookup.index].child_id,
+        path,
+        depth + 1 as usize,
+    );
+}
+
+fn bench_measure_lookups(
+    store: &LooseObjectStore,
+    root_id: &ManifestId,
+    paths: &ByteList,
+    path_count: usize,
+    expected_found: usize,
+) !BenchLookupMeasure {
+    const scratch_storage: &byte = malloc(BENCH_LOOKUP_ARENA_BYTES) as &byte;
+    if scratch_storage == null {
+        return error.BenchLookupAlloc;
+    }
+    defer {
+        free(scratch_storage as &void);
+    }
+
+    var total_ms: u64 = 0u64;
+    var found: usize = 0 as usize;
+    var iter: usize = 0 as usize;
+    while iter < BENCH_ITERATIONS {
+        found = 0 as usize;
+        const started_ms: u64 = now_ms() catch {
+            return error.BenchLookupParse;
+        };
+
+        var i: usize = 0 as usize;
+        while i < path_count {
+            var lookup_arena: Arena = Arena{ buffer: scratch_storage, size: 0, used: 0 };
+            arena_init(&lookup_arena, scratch_storage, BENCH_LOOKUP_ARENA_BYTES);
+            const hit: bool = try bench_lookup_path_recursive(
+                &lookup_arena,
+                store,
+                root_id,
+                &paths[i],
+                0 as usize,
+            );
+            if hit {
+                found = found + 1 as usize;
+            }
+            i = i + 1 as usize;
+        }
+
+        const finished_ms: u64 = now_ms() catch {
+            return error.BenchLookupParse;
+        };
+        if found != expected_found {
+            return error.BenchLookupUnexpectedResult;
+        }
+        total_ms = total_ms + (finished_ms - started_ms);
+        iter = iter + 1 as usize;
+    }
+    return BenchLookupMeasure{
+        avg_ms: total_ms / BENCH_ITERATIONS as u64,
+        found: found,
+    };
+}
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    if argc != 4 {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_LOOKUP_USAGE_TEXT);
+        return 1;
+    }
+
+    const total_entries: usize = bench_parse_usize(get_argv(1)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_LOOKUP_USAGE_TEXT);
+        return 1;
+    };
+    const lookup_count: usize = bench_parse_usize(get_argv(2)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_LOOKUP_USAGE_TEXT);
+        return 1;
+    };
+    const objects_root: &byte = get_argv(3);
+    if objects_root == null || objects_root[0] == 0 as byte {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_LOOKUP_USAGE_TEXT);
+        return 1;
+    }
+
+    const input_bytes: usize = @size_of(ManifestLeafInputEntry) as usize * total_entries +
+        @size_of(ByteList) as usize * lookup_count * 2 as usize +
+        total_entries * 64 as usize +
+        lookup_count * 64 as usize +
+        1048576 as usize;
+    const build_bytes: usize = @size_of(usize) as usize * total_entries * 4 as usize +
+        @size_of(ManifestLeafInputEntry) as usize * total_entries * 2 as usize +
+        total_entries * 96 as usize +
+        33554432 as usize;
+
+    const input_storage: &byte = malloc(input_bytes) as &byte;
+    if input_storage == null {
+        return 1;
+    }
+    defer {
+        free(input_storage as &void);
+    }
+    var input_arena: Arena = Arena{ buffer: input_storage, size: 0, used: 0 };
+    arena_init(&input_arena, input_storage, input_bytes);
+
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(
+        &input_arena,
+        @size_of(ManifestLeafInputEntry) as usize * total_entries,
+    ) as &ManifestLeafInputEntry;
+    if raw_inputs == null {
+        return 1;
+    }
+
+    var i: usize = 0 as usize;
+    while i < total_entries {
+        raw_inputs[i] = bench_make_input(&input_arena, total_entries, i) catch |err| {
+            fprintf(stderr, "input_build_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+        i = i + 1 as usize;
+    }
+
+    const hit_paths: &ByteList = arena_alloc(
+        &input_arena,
+        @size_of(ByteList) as usize * lookup_count,
+    ) as &ByteList;
+    if hit_paths == null {
+        return 1;
+    }
+    const miss_paths: &ByteList = arena_alloc(
+        &input_arena,
+        @size_of(ByteList) as usize * lookup_count,
+    ) as &ByteList;
+    if miss_paths == null {
+        return 1;
+    }
+
+    const group_count: usize = bench_group_count(total_entries);
+    i = 0 as usize;
+    while i < lookup_count {
+        const hit_index: usize = (i * 7919 as usize + 17 as usize) % total_entries;
+        hit_paths[i] = bench_make_path(&input_arena, total_entries, hit_index) catch |err| {
+            fprintf(stderr, "hit_path_build_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+        miss_paths[i] = bench_make_missing_path(&input_arena, i % group_count) catch |err| {
+            fprintf(stderr, "miss_path_build_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+        i = i + 1 as usize;
+    }
+
+    const build_storage: &byte = malloc(build_bytes) as &byte;
+    if build_storage == null {
+        return 1;
+    }
+    defer {
+        free(build_storage as &void);
+    }
+    var build_arena: Arena = Arena{ buffer: build_storage, size: 0, used: 0 };
+    arena_init(&build_arena, build_storage, build_bytes);
+
+    const store: LooseObjectStore = loose_store_open(objects_root) catch {
+        fprintf(stderr, "store_open_error\n" as *byte);
+        return 1;
+    };
+
+    const build_started_ms: u64 = now_ms() catch {
+        fprintf(stderr, "now_ms_start_error\n" as *byte);
+        return 1;
+    };
+    const root_id: ManifestId = manifest_root_build_and_store(
+        &build_arena,
+        &store,
+        manifest_leaf_input_list_from_slice(raw_inputs[0: total_entries]),
+    ) catch |err| {
+        fprintf(stderr, "manifest_store_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const build_finished_ms: u64 = now_ms() catch {
+        fprintf(stderr, "now_ms_finish_error\n" as *byte);
+        return 1;
+    };
+
+    const hit_measure: BenchLookupMeasure = bench_measure_lookups(
+        &store,
+        &root_id,
+        hit_paths,
+        lookup_count,
+        lookup_count,
+    ) catch |err| {
+        fprintf(stderr, "hit_lookup_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const miss_measure: BenchLookupMeasure = bench_measure_lookups(
+        &store,
+        &root_id,
+        miss_paths,
+        lookup_count,
+        0 as usize,
+    ) catch |err| {
+        fprintf(stderr, "miss_lookup_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    const hit_us_per_lookup: u64 = (hit_measure.avg_ms * 1000u64) / lookup_count as u64;
+    const miss_us_per_lookup: u64 = (miss_measure.avg_ms * 1000u64) / lookup_count as u64;
+
+    fprintf(
+        stderr,
+        "entries=%llu lookups=%llu build_ms=%llu hit_avg_ms=%llu hit_us_per_lookup=%llu hit_found=%llu miss_avg_ms=%llu miss_us_per_lookup=%llu miss_found=%llu\n" as *byte,
+        total_entries as u64,
+        lookup_count as u64,
+        build_finished_ms - build_started_ms,
+        hit_measure.avg_ms,
+        hit_us_per_lookup,
+        hit_measure.found as u64,
+        miss_measure.avg_ms,
+        miss_us_per_lookup,
+        miss_measure.found as u64,
+    );
+    return 0;
+}

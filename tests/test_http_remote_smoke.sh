@@ -33,6 +33,12 @@ run_once() {
   RUN_PID=$!
 }
 
+stop_server() {
+  local pid="$1"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 port="$(free_port)"
 run_once "$port" "secret-token" "65536"
 pid="$RUN_PID"
@@ -40,7 +46,7 @@ trap 'kill "$pid" 2>/dev/null || true' EXIT
 sleep 0.2
 code="$(curl -sS -o "$TEST_ROOT/unauthorized.out" -w '%{http_code}' "http://127.0.0.1:${port}/capabilities")"
 test "$code" = "401"
-wait "$pid"
+stop_server "$pid"
 trap - EXIT
 
 port="$(free_port)"
@@ -52,7 +58,7 @@ code="$(curl -sS -H 'Authorization: Bearer secret-token' -o "$TEST_ROOT/capabili
 test "$code" = "200"
 rg -q '"service":"hypergit-http-remote"' "$TEST_ROOT/capabilities.json"
 rg -q '"auth_required":true' "$TEST_ROOT/capabilities.json"
-wait "$pid"
+stop_server "$pid"
 trap - EXIT
 
 port="$(free_port)"
@@ -63,5 +69,5 @@ sleep 0.2
 printf '0123456789abcdef' > "$TEST_ROOT/oversized.body"
 code="$(curl -sS -H 'Authorization: Bearer secret-token' -H 'Content-Type: application/octet-stream' --data-binary @"$TEST_ROOT/oversized.body" -o "$TEST_ROOT/oversized.out" -w '%{http_code}' "http://127.0.0.1:${port}/objects/batch")"
 test "$code" = "413"
-wait "$pid"
+stop_server "$pid"
 trap - EXIT

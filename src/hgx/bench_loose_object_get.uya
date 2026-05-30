@@ -1,0 +1,220 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.time.now_ms;
+
+use libc.fprintf;
+use libc.free;
+use libc.malloc;
+use libc.stderr;
+use core.ids.ObjectId;
+use object.types.ObjectKind;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+
+export const BENCH_LOOSE_OBJECT_GET_USAGE_TEXT: &const byte =
+    "usage: bench_loose_object_get <object-count> <get-count> <payload-bytes> <objects-root>\n";
+
+const BENCH_ITERATIONS: usize = 3 as usize;
+const BENCH_GET_ARENA_BYTES: usize = 1048576 as usize;
+
+error BenchLooseGetAlloc;
+error BenchLooseGetParse;
+error BenchLooseGetUnexpectedResult;
+
+struct BenchLooseGetMeasure {
+    avg_ms: u64,
+    sink: u64
+}
+
+fn bench_parse_usize(text: &byte) !usize {
+    if text == null || text[0] == 0 as byte {
+        return error.BenchLooseGetParse;
+    }
+
+    var value: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while text[i] != 0 as byte {
+        if text[i] < '0' as byte || text[i] > '9' as byte {
+            return error.BenchLooseGetParse;
+        }
+        value = value * 10 as usize + (text[i] - '0' as byte) as usize;
+        i = i + 1 as usize;
+    }
+    if value == 0 as usize {
+        return error.BenchLooseGetParse;
+    }
+    return value;
+}
+
+fn bench_fill_payload(payload: &byte, len: usize, index: usize) void {
+    var i: usize = 0 as usize;
+    while i < len {
+        payload[i] = ((index * 131 as usize + i * 17 as usize) % 251 as usize) as byte;
+        i = i + 1 as usize;
+    }
+    if len > 0 as usize {
+        payload[0] = (index % 251 as usize) as byte;
+    }
+    if len > 1 as usize {
+        payload[1] = ((index / 251 as usize) % 251 as usize) as byte;
+    }
+    if len > 2 as usize {
+        payload[2] = ((index / (251 as usize * 251 as usize)) % 251 as usize) as byte;
+    }
+    if len > 3 as usize {
+        payload[3] = ((index / (251 as usize * 251 as usize * 251 as usize)) % 251 as usize) as byte;
+    }
+}
+
+fn bench_write_objects(
+    store: &LooseObjectStore,
+    ids: &ObjectId,
+    object_count: usize,
+    payload: &byte,
+    payload_bytes: usize,
+) !u64 {
+    const started_ms: u64 = now_ms() catch {
+        return error.BenchLooseGetParse;
+    };
+    var i: usize = 0 as usize;
+    while i < object_count {
+        bench_fill_payload(payload, payload_bytes, i);
+        ids[i] = store.put(ObjectKind.SmallBlob, payload[0: payload_bytes]) catch {
+            return error.BenchLooseGetUnexpectedResult;
+        };
+        i = i + 1 as usize;
+    }
+    const finished_ms: u64 = now_ms() catch {
+        return error.BenchLooseGetParse;
+    };
+    return finished_ms - started_ms;
+}
+
+fn bench_measure_get(
+    store: &LooseObjectStore,
+    ids: &ObjectId,
+    object_count: usize,
+    get_count: usize,
+    expected_min_len: usize,
+) !BenchLooseGetMeasure {
+    const scratch_storage: &byte = malloc(BENCH_GET_ARENA_BYTES) as &byte;
+    if scratch_storage == null {
+        return error.BenchLooseGetAlloc;
+    }
+    defer {
+        free(scratch_storage as &void);
+    }
+
+    var total_ms: u64 = 0u64;
+    var sink: u64 = 0u64;
+    var iter: usize = 0 as usize;
+    while iter < BENCH_ITERATIONS {
+        sink = 0u64;
+        const started_ms: u64 = now_ms() catch {
+            return error.BenchLooseGetParse;
+        };
+        var i: usize = 0 as usize;
+        while i < get_count {
+            var get_arena: Arena = Arena{ buffer: scratch_storage, size: 0, used: 0 };
+            arena_init(&get_arena, scratch_storage, BENCH_GET_ARENA_BYTES);
+
+            const object_index: usize = (i * 7919 as usize + 11 as usize) % object_count;
+            const bytes: ObjectBytes = store.get(ids[object_index], &get_arena) catch {
+                return error.BenchLooseGetUnexpectedResult;
+            };
+            if bytes.bytes.len < expected_min_len {
+                return error.BenchLooseGetUnexpectedResult;
+            }
+            sink = sink + bytes.bytes.len as u64 + bytes.bytes.ptr[0] as u64;
+            i = i + 1 as usize;
+        }
+        const finished_ms: u64 = now_ms() catch {
+            return error.BenchLooseGetParse;
+        };
+        total_ms = total_ms + (finished_ms - started_ms);
+        iter = iter + 1 as usize;
+    }
+    return BenchLooseGetMeasure{ avg_ms: total_ms / BENCH_ITERATIONS as u64, sink: sink };
+}
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    if argc != 5 {
+        fprintf(stderr, "%s" as *byte, BENCH_LOOSE_OBJECT_GET_USAGE_TEXT);
+        return 1;
+    }
+
+    const object_count: usize = bench_parse_usize(get_argv(1)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_LOOSE_OBJECT_GET_USAGE_TEXT);
+        return 1;
+    };
+    const get_count: usize = bench_parse_usize(get_argv(2)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_LOOSE_OBJECT_GET_USAGE_TEXT);
+        return 1;
+    };
+    const payload_bytes: usize = bench_parse_usize(get_argv(3)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_LOOSE_OBJECT_GET_USAGE_TEXT);
+        return 1;
+    };
+    const objects_root: &byte = get_argv(4);
+    if objects_root == null || objects_root[0] == 0 as byte {
+        fprintf(stderr, "%s" as *byte, BENCH_LOOSE_OBJECT_GET_USAGE_TEXT);
+        return 1;
+    }
+    if payload_bytes + 1024 as usize > BENCH_GET_ARENA_BYTES {
+        fprintf(stderr, "payload_too_large\n" as *byte);
+        return 1;
+    }
+
+    const ids: &ObjectId = malloc(@size_of(ObjectId) as usize * object_count) as &ObjectId;
+    if ids == null {
+        return 1;
+    }
+    defer {
+        free(ids as &void);
+    }
+
+    const payload: &byte = malloc(payload_bytes) as &byte;
+    if payload == null {
+        return 1;
+    }
+    defer {
+        free(payload as &void);
+    }
+
+    const store: LooseObjectStore = loose_store_open(objects_root) catch {
+        fprintf(stderr, "store_open_error\n" as *byte);
+        return 1;
+    };
+    const write_ms: u64 = bench_write_objects(&store, ids, object_count, payload, payload_bytes) catch |err| {
+        fprintf(stderr, "write_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const get_measure: BenchLooseGetMeasure = bench_measure_get(
+        &store,
+        ids,
+        object_count,
+        get_count,
+        payload_bytes,
+    ) catch |err| {
+        fprintf(stderr, "get_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    const get_us_per_op: u64 = (get_measure.avg_ms * 1000u64) / get_count as u64;
+    fprintf(
+        stderr,
+        "objects=%llu gets=%llu payload_bytes=%llu write_ms=%llu get_avg_ms=%llu get_us_per_op=%llu sink=%llu\n" as *byte,
+        object_count as u64,
+        get_count as u64,
+        payload_bytes as u64,
+        write_ms,
+        get_measure.avg_ms,
+        get_us_per_op,
+        get_measure.sink,
+    );
+    return 0;
+}

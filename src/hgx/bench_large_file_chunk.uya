@@ -1,0 +1,213 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.time.now_ms;
+
+use libc.fprintf;
+use libc.free;
+use libc.malloc;
+use libc.stderr;
+use large.chunker.LargeChunkList;
+use large.chunker.cdc_chunk_bytes_default;
+use large.prepare.LargePreparedChunkedBlob;
+use large.prepare.large_prepare_recommended_arena_bytes;
+use large.prepare.prepare_chunked_blob_repository_with_workers;
+use object.types.FileType;
+
+export const BENCH_LARGE_FILE_CHUNK_USAGE_TEXT: &const byte =
+    "usage: bench_large_file_chunk <payload-bytes> <iterations> <workers>\n";
+
+error BenchLargeChunkAlloc;
+error BenchLargeChunkParse;
+error BenchLargeChunkUnexpectedResult;
+
+struct BenchLargeChunkMeasure {
+    avg_ms: u64,
+    chunks: usize,
+    sink: u64
+}
+
+fn bench_parse_usize(text: &byte) !usize {
+    if text == null || text[0] == 0 as byte {
+        return error.BenchLargeChunkParse;
+    }
+
+    var value: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while text[i] != 0 as byte {
+        if text[i] < '0' as byte || text[i] > '9' as byte {
+            return error.BenchLargeChunkParse;
+        }
+        value = value * 10 as usize + (text[i] - '0' as byte) as usize;
+        i = i + 1 as usize;
+    }
+    if value == 0 as usize {
+        return error.BenchLargeChunkParse;
+    }
+    return value;
+}
+
+fn bench_parse_i32(text: &byte) !i32 {
+    const value: usize = try bench_parse_usize(text);
+    if value > 2147483647 as usize {
+        return error.BenchLargeChunkParse;
+    }
+    return value as i32;
+}
+
+fn fill_payload_randomish(payload: &byte, len: usize) void {
+    var state: u64 = 0x123456789abcdef0u64;
+    var i: usize = 0 as usize;
+    while i < len {
+        state = state ^ (state << 13);
+        state = state ^ (state >> 7);
+        state = state ^ (state << 17);
+        payload[i] = (state & 255u64) as byte;
+        i = i + 1 as usize;
+    }
+}
+
+fn bench_measure_chunk(payload: &[byte], iterations: usize, arena_bytes: usize) !BenchLargeChunkMeasure {
+    const scratch: &byte = malloc(arena_bytes) as &byte;
+    if scratch == null {
+        return error.BenchLargeChunkAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+
+    var total_ms: u64 = 0u64;
+    var chunks_len: usize = 0 as usize;
+    var sink: u64 = 0u64;
+    var iter: usize = 0 as usize;
+    while iter < iterations {
+        var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+        arena_init(&arena, scratch, arena_bytes);
+        const started_ms: u64 = now_ms() catch {
+            return error.BenchLargeChunkParse;
+        };
+        const chunks: LargeChunkList = cdc_chunk_bytes_default(&arena, payload) catch {
+            return error.BenchLargeChunkUnexpectedResult;
+        };
+        const finished_ms: u64 = now_ms() catch {
+            return error.BenchLargeChunkParse;
+        };
+        if chunks.len == 0 as usize {
+            return error.BenchLargeChunkUnexpectedResult;
+        }
+        chunks_len = chunks.len;
+        sink = sink + chunks.len as u64 + chunks.ptr[chunks.len - 1 as usize].logical_size as u64;
+        total_ms = total_ms + (finished_ms - started_ms);
+        iter = iter + 1 as usize;
+    }
+    return BenchLargeChunkMeasure{ avg_ms: total_ms / iterations as u64, chunks: chunks_len, sink: sink };
+}
+
+fn bench_measure_prepare(payload: &[byte], iterations: usize, arena_bytes: usize, workers: i32) !BenchLargeChunkMeasure {
+    const scratch: &byte = malloc(arena_bytes) as &byte;
+    if scratch == null {
+        return error.BenchLargeChunkAlloc;
+    }
+    defer {
+        free(scratch as &void);
+    }
+
+    var total_ms: u64 = 0u64;
+    var chunks_len: usize = 0 as usize;
+    var sink: u64 = 0u64;
+    var iter: usize = 0 as usize;
+    while iter < iterations {
+        var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
+        arena_init(&arena, scratch, arena_bytes);
+        const started_ms: u64 = now_ms() catch {
+            return error.BenchLargeChunkParse;
+        };
+        const prepared: LargePreparedChunkedBlob = prepare_chunked_blob_repository_with_workers(
+            &arena,
+            payload,
+            FileType.Binary,
+            workers,
+        ) catch {
+            return error.BenchLargeChunkUnexpectedResult;
+        };
+        const finished_ms: u64 = now_ms() catch {
+            return error.BenchLargeChunkParse;
+        };
+        if prepared.chunks.len == 0 as usize || prepared.parts.len != prepared.chunks.len {
+            return error.BenchLargeChunkUnexpectedResult;
+        }
+        chunks_len = prepared.chunks.len;
+        sink = sink + prepared.parts.len as u64 + prepared.payload.chunk_count as u64;
+        total_ms = total_ms + (finished_ms - started_ms);
+        iter = iter + 1 as usize;
+    }
+    return BenchLargeChunkMeasure{ avg_ms: total_ms / iterations as u64, chunks: chunks_len, sink: sink };
+}
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    if argc != 4 {
+        fprintf(stderr, "%s" as *byte, BENCH_LARGE_FILE_CHUNK_USAGE_TEXT);
+        return 1;
+    }
+
+    const payload_bytes: usize = bench_parse_usize(get_argv(1)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_LARGE_FILE_CHUNK_USAGE_TEXT);
+        return 1;
+    };
+    const iterations: usize = bench_parse_usize(get_argv(2)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_LARGE_FILE_CHUNK_USAGE_TEXT);
+        return 1;
+    };
+    const workers: i32 = bench_parse_i32(get_argv(3)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_LARGE_FILE_CHUNK_USAGE_TEXT);
+        return 1;
+    };
+
+    const payload: &byte = malloc(payload_bytes) as &byte;
+    if payload == null {
+        return 1;
+    }
+    defer {
+        free(payload as &void);
+    }
+    fill_payload_randomish(payload, payload_bytes);
+
+    const arena_bytes: usize = large_prepare_recommended_arena_bytes(payload_bytes as u64) catch {
+        fprintf(stderr, "arena_size_error\n" as *byte);
+        return 1;
+    };
+    const chunk_measure: BenchLargeChunkMeasure = bench_measure_chunk(
+        payload[0: payload_bytes],
+        iterations,
+        arena_bytes,
+    ) catch |err| {
+        fprintf(stderr, "chunk_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const prepare_measure: BenchLargeChunkMeasure = bench_measure_prepare(
+        payload[0: payload_bytes],
+        iterations,
+        arena_bytes,
+        workers,
+    ) catch |err| {
+        fprintf(stderr, "prepare_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    fprintf(
+        stderr,
+        "payload_bytes=%llu iterations=%llu workers=%d arena_bytes=%llu chunk_avg_ms=%llu prepare_avg_ms=%llu chunks=%llu chunk_sink=%llu prepare_sink=%llu\n" as *byte,
+        payload_bytes as u64,
+        iterations as u64,
+        workers,
+        arena_bytes as u64,
+        chunk_measure.avg_ms,
+        prepare_measure.avg_ms,
+        prepare_measure.chunks as u64,
+        chunk_measure.sink,
+        prepare_measure.sink,
+    );
+    return 0;
+}

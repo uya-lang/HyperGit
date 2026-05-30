@@ -14,6 +14,21 @@
 为防止这些模式回归，仓库现在有显式回归测试 `src/hypergit/test_compiler_regressions.uya`，并已接入 `Makefile test`。
 本次复验中，`~/uya/uya/bin/uya test src/hypergit/test_compiler_regressions.uya` 也通过，4 个场景全部为 `OK`，其中包含 `error enum wrapper` 重包错误联合的历史回归。
 
+## Array field copy in a struct literal generates a pointer-to-byte initializer
+
+- Current status (2026-05-30): 当前仍可复现。C99 smoke 过程中，`src/hgx/commands/diff.uya` 原本使用 `Hash32{ bytes: id.bytes }` 克隆数组字段，C 后端生成 `bytes = id->bytes`，宿主 C 编译器报警。项目代码已改为显式逐字节复制以规避该问题。
+- Trigger command: `~/uya/uya/bin/uya build docs/repros/uya_array_field_copy_generates_pointer_initializer.uya -o /tmp/uya_array_field_copy_generates_pointer_initializer && /tmp/uya_array_field_copy_generates_pointer_initializer; echo $?`
+- Expected behavior: build has no C warning, and the program exits `0` because both copied bytes match the source hash.
+- Actual behavior: generated C initializes the first byte of the fixed array from a pointer expression, emits `-Wint-conversion`, and the program exits non-zero.
+
+Error excerpt:
+
+```text
+warning: initialization of 'unsigned char' from 'uint8_t *' {aka 'unsigned char *'} makes integer from pointer without a cast [-Wint-conversion]
+```
+
+Minimal reproduction file: [docs/repros/uya_array_field_copy_generates_pointer_initializer.uya](/media/winger/_dde_data/winger/uya/HyperGit/docs/repros/uya_array_field_copy_generates_pointer_initializer.uya)
+
 ## Generic wrapper around `async_compute<T>` fails to link
 
 - Current status (2026-05-29): 不再复现。`docs/repros/uya_async_compute_generic_wrapper.uya` 在 `v0.9.7` 下可直接构建成功。
@@ -172,6 +187,58 @@ export fn main() i32 {
         return 1;
     };
     _ = engine.run_shards(&listener) catch {
+        return 1;
+    };
+    return 0;
+}
+```
+
+## `Engine.GET_T<T>` typed route registration generates invalid C
+
+- Current status (2026-05-30): 当前仍可复现。HyperGit HTTP remote smoke test 修复过程中尝试用 `engine.GET_T<HttpRemoteCapabilitiesHandler>(...)` / `POST_T<...>(...)` 避免 handler interface 生命周期问题，C99 后端生成未实例化的 `uya_Engine_add_typed_H` 调用，宿主 C 编译失败。
+- Trigger command: `~/uya/uya/bin/uya build docs/repros/uya_uyagin_typed_route_generic_invalid_c.uya -o /tmp/uya_uyagin_typed_route_generic_invalid_c`
+- Expected behavior: build succeeds, because `GET_T<TypedHandler>` should monomorphize through `Engine.add_typed<TypedHandler>` and store the typed handler in the route.
+- Actual behavior: generated `std/http/uyagin.c` references `uya_Engine_add_typed_H`, then fails with `implicit declaration of function` and `invalid initializer`.
+
+Error excerpt:
+
+```text
+home/winger/uya/uya/lib/std/http/uyagin.c:1392:52: warning: implicit declaration of function 'uya_Engine_add_typed_H'
+home/winger/uya/uya/lib/std/http/uyagin.c:1392:52: error: invalid initializer
+错误：make 链接失败，返回码：512
+```
+
+Minimal reproduction file: [docs/repros/uya_uyagin_typed_route_generic_invalid_c.uya](/media/winger/_dde_data/winger/uya/HyperGit/docs/repros/uya_uyagin_typed_route_generic_invalid_c.uya)
+
+```uya
+use std.runtime.entry;
+use std.async.Future;
+use std.http.types.Status;
+use std.http.uyagin.AsyncHandler;
+use std.http.uyagin.Engine;
+use std.http.uyagin.GinContext;
+use std.http.uyagin.uyagin_new;
+use std.string.strlen;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+struct TypedHandler : AsyncHandler {
+    @async_fn
+    fn handle(self: &Self, ctx: &GinContext) Future<!i32> {
+        return try @await ctx.string(Status.OK, "ok\n");
+    }
+}
+
+fn register_route(engine: &Engine, handler: &TypedHandler) !void {
+    try engine.GET_T<TypedHandler>(literal_bytes("/ok"), handler);
+}
+
+export fn main() i32 {
+    var engine: Engine = uyagin_new();
+    const handler: TypedHandler = TypedHandler{};
+    register_route(&engine, &handler) catch {
         return 1;
     };
     return 0;

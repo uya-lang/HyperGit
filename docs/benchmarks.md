@@ -82,3 +82,223 @@ Notes:
 - End-to-end absolute `hgx add` timings on this host were noisy during this session because another long-running `hgx add .` process was competing for CPU, so the isolated hot-path benchmark is the most trustworthy measurement from this run.
 - Manual end-to-end validation still covered the actual command behavior: exact-file delete staging, directory delete staging, and single-file pathspec add without traversing unrelated/unreadable directories.
 - Repeated runs on this host varied by a few milliseconds, so the table should be read as representative sample data rather than a hard constant.
+
+## 2026-05-30 Manifest Lookup
+
+This run measures recursive point lookup through a stored synthetic manifest.
+Each lookup decodes the root node, follows child ranges as needed, and checks
+the final leaf with `manifest_lookup_path`.
+
+Command:
+
+```bash
+bash bench/bench_manifest_lookup.sh 100000 2000
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+
+Results:
+
+| entries | lookups | build_ms | hit_avg_ms | hit_us_per_lookup | hit_found | miss_avg_ms | miss_us_per_lookup | miss_found |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100000 | 2000 | 320 | 2987 | 1493 | 2000 | 4478 | 2239 | 0 |
+
+Takeaways:
+
+- The benchmark now covers both exact hits and same-directory missing paths,
+  so lookup cost includes the recursive manifest node decode and final leaf
+  search rather than only in-memory path comparison.
+- Misses are slower in this sample because they still descend into candidate
+  child ranges before confirming absence at the leaf.
+
+## 2026-05-30 Manifest Diff
+
+This run measures the flat manifest diff path used by `hgx diff`. The synthetic
+inputs are split across 20 top-level directories, with every 100th entry
+modified on the right side.
+
+Command:
+
+```bash
+bash bench/bench_manifest_diff.sh 100000 100 4
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+
+Results:
+
+| entries | change_stride | workers | changed | serial_avg_ms | parallel_avg_ms | pathspec_avg_ms | pathspec_changed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100000 | 100 | 4 | 1000 | 58 | 148 | 93 | 50 |
+
+Takeaways:
+
+- For this 100k-entry synthetic workload, serial flat diff is faster than the
+  current parallel helper; thread-pool setup and the parallel two-pass count
+  appear to dominate at this size.
+- Pathspec-filtered parallel diff correctly limits output to the target
+  top-level directory, but still scans enough structure that it is slower than
+  the full serial run in this sample.
+
+## 2026-05-30 Loose Object Get
+
+This run writes a temporary loose object set, then measures repeated hot
+`LooseObjectStore.get` calls. Each get rebuilds the loose object path, reads the
+encoded object, decodes the envelope, and verifies the object hash.
+
+Command:
+
+```bash
+bash bench/bench_loose_object_get.sh 5000 50000 128
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+
+Results:
+
+| objects | gets | payload_bytes | write_ms | get_avg_ms | get_us_per_op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 5000 | 50000 | 128 | 205 | 781 | 15 |
+
+Takeaways:
+
+- Hot loose-object reads averaged about 15 us per get for 128-byte payloads on
+  this host.
+- The measured get path includes integrity verification, so this is not just
+  filesystem cache read latency.
+
+## 2026-05-30 Segment Pack Lookup
+
+This run writes a temporary segment pack and measures repeated
+`segment_pack_index_lookup` calls. The current lookup API reads and validates
+the index sidecar and verifies the pack cross-reference on each lookup.
+
+Command:
+
+```bash
+bash bench/bench_segment_pack_lookup.sh 2000 2000 128
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+
+Results:
+
+| objects | lookups | payload_bytes | prepare_ms | pack_bytes | index_bytes | lookup_avg_ms | lookup_us_per_op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2000 | 2000 | 128 | 237 | 452112 | 128120 | 3779 | 1889 |
+
+Takeaways:
+
+- Segment pack lookup currently measures as a validated lookup rather than a
+  cached in-memory index probe; each operation averaged about 1.9 ms here.
+- The result gives a useful baseline for deciding whether to add a reusable
+  decoded index/snapshot lookup path later.
+
+## 2026-05-30 Small File Commit
+
+This run measures an end-to-end first commit of many small files in a temporary
+repo. The script records file generation separately from `hgx add` and
+`hgx commit`.
+
+Command:
+
+```bash
+bash bench/bench_small_file_commit.sh 1000 32
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+
+Results:
+
+| files | payload_bytes | write_ms | add_ms | commit_ms |
+| --- | ---: | ---: | ---: | ---: |
+| 1000 | 32 | 117 | 24 | 11 |
+
+Takeaways:
+
+- First commit of 1000 already-staged 32-byte files completed in 11 ms on this
+  run.
+- The add phase remains the larger part of this small-file workflow at this
+  size, mostly from scanning, hashing and staging the files.
+
+## 2026-05-30 Large File Chunk
+
+This run measures the large-file content-defined chunking path separately from
+full chunked-blob prepare. The prepare step includes chunking plus per-chunk
+hash/reference construction.
+
+Command:
+
+```bash
+bash bench/bench_large_file_chunk.sh 33554432 2 2
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+
+Results:
+
+| payload_bytes | iterations | workers | arena_bytes | chunks | chunk_avg_ms | prepare_avg_ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 33554432 | 2 | 2 | 33652736 | 7 | 1335 | 1458 |
+
+Takeaways:
+
+- CDC chunking is the dominant portion of the 32MiB prepare path in this
+  sample.
+- The randomish payload produced 7 content-defined chunks, so this run covers
+  multi-chunk hashing and manifest reference construction as well as scanning.
+
+## 2026-05-30 Hydrate
+
+This run measures restoring materialized files from the object store after a
+successful `hgx dehydrate <pathspec>`. The temporary repo starts from a first
+commit of 1000 small files.
+
+Command:
+
+```bash
+bash bench/bench_hydrate.sh 1000 32
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+
+Results:
+
+| files | payload_bytes | dehydrate_ms | hydrate_ms |
+| --- | ---: | ---: | ---: |
+| 1000 | 32 | 205 | 280 |
+
+Takeaways:
+
+- Hydrating 1000 small files took 280 ms in this end-to-end sample, including
+  local state reconciliation and writing file contents.
+- Dehydrate is somewhat cheaper here because it deletes materialized files and
+  updates virtual state rather than reading and writing object payloads.

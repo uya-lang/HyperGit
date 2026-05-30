@@ -167,6 +167,16 @@ struct DiffChunkUnitList {
     len: usize
 }
 
+fn diff_hash32_clone(source: &Hash32) Hash32 {
+    var out: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0;
+    while i < 32 as usize {
+        out.bytes[i] = source.bytes[i];
+        i = i + 1 as usize;
+    }
+    return out;
+}
+
 struct DiffChunkSummary {
     reused: u64,
     added: u64,
@@ -859,7 +869,7 @@ fn diff_chunk_units_from_single(arena: &Arena, id: &Hash32, logical_size: u64) !
         return error.DiffAlloc;
     }
     raw[0] = DiffChunkUnit{
-        id: Hash32{ bytes: id.bytes },
+        id: diff_hash32_clone(id),
         logical_size: logical_size,
     };
     return DiffChunkUnitList{ ptr: raw, len: 1 as usize };
@@ -878,7 +888,7 @@ fn diff_chunk_units_from_chunked_payload(arena: &Arena, payload: &ChunkedBlobPay
     var i: usize = 0;
     while i < payload.chunks.len {
         raw[i] = DiffChunkUnit{
-            id: Hash32{ bytes: payload.chunks.ptr[i].logical_chunk_id.bytes },
+            id: diff_hash32_clone(&payload.chunks.ptr[i].logical_chunk_id),
             logical_size: payload.chunks.ptr[i].logical_size as u64,
         };
         i = i + 1 as usize;

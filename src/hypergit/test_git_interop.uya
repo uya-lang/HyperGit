@@ -11,19 +11,31 @@ use std.io.file.FILE;
 use std.io.file.fclose;
 use std.io.file.fopen;
 use std.io.file.fread;
+use std.io.file.fwrite;
 
 use libc.Stat;
 use libc.stat;
 use libc.system;
+use core.ids.CommitId;
 use core.ids.ManifestId;
 use core.ids.ObjectId;
+use core.ids.commit_id_compare;
+use core.ids.manifest_id_compare;
+use git.interop.GitCommitImportPrototype;
 use git.interop.GitLooseBlobPrototype;
+use git.interop.GitTreeExportPrototype;
+use git.interop.git_import_commit_prototype;
 use git.interop.git_import_loose_blob_as_small_blob_prototype;
 use git.interop.git_read_loose_blob_prototype;
 use git.interop.git_tree_to_manifest_entries_prototype;
 use git.interop.git_tree_to_manifest_prototype;
+use git.interop.hypergit_manifest_to_git_tree_prototype;
 use git.interop.GitTreeEntryPrototypeList;
+use manifest.load.manifest_load_flatten;
+use manifest.trie.ManifestLeafInputList;
+use object.codec.decode_commit_object;
 use object.codec.decode_small_blob_object;
+use object.types.CommitPayload;
 use object.types.EntryKind;
 use object.types.SmallBlobPayload;
 use store.loose_store.LooseObjectStore;
@@ -48,6 +60,17 @@ fn read_file_bytes(arena: &Arena, path: &const byte) !&[byte] {
     }
     try expect(fread(out.ptr, 1 as usize, size, stream) == size);
     return out;
+}
+
+fn write_file_bytes(path: &const byte, bytes: &[byte]) !void {
+    const stream: &FILE = fopen(path, "w");
+    try expect(stream != null);
+    defer {
+        _ = fclose(stream);
+    }
+    if bytes.len > 0 as usize {
+        try expect(fwrite(bytes.ptr as &const byte, 1 as usize, bytes.len, stream) == bytes.len);
+    }
 }
 
 fn trim_newline(slice: &[byte]) &[byte] {
@@ -111,9 +134,117 @@ fn test_git_tree_to_manifest_prototype_imports_paths_and_modes() !void {
     try expect(try store.has(manifest_id.id));
 }
 
+fn test_git_commit_to_hypergit_commit_prototype_imports_history() !void {
+    try expect(system("rm -rf build/git-interop-commit && mkdir -p build/git-interop-commit/repo build/git-interop-commit/hgit/objects/loose && cd build/git-interop-commit/repo && git init >/dev/null 2>&1 && printf one > file.txt && git add file.txt >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000000 +0000' GIT_COMMITTER_DATE='1700000001 +0000' git -c user.name=Alice -c user.email=alice@example.com commit -m first >/dev/null 2>&1 && printf two > file.txt && mkdir -p src && printf child > src/child.txt && git add file.txt src/child.txt >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000100 +0000' GIT_COMMITTER_DATE='1700000101 +0000' git -c user.name=Bob -c user.email=bob@example.com commit -m second >/dev/null 2>&1 && git rev-parse HEAD > ../head.txt") == 0);
+
+    var arena_buf: [byte: 131072] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 131072 as usize);
+
+    const head_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-commit/head.txt");
+    const head_hex: &[byte] = trim_newline(head_file);
+    const store: LooseObjectStore = try loose_store_open("build/git-interop-commit/hgit/objects/loose");
+
+    const imported: GitCommitImportPrototype = try git_import_commit_prototype(&arena, &store, literal_bytes("build/git-interop-commit/repo/.git"), head_hex);
+    try expect(imported.generation == 2u64);
+    try expect(try store.has(imported.commit_id.id));
+    try expect(try store.has(imported.manifest_root.id));
+
+    var read_arena_buf: [byte: 65536] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 65536 as usize);
+
+    const object_bytes: ObjectBytes = try store.get(imported.commit_id.id, &read_arena);
+    var offset: usize = 0 as usize;
+    const payload: CommitPayload = try decode_commit_object(&read_arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    try expect(offset == object_bytes.bytes.len);
+    try expect(payload.parents.len == 1 as usize);
+    const parent_id: CommitId = payload.parents.ptr[0];
+    try expect(try store.has(parent_id.id));
+    try expect(commit_id_compare(&parent_id, &imported.commit_id) != 0);
+    try expect(manifest_id_compare(&payload.manifest_root, &imported.manifest_root) == 0);
+    try expect(payload.generation == 2u64);
+    try expect(payload.timestamp_ms == 1700000100000i64);
+    try expect_byte_slice_eq(payload.author.name.ptr[0: payload.author.name.len], literal_bytes("Bob"));
+    try expect_byte_slice_eq(payload.author.email.ptr[0: payload.author.email.len], literal_bytes("bob@example.com"));
+    try expect_byte_slice_eq(payload.committer.name.ptr[0: payload.committer.name.len], literal_bytes("Bob"));
+    try expect_byte_slice_eq(payload.message.ptr[0: payload.message.len], literal_bytes("second\n"));
+}
+
+fn test_hypergit_manifest_to_git_tree_prototype_exports_tree() !void {
+    try expect(system("rm -rf build/git-interop-export && mkdir -p build/git-interop-export/source build/git-interop-export/export build/git-interop-export/hgit/objects/loose && cd build/git-interop-export/source && git init >/dev/null 2>&1 && mkdir -p src && printf tree-main > src/main.txt && printf '#!/bin/sh\\necho hi\\n' > run.sh && chmod +x run.sh && git add src/main.txt run.sh >/dev/null 2>&1 && git write-tree > ../tree.txt && cd ../export && git init >/dev/null 2>&1") == 0);
+
+    var arena_buf: [byte: 131072] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 131072 as usize);
+
+    const tree_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-export/tree.txt");
+    const source_tree_hex: &[byte] = trim_newline(tree_file);
+    const store: LooseObjectStore = try loose_store_open("build/git-interop-export/hgit/objects/loose");
+
+    const manifest_id: ManifestId = try git_tree_to_manifest_prototype(&arena, &store, literal_bytes("build/git-interop-export/source/.git"), source_tree_hex);
+    const exported: GitTreeExportPrototype = try hypergit_manifest_to_git_tree_prototype(
+        &arena,
+        &store,
+        literal_bytes("build/git-interop-export/export/.git"),
+        &manifest_id,
+    );
+    try expect(exported.entry_count == 2 as usize);
+    try expect(exported.tree_hex.len == 40 as usize);
+
+    const roundtrip_entries: GitTreeEntryPrototypeList = try git_tree_to_manifest_entries_prototype(
+        &arena,
+        &store,
+        literal_bytes("build/git-interop-export/export/.git"),
+        exported.tree_hex.ptr[0: exported.tree_hex.len],
+    );
+    try expect(roundtrip_entries.len == 2 as usize);
+    try expect(roundtrip_entries.ptr[0].kind == EntryKind.Executable || roundtrip_entries.ptr[1].kind == EntryKind.Executable);
+    try expect_byte_slice_eq(roundtrip_entries.ptr[0].path.ptr[0: roundtrip_entries.ptr[0].path.len], literal_bytes("run.sh"));
+    try expect_byte_slice_eq(roundtrip_entries.ptr[1].path.ptr[0: roundtrip_entries.ptr[1].path.len], literal_bytes("src/main.txt"));
+
+    try write_file_bytes("build/git-interop-export/exported-tree.txt", exported.tree_hex.ptr[0: exported.tree_hex.len]);
+    try expect(system("cd build/git-interop-export/export && tree=$(cat ../exported-tree.txt) && git ls-tree -r \"$tree\" > ../ls-tree.txt && git cat-file -p \"$tree:src/main.txt\" > ../cat-main.txt && mkdir -p ../checkout && git --git-dir=.git --work-tree=../checkout checkout \"$tree\" -- . && test -x ../checkout/run.sh") == 0);
+
+    const cat_main: &[byte] = try read_file_bytes(&arena, "build/git-interop-export/cat-main.txt");
+    try expect_byte_slice_eq(cat_main, literal_bytes("tree-main"));
+    const checkout_main: &[byte] = try read_file_bytes(&arena, "build/git-interop-export/checkout/src/main.txt");
+    try expect_byte_slice_eq(checkout_main, literal_bytes("tree-main"));
+    const checkout_run: &[byte] = try read_file_bytes(&arena, "build/git-interop-export/checkout/run.sh");
+    try expect_byte_slice_eq(checkout_run, literal_bytes("#!/bin/sh\necho hi\n"));
+}
+
+fn test_small_git_repo_import_covers_tree_and_commit_history() !void {
+    try expect(system("rm -rf build/git-interop-small-import && mkdir -p build/git-interop-small-import/repo build/git-interop-small-import/hgit/objects/loose && cd build/git-interop-small-import/repo && git init >/dev/null 2>&1 && printf root > README.md && git add README.md >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000200 +0000' GIT_COMMITTER_DATE='1700000201 +0000' git -c user.name=Alice -c user.email=alice@example.com commit -m root >/dev/null 2>&1 && mkdir -p src && printf main > src/main.txt && printf '#!/bin/sh\\necho hi\\n' > run.sh && chmod +x run.sh && git add README.md src/main.txt run.sh >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000300 +0000' GIT_COMMITTER_DATE='1700000301 +0000' git -c user.name=Bob -c user.email=bob@example.com commit -m import-head >/dev/null 2>&1 && git rev-parse HEAD > ../head.txt") == 0);
+
+    var arena_buf: [byte: 131072] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 131072 as usize);
+
+    const head_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-small-import/head.txt");
+    const head_hex: &[byte] = trim_newline(head_file);
+    const store: LooseObjectStore = try loose_store_open("build/git-interop-small-import/hgit/objects/loose");
+    const imported: GitCommitImportPrototype = try git_import_commit_prototype(&arena, &store, literal_bytes("build/git-interop-small-import/repo/.git"), head_hex);
+    try expect(imported.generation == 2u64);
+    try expect(try store.has(imported.commit_id.id));
+
+    const entries: ManifestLeafInputList = try manifest_load_flatten(&arena, &store, &imported.manifest_root);
+    try expect(entries.len == 3 as usize);
+    try expect_byte_slice_eq(entries.ptr[0].path.ptr[0: entries.ptr[0].path.len], literal_bytes("README.md"));
+    try expect_byte_slice_eq(entries.ptr[1].path.ptr[0: entries.ptr[1].path.len], literal_bytes("run.sh"));
+    try expect_byte_slice_eq(entries.ptr[2].path.ptr[0: entries.ptr[2].path.len], literal_bytes("src/main.txt"));
+    try expect(entries.ptr[1].kind == EntryKind.Executable);
+    try expect(try store.has(entries.ptr[0].object_id));
+    try expect(try store.has(entries.ptr[1].object_id));
+    try expect(try store.has(entries.ptr[2].object_id));
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Git Interop Tests");
     run_test("git loose blob prototype reads and imports blob", test_git_loose_blob_prototype_reads_and_imports_blob);
     run_test("git tree to manifest prototype imports paths and modes", test_git_tree_to_manifest_prototype_imports_paths_and_modes);
+    run_test("git commit to hypergit commit prototype imports history", test_git_commit_to_hypergit_commit_prototype_imports_history);
+    run_test("hypergit manifest to git tree prototype exports tree", test_hypergit_manifest_to_git_tree_prototype_exports_tree);
+    run_test("small git repo import covers tree and commit history", test_small_git_repo_import_covers_tree_and_commit_history);
     return test_suite_end();
 }

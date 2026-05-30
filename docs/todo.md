@@ -334,7 +334,7 @@
 - [x] 实现 push endpoint。
 - [x] 实现 request size limit。
 - [x] 实现基础鉴权 hook。
-- [ ] 实现服务端 smoke test。
+- [x] 实现服务端 smoke test。
 
 ## 20. Security / Policy
 
@@ -353,38 +353,38 @@
 
 - [x] 编写 Git import/export 设计补充文档。
 - [x] 实现读取 loose Git blob 原型。
-- [ ] 实现 Git tree -> manifest 转换原型。
-- [ ] 实现 Git commit -> HyperGit commit 映射原型。
-- [ ] 实现 HyperGit manifest -> Git tree 导出原型。
+- [x] 实现 Git tree -> manifest 转换原型。
+- [x] 实现 Git commit -> HyperGit commit 映射原型。
+- [x] 实现 HyperGit manifest -> Git tree 导出原型。
 - [x] 明确 native chunked blob 的 Git 降级策略。
-- [ ] 测试小仓库 Git import。
-- [ ] 测试导出后 Git 能读取。
+- [x] 测试小仓库 Git import。
+- [x] 测试导出后 Git 能读取。
 
 ## 22. Benchmarks
 
 - [x] 生成 10 万路径 synthetic manifest。
 - [x] 生成 100 万路径 synthetic manifest。
-- [ ] 基准 manifest lookup。
-- [ ] 基准 manifest diff。
-- [ ] 基准 loose object get。
-- [ ] 基准 segment pack lookup。
-- [ ] 基准 small file commit。
+- [x] 基准 manifest lookup。
+- [x] 基准 manifest diff。
+- [x] 基准 loose object get。
+- [x] 基准 segment pack lookup。
+- [x] 基准 small file commit。
 - [x] 基准单文件 `hgx add <pathspec>`（大 worktree，小 pathspec）。
 - [x] 基准目录 `hgx add <pathspec>`（大 worktree，小目录）。
 - [x] 基准重复 `hgx add` 命中 metadata fast path。
-- [ ] 基准 large file chunk。
-- [ ] 基准 hydrate。
+- [x] 基准 large file chunk。
+- [x] 基准 hydrate。
 - [x] 记录每次基准命令和机器信息。
 
 ## 23. Release Readiness
 
-- [ ] `hgx init/status/add/commit/log/diff` 可端到端运行。
-- [ ] 所有 object codec 测试通过。
-- [ ] 所有 store 测试通过。
-- [ ] 所有 manifest 测试通过。
-- [ ] 所有 workspace 测试通过。
-- [ ] 损坏对象测试通过。
-- [ ] C99 后端 build smoke 通过。
-- [ ] README 能按步骤复现 MVP。
-- [ ] `docs/design.md` 与实际模块命名一致。
-- [ ] `docs/todo.md` 已更新真实完成状态。
+- [x] `hgx init/status/add/commit/log/diff` 可端到端运行。
+- [x] 所有 object codec 测试通过。
+- [x] 所有 store 测试通过。
+- [x] 所有 manifest 测试通过。
+- [x] 所有 workspace 测试通过。
+- [x] 损坏对象测试通过。
+- [x] C99 后端 build smoke 通过。
+- [x] README 能按步骤复现 MVP。
+- [x] `docs/design.md` 与实际模块命名一致。
+- [x] `docs/todo.md` 已更新真实完成状态。

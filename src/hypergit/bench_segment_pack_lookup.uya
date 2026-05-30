@@ -1,0 +1,289 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.time.now_ms;
+
+use libc.fprintf;
+use libc.free;
+use libc.malloc;
+use libc.stderr;
+use core.ids.ObjectId;
+use core.ids.object_id_compare;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.segment_pack.SegmentPackIndexEntry;
+use store.segment_pack.SegmentPackWriteInput;
+use store.segment_pack.SegmentPackWriteResult;
+use store.segment_pack.segment_pack_index_lookup;
+use store.segment_pack.segment_pack_write;
+
+export const BENCH_SEGMENT_PACK_LOOKUP_USAGE_TEXT: &const byte =
+    "usage: bench_segment_pack_lookup <object-count> <lookup-count> <payload-bytes> <objects-root> <pack-path> <index-path>\n";
+
+const BENCH_ITERATIONS: usize = 3 as usize;
+const BENCH_LOOKUP_ARENA_BYTES: usize = 16777216 as usize;
+
+error BenchSegmentLookupAlloc;
+error BenchSegmentLookupParse;
+error BenchSegmentLookupUnexpectedResult;
+
+struct BenchSegmentLookupMeasure {
+    avg_ms: u64,
+    sink: u64
+}
+
+fn bench_parse_usize(text: &byte) !usize {
+    if text == null || text[0] == 0 as byte {
+        return error.BenchSegmentLookupParse;
+    }
+
+    var value: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while text[i] != 0 as byte {
+        if text[i] < '0' as byte || text[i] > '9' as byte {
+            return error.BenchSegmentLookupParse;
+        }
+        value = value * 10 as usize + (text[i] - '0' as byte) as usize;
+        i = i + 1 as usize;
+    }
+    if value == 0 as usize {
+        return error.BenchSegmentLookupParse;
+    }
+    return value;
+}
+
+fn bench_fill_payload(payload: &byte, len: usize, index: usize) void {
+    var i: usize = 0 as usize;
+    while i < len {
+        payload[i] = ((index * 137 as usize + i * 19 as usize) % 251 as usize) as byte;
+        i = i + 1 as usize;
+    }
+    if len > 0 as usize {
+        payload[0] = (index % 251 as usize) as byte;
+    }
+    if len > 1 as usize {
+        payload[1] = ((index / 251 as usize) % 251 as usize) as byte;
+    }
+    if len > 2 as usize {
+        payload[2] = ((index / (251 as usize * 251 as usize)) % 251 as usize) as byte;
+    }
+    if len > 3 as usize {
+        payload[3] = ((index / (251 as usize * 251 as usize * 251 as usize)) % 251 as usize) as byte;
+    }
+}
+
+fn bench_prepare_pack(
+    store: &LooseObjectStore,
+    ids: &ObjectId,
+    inputs: &SegmentPackWriteInput,
+    object_count: usize,
+    payload: &byte,
+    payload_bytes: usize,
+    object_arena: &Arena,
+    pack_path: &const byte,
+    index_path: &const byte,
+    pack_bytes_out: &u64,
+    index_bytes_out: &u64,
+) !u64 {
+    const started_ms: u64 = now_ms() catch {
+        return error.BenchSegmentLookupParse;
+    };
+
+    var i: usize = 0 as usize;
+    while i < object_count {
+        bench_fill_payload(payload, payload_bytes, i);
+        const id: ObjectId = store.put(ObjectKind.SmallBlob, payload[0: payload_bytes]) catch {
+            return error.BenchSegmentLookupUnexpectedResult;
+        };
+        const object_bytes: ObjectBytes = store.get(ObjectId{ hash: id.hash }, object_arena) catch {
+            return error.BenchSegmentLookupUnexpectedResult;
+        };
+        ids[i] = ObjectId{ hash: id.hash };
+        inputs[i] = SegmentPackWriteInput{
+            object_id: ObjectId{ hash: id.hash },
+            kind: ObjectKind.SmallBlob,
+            flags: 0u16,
+            logical_size: object_bytes.bytes.len as u64,
+            object_bytes: ByteList{ ptr: object_bytes.bytes.ptr, len: object_bytes.bytes.len },
+        };
+        i = i + 1 as usize;
+    }
+
+    const result: SegmentPackWriteResult = segment_pack_write(
+        pack_path,
+        index_path,
+        1u64,
+        1000i64,
+        0u64,
+        inputs[0: object_count],
+    ) catch {
+        return error.BenchSegmentLookupUnexpectedResult;
+    };
+    pack_bytes_out[0] = result.pack_bytes;
+    index_bytes_out[0] = result.index_bytes;
+
+    const finished_ms: u64 = now_ms() catch {
+        return error.BenchSegmentLookupParse;
+    };
+    return finished_ms - started_ms;
+}
+
+fn bench_measure_lookup(index_path: &const byte, ids: &ObjectId, object_count: usize, lookup_count: usize) !BenchSegmentLookupMeasure {
+    const scratch_storage: &byte = malloc(BENCH_LOOKUP_ARENA_BYTES) as &byte;
+    if scratch_storage == null {
+        return error.BenchSegmentLookupAlloc;
+    }
+    defer {
+        free(scratch_storage as &void);
+    }
+
+    var total_ms: u64 = 0u64;
+    var sink: u64 = 0u64;
+    var iter: usize = 0 as usize;
+    while iter < BENCH_ITERATIONS {
+        sink = 0u64;
+        const started_ms: u64 = now_ms() catch {
+            return error.BenchSegmentLookupParse;
+        };
+        var i: usize = 0 as usize;
+        while i < lookup_count {
+            var lookup_arena: Arena = Arena{ buffer: scratch_storage, size: 0, used: 0 };
+            arena_init(&lookup_arena, scratch_storage, BENCH_LOOKUP_ARENA_BYTES);
+            const object_index: usize = (i * 7919 as usize + 11 as usize) % object_count;
+            const entry: SegmentPackIndexEntry = segment_pack_index_lookup(
+                index_path,
+                ObjectId{ hash: ids[object_index].hash },
+                &lookup_arena,
+            ) catch {
+                return error.BenchSegmentLookupUnexpectedResult;
+            };
+            if object_id_compare(&entry.object_id, &ids[object_index]) != 0 {
+                return error.BenchSegmentLookupUnexpectedResult;
+            }
+            sink = sink + entry.record_offset + entry.record_bytes as u64 + entry.logical_size;
+            i = i + 1 as usize;
+        }
+        const finished_ms: u64 = now_ms() catch {
+            return error.BenchSegmentLookupParse;
+        };
+        total_ms = total_ms + (finished_ms - started_ms);
+        iter = iter + 1 as usize;
+    }
+
+    return BenchSegmentLookupMeasure{ avg_ms: total_ms / BENCH_ITERATIONS as u64, sink: sink };
+}
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    if argc != 7 {
+        fprintf(stderr, "%s" as *byte, BENCH_SEGMENT_PACK_LOOKUP_USAGE_TEXT);
+        return 1;
+    }
+
+    const object_count: usize = bench_parse_usize(get_argv(1)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_SEGMENT_PACK_LOOKUP_USAGE_TEXT);
+        return 1;
+    };
+    const lookup_count: usize = bench_parse_usize(get_argv(2)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_SEGMENT_PACK_LOOKUP_USAGE_TEXT);
+        return 1;
+    };
+    const payload_bytes: usize = bench_parse_usize(get_argv(3)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_SEGMENT_PACK_LOOKUP_USAGE_TEXT);
+        return 1;
+    };
+    const objects_root: &byte = get_argv(4);
+    const pack_path: &const byte = get_argv(5) as &const byte;
+    const index_path: &const byte = get_argv(6) as &const byte;
+    if objects_root == null || objects_root[0] == 0 as byte || pack_path == null || index_path == null {
+        fprintf(stderr, "%s" as *byte, BENCH_SEGMENT_PACK_LOOKUP_USAGE_TEXT);
+        return 1;
+    }
+
+    const ids: &ObjectId = malloc(@size_of(ObjectId) as usize * object_count) as &ObjectId;
+    if ids == null {
+        return 1;
+    }
+    defer {
+        free(ids as &void);
+    }
+    const inputs: &SegmentPackWriteInput = malloc(@size_of(SegmentPackWriteInput) as usize * object_count) as &SegmentPackWriteInput;
+    if inputs == null {
+        return 1;
+    }
+    defer {
+        free(inputs as &void);
+    }
+    const payload: &byte = malloc(payload_bytes) as &byte;
+    if payload == null {
+        return 1;
+    }
+    defer {
+        free(payload as &void);
+    }
+
+    const object_arena_bytes: usize = object_count * (payload_bytes + 256 as usize) + 1048576 as usize;
+    const object_storage: &byte = malloc(object_arena_bytes) as &byte;
+    if object_storage == null {
+        return 1;
+    }
+    defer {
+        free(object_storage as &void);
+    }
+    var object_arena: Arena = Arena{ buffer: object_storage, size: 0, used: 0 };
+    arena_init(&object_arena, object_storage, object_arena_bytes);
+
+    const store: LooseObjectStore = loose_store_open(objects_root) catch {
+        fprintf(stderr, "store_open_error\n" as *byte);
+        return 1;
+    };
+    var pack_bytes: u64 = 0u64;
+    var index_bytes: u64 = 0u64;
+    const prepare_ms: u64 = bench_prepare_pack(
+        &store,
+        ids,
+        inputs,
+        object_count,
+        payload,
+        payload_bytes,
+        &object_arena,
+        pack_path,
+        index_path,
+        &pack_bytes,
+        &index_bytes,
+    ) catch |err| {
+        fprintf(stderr, "prepare_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    const lookup_measure: BenchSegmentLookupMeasure = bench_measure_lookup(
+        index_path,
+        ids,
+        object_count,
+        lookup_count,
+    ) catch |err| {
+        fprintf(stderr, "lookup_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    const lookup_us_per_op: u64 = (lookup_measure.avg_ms * 1000u64) / lookup_count as u64;
+    fprintf(
+        stderr,
+        "objects=%llu lookups=%llu payload_bytes=%llu prepare_ms=%llu pack_bytes=%llu index_bytes=%llu lookup_avg_ms=%llu lookup_us_per_op=%llu sink=%llu\n" as *byte,
+        object_count as u64,
+        lookup_count as u64,
+        payload_bytes as u64,
+        prepare_ms,
+        pack_bytes,
+        index_bytes,
+        lookup_measure.avg_ms,
+        lookup_us_per_op,
+        lookup_measure.sink,
+    );
+    return 0;
+}

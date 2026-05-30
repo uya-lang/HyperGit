@@ -1,0 +1,418 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.time.now_ms;
+
+use libc.fprintf;
+use libc.free;
+use libc.malloc;
+use libc.stderr;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.flat_diff.ManifestFlatDiffEntryList;
+use manifest.flat_diff.manifest_flat_diff;
+use manifest.flat_diff.manifest_flat_diff_parallel;
+use manifest.query.ManifestPathspecList;
+use manifest.query.manifest_pathspec_list_from_slice;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+
+export const BENCH_MANIFEST_DIFF_USAGE_TEXT: &const byte =
+    "usage: bench_manifest_diff <entry-count> <change-stride> <workers>\n";
+
+const BENCH_GROUP_COUNT: usize = 20 as usize;
+const BENCH_ITERATIONS: usize = 3 as usize;
+const BENCH_DIFF_ARENA_BYTES: usize = 67108864 as usize;
+
+error BenchDiffAlloc;
+error BenchDiffParse;
+error BenchDiffUnexpectedResult;
+
+struct BenchDiffMeasure {
+    avg_ms: u64,
+    changes: usize
+}
+
+fn bench_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn bench_object_id(seed: byte) ObjectId {
+    return object_id_from_hash(bench_hash(seed));
+}
+
+fn bench_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(bench_object_id(seed));
+}
+
+fn bench_parse_usize(text: &byte) !usize {
+    if text == null || text[0] == 0 as byte {
+        return error.BenchDiffParse;
+    }
+
+    var value: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while text[i] != 0 as byte {
+        if text[i] < '0' as byte || text[i] > '9' as byte {
+            return error.BenchDiffParse;
+        }
+        value = value * 10 as usize + (text[i] - '0' as byte) as usize;
+        i = i + 1 as usize;
+    }
+    if value == 0 as usize {
+        return error.BenchDiffParse;
+    }
+    return value;
+}
+
+fn bench_parse_i32(text: &byte) !i32 {
+    const value: usize = try bench_parse_usize(text);
+    if value > 2147483647 as usize {
+        return error.BenchDiffParse;
+    }
+    return value as i32;
+}
+
+fn bench_group_count(total_entries: usize) usize {
+    if total_entries < BENCH_GROUP_COUNT {
+        return total_entries;
+    }
+    return BENCH_GROUP_COUNT;
+}
+
+fn bench_files_per_group(total_entries: usize, group_count: usize) usize {
+    return (total_entries + group_count - 1 as usize) / group_count;
+}
+
+fn bench_make_u32_decimal_fixed(raw: &byte, width: usize, value: usize) void {
+    var divisor: usize = 1 as usize;
+    var i: usize = 1 as usize;
+    while i < width {
+        divisor = divisor * 10 as usize;
+        i = i + 1 as usize;
+    }
+
+    i = 0 as usize;
+    while i < width {
+        raw[i] = ('0' as byte) + ((value / divisor) % 10 as usize) as byte;
+        if divisor > 1 as usize {
+            divisor = divisor / 10 as usize;
+        }
+        i = i + 1 as usize;
+    }
+}
+
+fn bench_group_for_index(total_entries: usize, index: usize) usize {
+    const group_count: usize = bench_group_count(total_entries);
+    const files_per_group: usize = bench_files_per_group(total_entries, group_count);
+    return index / files_per_group;
+}
+
+fn bench_make_path(arena: &Arena, total_entries: usize, index: usize) !ByteList {
+    const group_count: usize = bench_group_count(total_entries);
+    const files_per_group: usize = bench_files_per_group(total_entries, group_count);
+    const group_index: usize = index / files_per_group;
+    const file_index: usize = index % files_per_group;
+    const total_len: usize = 20 as usize;
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.BenchDiffAlloc;
+    }
+
+    raw[0] = 'p' as byte;
+    raw[1] = 'k' as byte;
+    raw[2] = 'g' as byte;
+    bench_make_u32_decimal_fixed(&raw[3], 2 as usize, group_index);
+    raw[5] = '/' as byte;
+    raw[6] = 'f' as byte;
+    raw[7] = 'i' as byte;
+    raw[8] = 'l' as byte;
+    raw[9] = 'e' as byte;
+    bench_make_u32_decimal_fixed(&raw[10], 6 as usize, file_index);
+    raw[16] = '.' as byte;
+    raw[17] = 't' as byte;
+    raw[18] = 'x' as byte;
+    raw[19] = 't' as byte;
+    return ByteList{ ptr: raw, len: total_len };
+}
+
+fn bench_make_group_pathspec(arena: &Arena, group_index: usize) !ByteList {
+    const total_len: usize = 5 as usize;
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.BenchDiffAlloc;
+    }
+
+    raw[0] = 'p' as byte;
+    raw[1] = 'k' as byte;
+    raw[2] = 'g' as byte;
+    bench_make_u32_decimal_fixed(&raw[3], 2 as usize, group_index);
+    return ByteList{ ptr: raw, len: total_len };
+}
+
+fn bench_make_input(arena: &Arena, total_entries: usize, index: usize, modified: bool) !ManifestLeafInputEntry {
+    var object_seed: byte = (index % 200 as usize) as byte;
+    if modified {
+        object_seed = object_seed + 37 as byte;
+    }
+    return ManifestLeafInputEntry{
+        path: try bench_make_path(arena, total_entries, index),
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: bench_object_id(object_seed),
+        logical_size: index as u64,
+        content_type: ContentType.Utf8Text,
+        policy_id: bench_policy_id((index % 200 as usize) as byte + 20 as byte),
+    };
+}
+
+fn bench_count_all_changes(total_entries: usize, change_stride: usize) usize {
+    var count: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < total_entries {
+        if i % change_stride == 0 as usize {
+            count = count + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return count;
+}
+
+fn bench_count_group_changes(total_entries: usize, change_stride: usize, group_index: usize) usize {
+    var count: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < total_entries {
+        if i % change_stride == 0 as usize && bench_group_for_index(total_entries, i) == group_index {
+            count = count + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return count;
+}
+
+fn bench_measure_serial(
+    left: &ManifestLeafInputList,
+    right: &ManifestLeafInputList,
+    pathspecs: ManifestPathspecList,
+    expected_changes: usize,
+) !BenchDiffMeasure {
+    const scratch_storage: &byte = malloc(BENCH_DIFF_ARENA_BYTES) as &byte;
+    if scratch_storage == null {
+        return error.BenchDiffAlloc;
+    }
+    defer {
+        free(scratch_storage as &void);
+    }
+
+    var total_ms: u64 = 0u64;
+    var changes: usize = 0 as usize;
+    var iter: usize = 0 as usize;
+    while iter < BENCH_ITERATIONS {
+        var diff_arena: Arena = Arena{ buffer: scratch_storage, size: 0, used: 0 };
+        arena_init(&diff_arena, scratch_storage, BENCH_DIFF_ARENA_BYTES);
+
+        const started_ms: u64 = now_ms() catch {
+            return error.BenchDiffParse;
+        };
+        const diff: ManifestFlatDiffEntryList = try manifest_flat_diff(
+            &diff_arena,
+            left,
+            right,
+            ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+        );
+        const finished_ms: u64 = now_ms() catch {
+            return error.BenchDiffParse;
+        };
+        if diff.len != expected_changes {
+            return error.BenchDiffUnexpectedResult;
+        }
+        changes = diff.len;
+        total_ms = total_ms + (finished_ms - started_ms);
+        iter = iter + 1 as usize;
+    }
+    return BenchDiffMeasure{ avg_ms: total_ms / BENCH_ITERATIONS as u64, changes: changes };
+}
+
+fn bench_measure_parallel(
+    left: &ManifestLeafInputList,
+    right: &ManifestLeafInputList,
+    pathspecs: ManifestPathspecList,
+    expected_changes: usize,
+    workers: i32,
+) !BenchDiffMeasure {
+    const scratch_storage: &byte = malloc(BENCH_DIFF_ARENA_BYTES) as &byte;
+    if scratch_storage == null {
+        return error.BenchDiffAlloc;
+    }
+    defer {
+        free(scratch_storage as &void);
+    }
+
+    var total_ms: u64 = 0u64;
+    var changes: usize = 0 as usize;
+    var iter: usize = 0 as usize;
+    while iter < BENCH_ITERATIONS {
+        var diff_arena: Arena = Arena{ buffer: scratch_storage, size: 0, used: 0 };
+        arena_init(&diff_arena, scratch_storage, BENCH_DIFF_ARENA_BYTES);
+
+        const started_ms: u64 = now_ms() catch {
+            return error.BenchDiffParse;
+        };
+        const diff: ManifestFlatDiffEntryList = try manifest_flat_diff_parallel(
+            &diff_arena,
+            left,
+            right,
+            ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+            workers,
+        );
+        const finished_ms: u64 = now_ms() catch {
+            return error.BenchDiffParse;
+        };
+        if diff.len != expected_changes {
+            return error.BenchDiffUnexpectedResult;
+        }
+        changes = diff.len;
+        total_ms = total_ms + (finished_ms - started_ms);
+        iter = iter + 1 as usize;
+    }
+    return BenchDiffMeasure{ avg_ms: total_ms / BENCH_ITERATIONS as u64, changes: changes };
+}
+
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    if argc != 4 {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_DIFF_USAGE_TEXT);
+        return 1;
+    }
+
+    const total_entries: usize = bench_parse_usize(get_argv(1)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_DIFF_USAGE_TEXT);
+        return 1;
+    };
+    const change_stride: usize = bench_parse_usize(get_argv(2)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_DIFF_USAGE_TEXT);
+        return 1;
+    };
+    const workers: i32 = bench_parse_i32(get_argv(3)) catch {
+        fprintf(stderr, "%s" as *byte, BENCH_MANIFEST_DIFF_USAGE_TEXT);
+        return 1;
+    };
+
+    const input_bytes: usize = @size_of(ManifestLeafInputEntry) as usize * total_entries * 2 as usize +
+        total_entries * 64 as usize * 2 as usize +
+        1048576 as usize;
+    const input_storage: &byte = malloc(input_bytes) as &byte;
+    if input_storage == null {
+        return 1;
+    }
+    defer {
+        free(input_storage as &void);
+    }
+    var input_arena: Arena = Arena{ buffer: input_storage, size: 0, used: 0 };
+    arena_init(&input_arena, input_storage, input_bytes);
+
+    const left_raw: &ManifestLeafInputEntry = arena_alloc(
+        &input_arena,
+        @size_of(ManifestLeafInputEntry) as usize * total_entries,
+    ) as &ManifestLeafInputEntry;
+    if left_raw == null {
+        return 1;
+    }
+    const right_raw: &ManifestLeafInputEntry = arena_alloc(
+        &input_arena,
+        @size_of(ManifestLeafInputEntry) as usize * total_entries,
+    ) as &ManifestLeafInputEntry;
+    if right_raw == null {
+        return 1;
+    }
+
+    var i: usize = 0 as usize;
+    while i < total_entries {
+        left_raw[i] = bench_make_input(&input_arena, total_entries, i, false) catch |err| {
+            fprintf(stderr, "left_input_build_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+        right_raw[i] = bench_make_input(&input_arena, total_entries, i, i % change_stride == 0 as usize) catch |err| {
+            fprintf(stderr, "right_input_build_error=%u\n" as *byte, @error_id(err));
+            return 1;
+        };
+        i = i + 1 as usize;
+    }
+
+    const left: ManifestLeafInputList = manifest_leaf_input_list_from_slice(left_raw[0: total_entries]);
+    const right: ManifestLeafInputList = manifest_leaf_input_list_from_slice(right_raw[0: total_entries]);
+
+    const group_count: usize = bench_group_count(total_entries);
+    var target_group: usize = 5 as usize;
+    if target_group >= group_count {
+        target_group = group_count - 1 as usize;
+    }
+    const target_spec: ByteList = bench_make_group_pathspec(&input_arena, target_group) catch |err| {
+        fprintf(stderr, "pathspec_build_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    var specs: [ByteList: 1] = [target_spec];
+    var no_specs: [ByteList: 1] = [ByteList{ ptr: null, len: 0 }];
+
+    const expected_all: usize = bench_count_all_changes(total_entries, change_stride);
+    const expected_group: usize = bench_count_group_changes(total_entries, change_stride, target_group);
+
+    const serial_measure: BenchDiffMeasure = bench_measure_serial(
+        &left,
+        &right,
+        manifest_pathspec_list_from_slice(no_specs[0: 0]),
+        expected_all,
+    ) catch |err| {
+        fprintf(stderr, "serial_diff_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const parallel_measure: BenchDiffMeasure = bench_measure_parallel(
+        &left,
+        &right,
+        manifest_pathspec_list_from_slice(no_specs[0: 0]),
+        expected_all,
+        workers,
+    ) catch |err| {
+        fprintf(stderr, "parallel_diff_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    const pathspec_measure: BenchDiffMeasure = bench_measure_parallel(
+        &left,
+        &right,
+        manifest_pathspec_list_from_slice(specs[0: 1]),
+        expected_group,
+        workers,
+    ) catch |err| {
+        fprintf(stderr, "pathspec_diff_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+
+    fprintf(
+        stderr,
+        "entries=%llu change_stride=%llu workers=%d changed=%llu serial_avg_ms=%llu parallel_avg_ms=%llu pathspec_avg_ms=%llu pathspec_changed=%llu\n" as *byte,
+        total_entries as u64,
+        change_stride as u64,
+        workers,
+        serial_measure.changes as u64,
+        serial_measure.avg_ms,
+        parallel_measure.avg_ms,
+        pathspec_measure.avg_ms,
+        pathspec_measure.changes as u64,
+    );
+    return 0;
+}
