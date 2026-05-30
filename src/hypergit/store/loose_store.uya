@@ -239,7 +239,7 @@ fn hash_object_payload(kind: ObjectKind, payload: &[byte]) !ObjectId {
     return object_id_from_hash(hash);
 }
 
-fn build_loose_paths(root: &StorePath, id: &ObjectId, dir_out: &StorePath, file_out: &StorePath, temp_out: &StorePath) !void {
+fn build_loose_object_paths(root: &StorePath, id: &ObjectId, dir_out: &StorePath, file_out: &StorePath) !void {
     var hex: [byte: 64] = [];
     _ = try object_id_encode_hex(id, hex[0: HASH32_HEX_BYTES]);
 
@@ -256,7 +256,12 @@ fn build_loose_paths(root: &StorePath, id: &ObjectId, dir_out: &StorePath, file_
     try store_path_append_byte(&file_path, '/' as byte);
     try store_path_append_bytes(&file_path, &hex[2], HASH32_HEX_BYTES - 2 as usize);
 
-    var temp_path: StorePath = store_path_clone(&file_path);
+    dir_out[0] = store_path_clone(&dir_path);
+    file_out[0] = store_path_clone(&file_path);
+}
+
+fn build_loose_temp_path(file_path: &StorePath, temp_out: &StorePath) !void {
+    var temp_path: StorePath = store_path_clone(file_path);
     try store_path_append_literal(&temp_path, ".tmp.");
     try append_decimal_i32(&temp_path, getpid());
     try store_path_append_byte(&temp_path, '.' as byte);
@@ -265,9 +270,12 @@ fn build_loose_paths(root: &StorePath, id: &ObjectId, dir_out: &StorePath, file_
     };
     try append_decimal_i32(&temp_path, tid);
 
-    dir_out[0] = store_path_clone(&dir_path);
-    file_out[0] = store_path_clone(&file_path);
     temp_out[0] = store_path_clone(&temp_path);
+}
+
+fn build_loose_paths(root: &StorePath, id: &ObjectId, dir_out: &StorePath, file_out: &StorePath, temp_out: &StorePath) !void {
+    try build_loose_object_paths(root, id, dir_out, file_out);
+    try build_loose_temp_path(file_out, temp_out);
 }
 
 fn load_file_bytes(arena: &Arena, path: &StorePath) !ByteList {
@@ -388,16 +396,14 @@ export struct LooseObjectStore : ObjectStore {
     fn has(self: &Self, id: ObjectId) !bool {
         var dir_path: StorePath = store_path_empty();
         var file_path: StorePath = store_path_empty();
-        var temp_path: StorePath = store_path_empty();
-        try build_loose_paths(&self.root, &id, &dir_path, &file_path, &temp_path);
+        try build_loose_object_paths(&self.root, &id, &dir_path, &file_path);
         return store_path_exists(&file_path);
     },
 
     fn get(self: &Self, id: ObjectId, arena: &Arena) !ObjectBytes {
         var dir_path: StorePath = store_path_empty();
         var file_path: StorePath = store_path_empty();
-        var temp_path: StorePath = store_path_empty();
-        try build_loose_paths(&self.root, &id, &dir_path, &file_path, &temp_path);
+        try build_loose_object_paths(&self.root, &id, &dir_path, &file_path);
         const data: ByteList = try load_file_bytes(arena, &file_path);
         try verify_object_bytes(&id, data);
         return ObjectBytes{ bytes: data };
@@ -411,8 +417,7 @@ export struct LooseObjectStore : ObjectStore {
     fn open_reader(self: &Self, id: ObjectId) !ObjectReader {
         var dir_path: StorePath = store_path_empty();
         var file_path: StorePath = store_path_empty();
-        var temp_path: StorePath = store_path_empty();
-        try build_loose_paths(&self.root, &id, &dir_path, &file_path, &temp_path);
+        try build_loose_object_paths(&self.root, &id, &dir_path, &file_path);
         const file: File = file_open(store_path_cstr(&file_path) as &const byte, O_RDONLY as i32, 0u32) catch {
             return error.StoreOpenFailed;
         };
@@ -433,8 +438,7 @@ export fn loose_store_put_known_id(store: &LooseObjectStore, id: &ObjectId, kind
 export fn loose_store_object_path(store: &LooseObjectStore, id: &ObjectId, out: &[byte]) !usize {
     var dir_path: StorePath = store_path_empty();
     var file_path: StorePath = store_path_empty();
-    var temp_path: StorePath = store_path_empty();
-    try build_loose_paths(&store.root, id, &dir_path, &file_path, &temp_path);
+    try build_loose_object_paths(&store.root, id, &dir_path, &file_path);
     if file_path.len + 1 > out.len {
         return error.StorePathTooLong;
     }

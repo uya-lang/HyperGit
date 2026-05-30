@@ -40,6 +40,7 @@ use libc.sched_getaffinity;
 use libc.stderr;
 use libc.stdout;
 use libc.STDERR_FILENO;
+use libc.STDOUT_FILENO;
 use libc.sys_ioctl;
 use cli.EXIT_NOT_IMPLEMENTED;
 use cli.EXIT_OK;
@@ -123,10 +124,8 @@ const ADD_ARENA_BYTES: usize = 268435456 as usize;
 const ADD_PATHSPEC_ARENA_BYTES: usize = 65536 as usize;
 const ADD_PATH_MAX: usize = 4096;
 const ADD_PARALLEL_WORKERS_DEFAULT: i32 = 2;
-const ADD_PARALLEL_MAX_WORKERS: usize = 32 as usize;
+const ADD_PARALLEL_MAX_WORKERS: usize = 64 as usize;
 const ADD_PARALLEL_CPU_MASK_BYTES: usize = 128 as usize;
-// Keep `hgx add` under roughly 200% CPU by capping to two concurrent workers.
-const ADD_PARALLEL_ASYNC_MAX_INFLIGHT: usize = 2 as usize;
 const ADD_PROGRESS_MIN_FILES: usize = 4096 as usize;
 const ADD_PROGRESS_INTERVAL_FILES: usize = 4096 as usize;
 const ADD_PROGRESS_MIN_BYTES: u64 = 1073741824u64;
@@ -138,6 +137,10 @@ const ADD_PREPARE_SMALL_HASH_FAILED: usize = 5 as usize;
 const ADD_STORE_OBJECT_PERMISSION: usize = 6 as usize;
 const ADD_STORE_OBJECT_UNPROCESSABLE: usize = 7 as usize;
 const ADD_STORE_OBJECT_FATAL: usize = 8 as usize;
+const ADD_FILE_PROCESS_PENDING: usize = 0 as usize;
+const ADD_FILE_PROCESS_STORED: usize = 1 as usize;
+const ADD_FILE_PROCESS_SKIP_PERMISSION: usize = 2 as usize;
+const ADD_FILE_PROCESS_SKIP_UNPROCESSABLE: usize = 3 as usize;
 const ADD_WORKER_SLOT_IDLE: i32 = 0;
 const ADD_WORKER_SLOT_ASSIGNED: i32 = 1;
 const ADD_WORKER_SLOT_COMPLETED: i32 = 2;
@@ -189,15 +192,17 @@ struct AddOwnedBytes {
 }
 
 struct AddPrepareSmallBlobTask {
-    root_fs_path: AddFsPath,
+    root_fs_path: &AddFsPath,
     file_entry: &WorkspaceFileEntry,
     base_entry_index: isize
 }
 
 struct AddStoreObjectTask {
-    root_fs_path: AddFsPath,
+    root_fs_path: &AddFsPath,
     file_entry: &WorkspaceFileEntry,
-    base_entry_index: isize,
+    result_index: usize,
+    measure_object_timing: bool,
+    measure_prepare_timing: bool,
     store: &LooseObjectStore,
     chunk_store: &ChunkStore
 }
@@ -210,8 +215,21 @@ struct AddPreparedSmallBlobResult {
 
 struct AddSmallBlobWorker {
     thread: pthread_t,
-    task: &AddPrepareSmallBlobTask,
-    status: usize,
+    tasks: &AddPrepareSmallBlobTask,
+    task_count: usize,
+    worker_index: usize,
+    worker_count: usize,
+    statuses: &usize,
+    started: i32
+}
+
+struct AddStoreObjectWorker {
+    thread: pthread_t,
+    tasks: &AddStoreObjectTask,
+    task_count: usize,
+    worker_index: usize,
+    worker_count: usize,
+    statuses: &usize,
     started: i32
 }
 
@@ -221,6 +239,14 @@ struct AddCachedObjectResult {
 }
 
 struct AddStoredObjectResult {
+    object_id: ObjectId,
+    hash_elapsed_ms: u64,
+    prepare_elapsed_ms: u64,
+    store_elapsed_ms: u64
+}
+
+struct AddFileProcessResult {
+    status: usize,
     object_id: ObjectId,
     hash_elapsed_ms: u64,
     store_elapsed_ms: u64
@@ -234,6 +260,7 @@ export struct AddStageResult {
 struct AddProgressState {
     enabled: bool,
     print_current_file: bool,
+    print_path_timings: bool,
     total_files: usize,
     total_bytes: u64,
     processed_files: usize,
@@ -243,6 +270,33 @@ struct AddProgressState {
 
 struct AddPrintablePath {
     bytes: [byte: 4096] = []
+}
+
+struct AddProfileState {
+    enabled: bool,
+    total_started_ms: u64,
+    scan_elapsed_ms: u64,
+    stage_lock_elapsed_ms: u64,
+    stage_read_elapsed_ms: u64,
+    local_change_read_elapsed_ms: u64,
+    base_manifest_elapsed_ms: u64,
+    process_files_wall_ms: u64,
+    delete_stage_elapsed_ms: u64,
+    stage_sort_elapsed_ms: u64,
+    stage_merge_elapsed_ms: u64,
+    local_change_sort_elapsed_ms: u64,
+    local_change_merge_elapsed_ms: u64,
+    stage_write_elapsed_ms: u64,
+    local_change_write_elapsed_ms: u64,
+    cache_lookup_elapsed_ms: u64,
+    object_prepare_sum_ms: u64,
+    object_store_sum_ms: u64,
+    cache_hits: usize,
+    cache_misses: usize,
+    small_blob_misses: usize,
+    large_blob_misses: usize,
+    parallel_batches: usize,
+    workers: usize
 }
 
 struct AddCompletionQueue {
@@ -267,6 +321,111 @@ struct AddWorkerSlot {
 
 fn add_zero_object_id() ObjectId {
     return object_id_from_hash(Hash32{ bytes: [] });
+}
+
+fn add_profile_env_enabled() bool {
+    const raw: &byte = getenv("HGX_ADD_PROFILE");
+    if raw == null || raw[0] == 0 as byte {
+        return false;
+    }
+    return !(raw[0] == '0' as byte && raw[1] == 0 as byte);
+}
+
+fn add_profile_init() AddProfileState {
+    const enabled: bool = add_profile_env_enabled();
+    return AddProfileState{
+        enabled: enabled,
+        total_started_ms: add_maybe_now_ms(enabled),
+        scan_elapsed_ms: 0u64,
+        stage_lock_elapsed_ms: 0u64,
+        stage_read_elapsed_ms: 0u64,
+        local_change_read_elapsed_ms: 0u64,
+        base_manifest_elapsed_ms: 0u64,
+        process_files_wall_ms: 0u64,
+        delete_stage_elapsed_ms: 0u64,
+        stage_sort_elapsed_ms: 0u64,
+        stage_merge_elapsed_ms: 0u64,
+        local_change_sort_elapsed_ms: 0u64,
+        local_change_merge_elapsed_ms: 0u64,
+        stage_write_elapsed_ms: 0u64,
+        local_change_write_elapsed_ms: 0u64,
+        cache_lookup_elapsed_ms: 0u64,
+        object_prepare_sum_ms: 0u64,
+        object_store_sum_ms: 0u64,
+        cache_hits: 0 as usize,
+        cache_misses: 0 as usize,
+        small_blob_misses: 0 as usize,
+        large_blob_misses: 0 as usize,
+        parallel_batches: 0 as usize,
+        workers: 1 as usize,
+    };
+}
+
+fn add_profile_add_elapsed(total: &u64, started_ms: u64) void {
+    if started_ms == 0u64 {
+        return;
+    }
+    *total = *total + add_elapsed_ms_since(started_ms);
+}
+
+fn add_profile_add_object_timings(profile: &AddProfileState, prepare_ms: u64, store_ms: u64) void {
+    if !profile.enabled {
+        return;
+    }
+    profile.object_prepare_sum_ms = profile.object_prepare_sum_ms + prepare_ms;
+    profile.object_store_sum_ms = profile.object_store_sum_ms + store_ms;
+}
+
+fn add_profile_print_summary(
+    profile: &AddProfileState,
+    matched_count: usize,
+    staged_count: usize,
+    delete_count: usize,
+    skipped_count: usize,
+) void {
+    if !profile.enabled {
+        return;
+    }
+
+    fprintf(
+        stderr,
+        "info: add profile counts workers=%llu matched=%llu staged=%llu deleted=%llu skipped=%llu cache_hits=%llu cache_misses=%llu small_blob_misses=%llu large_blob_misses=%llu parallel_batches=%llu\n" as *byte,
+        profile.workers as u64,
+        matched_count as u64,
+        staged_count as u64,
+        delete_count as u64,
+        skipped_count as u64,
+        profile.cache_hits as u64,
+        profile.cache_misses as u64,
+        profile.small_blob_misses as u64,
+        profile.large_blob_misses as u64,
+        profile.parallel_batches as u64,
+    );
+    fprintf(
+        stderr,
+        "info: add profile wall_ms total=%llu scan=%llu stage_lock=%llu stage_read=%llu local_read=%llu base_manifest=%llu process_files=%llu delete_stage=%llu stage_sort=%llu stage_merge=%llu stage_write=%llu local_sort=%llu local_merge=%llu local_write=%llu\n" as *byte,
+        add_elapsed_ms_since(profile.total_started_ms),
+        profile.scan_elapsed_ms,
+        profile.stage_lock_elapsed_ms,
+        profile.stage_read_elapsed_ms,
+        profile.local_change_read_elapsed_ms,
+        profile.base_manifest_elapsed_ms,
+        profile.process_files_wall_ms,
+        profile.delete_stage_elapsed_ms,
+        profile.stage_sort_elapsed_ms,
+        profile.stage_merge_elapsed_ms,
+        profile.stage_write_elapsed_ms,
+        profile.local_change_sort_elapsed_ms,
+        profile.local_change_merge_elapsed_ms,
+        profile.local_change_write_elapsed_ms,
+    );
+    fprintf(
+        stderr,
+        "info: add profile sum_ms cache_lookup=%llu object_prepare=%llu object_store=%llu\n" as *byte,
+        profile.cache_lookup_elapsed_ms,
+        profile.object_prepare_sum_ms,
+        profile.object_store_sum_ms,
+    );
 }
 
 fn add_fs_path_from_repo_path(path: &RepoPath) !AddFsPath {
@@ -412,13 +571,25 @@ fn add_parallel_requested_workers() i32 {
 }
 
 fn add_parallel_worker_count(task_count: usize, requested_workers: i32) usize {
-    _ = requested_workers;
-    if task_count <= 1 as usize {
+    if requested_workers <= 1 as i32 || task_count <= 1 as usize {
         return 1 as usize;
     }
-    // `hgx add` parallel dispatch is temporarily pinned to one worker.
-    // This keeps CPU usage low and avoids the remaining scheduler deadlock path.
-    return 1 as usize;
+
+    var worker_count: usize = requested_workers as usize;
+    if worker_count > ADD_PARALLEL_MAX_WORKERS {
+        worker_count = ADD_PARALLEL_MAX_WORKERS;
+    }
+    if worker_count > task_count {
+        worker_count = task_count;
+    }
+    if worker_count == 0 as usize {
+        return 1 as usize;
+    }
+    return worker_count;
+}
+
+export fn add_parallel_worker_count_for_test(task_count: usize, requested_workers: i32) usize {
+    return add_parallel_worker_count(task_count, requested_workers);
 }
 
 fn add_errno_permission() bool {
@@ -586,22 +757,23 @@ fn add_store_small_blob_encoded(store: &LooseObjectStore, object_id: &ObjectId, 
     };
 }
 
-fn add_store_small_blob_bytes_timed(store: &LooseObjectStore, content: &[byte]) !AddStoredObjectResult {
+fn add_store_small_blob_bytes_timed(store: &LooseObjectStore, content: &[byte], measure_timing: bool) !AddStoredObjectResult {
     const payload: SmallBlobPayload = add_small_blob_payload_from_bytes(content);
     const encoded: AddOwnedBytes = try add_encode_small_blob_payload(&payload);
     defer {
         add_owned_bytes_free(&encoded);
     }
 
-    const hash_started_ms: u64 = add_now_ms_or_zero();
+    const hash_started_ms: u64 = add_maybe_now_ms(measure_timing);
     const object_id: ObjectId = try add_hash_small_blob_encoded(add_owned_bytes_slice(&encoded));
     const hash_elapsed_ms: u64 = add_elapsed_ms_since(hash_started_ms);
 
-    const store_started_ms: u64 = add_now_ms_or_zero();
+    const store_started_ms: u64 = add_maybe_now_ms(measure_timing);
     const stored_id: ObjectId = try add_store_small_blob_encoded(store, &object_id, add_owned_bytes_slice(&encoded));
     return AddStoredObjectResult{
         object_id: stored_id,
         hash_elapsed_ms: hash_elapsed_ms,
+        prepare_elapsed_ms: 0u64,
         store_elapsed_ms: add_elapsed_ms_since(store_started_ms),
     };
 }
@@ -609,7 +781,7 @@ fn add_store_small_blob_bytes_timed(store: &LooseObjectStore, content: &[byte]) 
 fn add_prepare_small_blob_task_run(task_ptr: usize) usize {
     const task: &AddPrepareSmallBlobTask = task_ptr as &AddPrepareSmallBlobTask;
     const started_ms: u64 = add_now_ms_or_zero();
-    const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&task.root_fs_path, task.file_entry) catch |err| {
+    const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(task.root_fs_path, task.file_entry) catch |err| {
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
             return ADD_PREPARE_SMALL_PERMISSION;
         }
@@ -657,10 +829,27 @@ fn add_prepared_small_blob_result_free(result: &AddPreparedSmallBlobResult) void
 
 fn add_small_blob_worker_main(arg: &void) &void {
     const worker: &AddSmallBlobWorker = arg as &AddSmallBlobWorker;
-    if worker == null || worker.task == null {
+    if worker == null || worker.tasks == null || worker.statuses == null {
         return null;
     }
-    worker.status = add_prepare_small_blob_task_run(@usize_from_ptr(worker.task as &void));
+    var task_index: usize = worker.worker_index;
+    while task_index < worker.task_count {
+        worker.statuses[task_index] = add_prepare_small_blob_task_run(@usize_from_ptr((&worker.tasks[task_index]) as &void));
+        task_index = task_index + worker.worker_count;
+    }
+    return null;
+}
+
+fn add_store_object_worker_main(arg: &void) &void {
+    const worker: &AddStoreObjectWorker = arg as &AddStoreObjectWorker;
+    if worker == null || worker.tasks == null || worker.statuses == null {
+        return null;
+    }
+    var task_index: usize = worker.worker_index;
+    while task_index < worker.task_count {
+        worker.statuses[task_index] = add_store_object_task_run(@usize_from_ptr((&worker.tasks[task_index]) as &void));
+        task_index = task_index + worker.worker_count;
+    }
     return null;
 }
 
@@ -681,9 +870,15 @@ fn add_hash_worktree_object_id(file_entry: &WorkspaceFileEntry, content: &[byte]
     return try add_hash_small_blob_bytes(content);
 }
 
-fn add_store_worktree_object(store: &LooseObjectStore, chunk_store: &ChunkStore, file_entry: &WorkspaceFileEntry, content: &[byte]) !AddStoredObjectResult {
+fn add_store_worktree_object(
+    store: &LooseObjectStore,
+    chunk_store: &ChunkStore,
+    file_entry: &WorkspaceFileEntry,
+    content: &[byte],
+    measure_timing: bool,
+) !AddStoredObjectResult {
     if file_entry.kind == WorkspaceFileKind.Symlink || large_file_uses_small_blob(file_entry.logical_size) {
-        return try add_store_small_blob_bytes_timed(store, content);
+        return try add_store_small_blob_bytes_timed(store, content, measure_timing);
     }
 
     const scratch_len: usize = try large_prepare_recommended_arena_bytes(file_entry.logical_size);
@@ -697,13 +892,13 @@ fn add_store_worktree_object(store: &LooseObjectStore, chunk_store: &ChunkStore,
     var large_arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
     arena_init(&large_arena, scratch, scratch_len);
 
-    const hash_started_ms: u64 = add_now_ms_or_zero();
+    const hash_started_ms: u64 = add_maybe_now_ms(measure_timing);
     const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_parallel_default(&large_arena, content, FileType.Binary);
     const encoded_payload: ByteList = try chunked_blob_payload_to_canonical(&large_arena, &prepared.payload);
     const object_id: ObjectId = try add_hash_object_payload(ObjectKind.ChunkedBlob, encoded_payload.ptr[0: encoded_payload.len]);
     const hash_elapsed_ms: u64 = add_elapsed_ms_since(hash_started_ms);
 
-    const store_started_ms: u64 = add_now_ms_or_zero();
+    const store_started_ms: u64 = add_maybe_now_ms(measure_timing);
     var part_index: usize = 0 as usize;
     while part_index < prepared.parts.len {
         const chunk: &LargeChunk = &prepared.chunks.ptr[part_index];
@@ -726,6 +921,7 @@ fn add_store_worktree_object(store: &LooseObjectStore, chunk_store: &ChunkStore,
     return AddStoredObjectResult{
         object_id: stored_id,
         hash_elapsed_ms: hash_elapsed_ms,
+        prepare_elapsed_ms: 0u64,
         store_elapsed_ms: add_elapsed_ms_since(store_started_ms),
     };
 }
@@ -806,7 +1002,8 @@ fn add_completion_queue_wait_pop(queue: &AddCompletionQueue) usize {
 
 fn add_store_object_task_run(task_ptr: usize) usize {
     const task: &AddStoreObjectTask = task_ptr as &AddStoreObjectTask;
-    const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&task.root_fs_path, task.file_entry) catch |err| {
+    const object_started_ms: u64 = add_maybe_now_ms(task.measure_prepare_timing);
+    const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(task.root_fs_path, task.file_entry) catch |err| {
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
             return ADD_STORE_OBJECT_PERMISSION;
         }
@@ -825,6 +1022,7 @@ fn add_store_object_task_run(task_ptr: usize) usize {
         task.chunk_store,
         task.file_entry,
         add_owned_bytes_slice(&file_bytes),
+        task.measure_object_timing,
     ) catch |err| {
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
             return ADD_STORE_OBJECT_PERMISSION;
@@ -836,6 +1034,14 @@ fn add_store_object_task_run(task_ptr: usize) usize {
         return ADD_STORE_OBJECT_FATAL;
     };
 
+    var prepare_elapsed_ms: u64 = 0u64;
+    if task.measure_prepare_timing {
+        const object_total_ms: u64 = add_elapsed_ms_since(object_started_ms);
+        if object_total_ms > stored.store_elapsed_ms {
+            prepare_elapsed_ms = object_total_ms - stored.store_elapsed_ms;
+        }
+    }
+
     const raw_result: &AddStoredObjectResult = malloc(@size_of(AddStoredObjectResult) as usize) as &AddStoredObjectResult;
     if raw_result == null {
         return ADD_STORE_OBJECT_FATAL;
@@ -843,6 +1049,7 @@ fn add_store_object_task_run(task_ptr: usize) usize {
     raw_result[0] = AddStoredObjectResult{
         object_id: ObjectId{ hash: stored.object_id.hash },
         hash_elapsed_ms: stored.hash_elapsed_ms,
+        prepare_elapsed_ms: prepare_elapsed_ms,
         store_elapsed_ms: stored.store_elapsed_ms,
     };
     return @usize_from_ptr(raw_result as &void);
@@ -983,23 +1190,21 @@ fn add_worker_slot_request_stop(slot: &AddWorkerSlot) void {
 fn add_process_completed_object_task(
     task: &AddStoreObjectTask,
     status: usize,
-    existing_local_changes: &LocalChangeList,
-    base_inputs: ManifestLeafInputList,
-    raw_updates: &StageEntry,
-    update_index: &usize,
-    raw_change_updates: &LocalChange,
-    change_update_index: &usize,
+    processed_results: &AddFileProcessResult,
     skipped_count: &usize,
     progress: &AddProgressState,
+    profile: &AddProfileState,
 ) !void {
     const file_entry: &WorkspaceFileEntry = task.file_entry;
     if status == ADD_STORE_OBJECT_PERMISSION {
+        processed_results[task.result_index] = add_file_process_result_skipped(ADD_FILE_PROCESS_SKIP_PERMISSION);
         add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
         *skipped_count = *skipped_count + 1 as usize;
         add_progress_mark_file(progress, file_entry);
         return;
     }
     if status == ADD_STORE_OBJECT_UNPROCESSABLE {
+        processed_results[task.result_index] = add_file_process_result_skipped(ADD_FILE_PROCESS_SKIP_UNPROCESSABLE);
         add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
         *skipped_count = *skipped_count + 1 as usize;
         add_progress_mark_file(progress, file_entry);
@@ -1014,26 +1219,11 @@ fn add_process_completed_object_task(
         add_stored_object_result_free(stored);
     }
 
-    const update_index_before: usize = *update_index;
-    add_record_file_result(
-        existing_local_changes,
-        ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-        file_entry,
-        task.base_entry_index,
+    add_profile_add_object_timings(profile, stored.prepare_elapsed_ms, stored.store_elapsed_ms);
+    processed_results[task.result_index] = add_file_process_result_stored(
         &stored.object_id,
-        raw_updates,
-        update_index,
-        raw_change_updates,
-        change_update_index,
-    );
-    add_print_new_stage_entries(
-        raw_updates,
-        update_index_before,
-        *update_index,
-        file_entry.logical_size,
         stored.hash_elapsed_ms,
         stored.store_elapsed_ms,
-        progress.enabled,
     );
     add_progress_mark_file(progress, file_entry);
 }
@@ -1091,11 +1281,39 @@ fn add_cached_object_miss() AddCachedObjectResult {
     };
 }
 
-fn add_stored_object_result(object_id: ObjectId, hash_elapsed_ms: u64, store_elapsed_ms: u64) AddStoredObjectResult {
+fn add_stored_object_result(object_id: ObjectId, hash_elapsed_ms: u64, prepare_elapsed_ms: u64, store_elapsed_ms: u64) AddStoredObjectResult {
     return AddStoredObjectResult{
         object_id: ObjectId{ hash: object_id.hash },
         hash_elapsed_ms: hash_elapsed_ms,
+        prepare_elapsed_ms: prepare_elapsed_ms,
         store_elapsed_ms: store_elapsed_ms,
+    };
+}
+
+fn add_file_process_result_pending() AddFileProcessResult {
+    return AddFileProcessResult{
+        status: ADD_FILE_PROCESS_PENDING,
+        object_id: add_zero_object_id(),
+        hash_elapsed_ms: 0u64,
+        store_elapsed_ms: 0u64,
+    };
+}
+
+fn add_file_process_result_stored(object_id: &ObjectId, hash_elapsed_ms: u64, store_elapsed_ms: u64) AddFileProcessResult {
+    return AddFileProcessResult{
+        status: ADD_FILE_PROCESS_STORED,
+        object_id: ObjectId{ hash: object_id.hash },
+        hash_elapsed_ms: hash_elapsed_ms,
+        store_elapsed_ms: store_elapsed_ms,
+    };
+}
+
+fn add_file_process_result_skipped(status: usize) AddFileProcessResult {
+    return AddFileProcessResult{
+        status: status,
+        object_id: add_zero_object_id(),
+        hash_elapsed_ms: 0u64,
+        store_elapsed_ms: 0u64,
     };
 }
 
@@ -1151,6 +1369,13 @@ fn add_now_ms_or_zero() u64 {
     };
 }
 
+fn add_maybe_now_ms(enabled: bool) u64 {
+    if !enabled {
+        return 0u64;
+    }
+    return add_now_ms_or_zero();
+}
+
 fn add_elapsed_ms_since(started_ms: u64) u64 {
     if started_ms == 0u64 {
         return 0u64;
@@ -1181,7 +1406,6 @@ fn add_print_staged_path(path: &ByteList, logical_size: u64, hash_elapsed_ms: u6
     } else {
         fprintf(stdout, "%s\n" as *byte, path_cstr);
     }
-    _ = fflush(stdout);
 }
 
 fn add_print_new_stage_entries(
@@ -1212,6 +1436,13 @@ fn add_error_is_skippable(err_id: u32) bool {
         err_id == @error_id(error.AddAlloc);
 }
 
+fn add_file_process_skip_status_for_error(err_id: u32) usize {
+    if err_id == @error_id(error.RepoPermissionDenied) {
+        return ADD_FILE_PROCESS_SKIP_PERMISSION;
+    }
+    return ADD_FILE_PROCESS_SKIP_UNPROCESSABLE;
+}
+
 fn add_progress_total_bytes(files: &WorkspaceFileList) u64 {
     var total: u64 = 0u64;
     var i: usize = 0 as usize;
@@ -1222,10 +1453,10 @@ fn add_progress_total_bytes(files: &WorkspaceFileList) u64 {
     return total;
 }
 
-fn add_progress_should_print_current_file() bool {
+fn add_fd_is_tty(fd: i32) bool {
     std.cfg(std.target_os == .tos_linux, {
         var probe: [byte: ADD_PROGRESS_TTY_PROBE_BYTES] = [];
-        _ = sys_ioctl(STDERR_FILENO, ADD_PROGRESS_TTY_IOCTL_TCGETS, &probe[0] as i64) catch {
+        _ = sys_ioctl(fd as i64, ADD_PROGRESS_TTY_IOCTL_TCGETS, &probe[0] as i64) catch {
             return false;
         };
         return true;
@@ -1237,7 +1468,8 @@ fn add_progress_should_print_current_file() bool {
 fn add_progress_init(files: &WorkspaceFileList) AddProgressState {
     const total_bytes: u64 = add_progress_total_bytes(files);
     const enabled: bool = files.len >= ADD_PROGRESS_MIN_FILES || total_bytes >= ADD_PROGRESS_MIN_BYTES;
-    const print_current_file: bool = add_progress_should_print_current_file();
+    const print_current_file: bool = add_fd_is_tty(STDERR_FILENO);
+    const print_path_timings: bool = add_fd_is_tty(STDOUT_FILENO);
     if enabled {
         fprintf(
             stderr,
@@ -1249,6 +1481,7 @@ fn add_progress_init(files: &WorkspaceFileList) AddProgressState {
     return AddProgressState{
         enabled: enabled,
         print_current_file: print_current_file,
+        print_path_timings: print_path_timings,
         total_files: files.len,
         total_bytes: total_bytes,
         processed_files: 0 as usize,
@@ -1320,6 +1553,13 @@ fn add_progress_finish(progress: &AddProgressState) void {
             progress.total_bytes,
         );
     }
+}
+
+fn add_arena_restore(arena: &Arena, used: usize) void {
+    arena.used = used;
+    arena.has_last = false;
+    arena.last_start = 0 as usize;
+    arena.last_aligned = 0 as usize;
 }
 
 fn add_load_existing_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapshot {
@@ -1528,9 +1768,9 @@ fn add_record_file_result(
     *update_index = *update_index + 1 as usize;
 }
 
-fn add_process_small_blob_batch(
-    task_count: usize,
-    tasks: &AddPrepareSmallBlobTask,
+fn add_process_small_blob_task_status(
+    task: &AddPrepareSmallBlobTask,
+    status: usize,
     store: &LooseObjectStore,
     existing_local_changes: &LocalChangeList,
     base_inputs: ManifestLeafInputList,
@@ -1540,8 +1780,91 @@ fn add_process_small_blob_batch(
     change_update_index: &usize,
     skipped_count: &usize,
     progress: &AddProgressState,
+    profile: &AddProfileState,
 ) !void {
-    const workers: &AddSmallBlobWorker = malloc(@size_of(AddSmallBlobWorker) as usize * task_count) as &AddSmallBlobWorker;
+    const file_entry: &WorkspaceFileEntry = task.file_entry;
+    if status == ADD_PREPARE_SMALL_PERMISSION {
+        add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
+        *skipped_count = *skipped_count + 1 as usize;
+        add_progress_mark_file(progress, file_entry);
+        return;
+    }
+    if status == ADD_PREPARE_SMALL_READ_FAILED || status == ADD_PREPARE_SMALL_ALLOC_FAILED {
+        add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+        *skipped_count = *skipped_count + 1 as usize;
+        add_progress_mark_file(progress, file_entry);
+        return;
+    }
+    if status == ADD_PREPARE_SMALL_ENCODE_FAILED || status == ADD_PREPARE_SMALL_HASH_FAILED {
+        return error.AddStoreFailed;
+    }
+
+    const result: &AddPreparedSmallBlobResult = status as &AddPreparedSmallBlobResult;
+    defer {
+        add_prepared_small_blob_result_free(result);
+    }
+    const store_started_ms: u64 = add_now_ms_or_zero();
+    const stored_id: ObjectId = try add_store_small_blob_encoded(
+        store,
+        &result.object_id,
+        add_owned_bytes_slice(&result.payload),
+    );
+    const store_elapsed_ms: u64 = add_elapsed_ms_since(store_started_ms);
+    add_profile_add_object_timings(profile, result.hash_elapsed_ms, store_elapsed_ms);
+    const update_index_before: usize = *update_index;
+    add_record_file_result(
+        existing_local_changes,
+        ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+        file_entry,
+        task.base_entry_index,
+        &stored_id,
+        raw_updates,
+        update_index,
+        raw_change_updates,
+        change_update_index,
+    );
+    add_print_new_stage_entries(
+        raw_updates,
+        update_index_before,
+        *update_index,
+        file_entry.logical_size,
+        result.hash_elapsed_ms,
+        store_elapsed_ms,
+        progress.print_path_timings,
+    );
+    add_progress_mark_file(progress, file_entry);
+}
+
+fn add_process_small_blob_batch(
+    task_count: usize,
+    worker_count_limit: usize,
+    tasks: &AddStoreObjectTask,
+    processed_results: &AddFileProcessResult,
+    skipped_count: &usize,
+    progress: &AddProgressState,
+    profile: &AddProfileState,
+) !void {
+    if task_count == 0 as usize {
+        return;
+    }
+
+    var worker_count: usize = worker_count_limit;
+    if worker_count > task_count {
+        worker_count = task_count;
+    }
+    if worker_count == 0 as usize {
+        worker_count = 1 as usize;
+    }
+
+    const statuses: &usize = malloc(@size_of(usize) as usize * task_count) as &usize;
+    if statuses == null {
+        return error.AddAlloc;
+    }
+    defer {
+        free(statuses as &void);
+    }
+
+    const workers: &AddStoreObjectWorker = malloc(@size_of(AddStoreObjectWorker) as usize * worker_count) as &AddStoreObjectWorker;
     if workers == null {
         return error.AddAlloc;
     }
@@ -1549,9 +1872,9 @@ fn add_process_small_blob_batch(
         free(workers as &void);
     }
 
-    var batch_index: usize = 0 as usize;
-    while batch_index < task_count {
-        workers[batch_index] = AddSmallBlobWorker{
+    var worker_index: usize = 0 as usize;
+    while worker_index < worker_count {
+        workers[worker_index] = AddStoreObjectWorker{
             thread: pthread_t{
                 tid: 0i64,
                 stack: null,
@@ -1562,19 +1885,22 @@ fn add_process_small_blob_batch(
                 start_routine: null,
                 arg: null,
             },
-            task: &tasks[batch_index],
-            status: ADD_PREPARE_SMALL_ALLOC_FAILED,
+            tasks: tasks,
+            task_count: task_count,
+            worker_index: worker_index,
+            worker_count: worker_count,
+            statuses: statuses,
             started: 0,
         };
         const create_result: i32 = pthread_create(
-            &workers[batch_index].thread,
+            &workers[worker_index].thread,
             null as &const pthread_attr_t,
-            &add_small_blob_worker_main as &void,
-            (&workers[batch_index]) as &void,
+            &add_store_object_worker_main as &void,
+            (&workers[worker_index]) as &void,
         );
         if create_result != 0 {
             var cleanup_index: usize = 0 as usize;
-            while cleanup_index < batch_index {
+            while cleanup_index < worker_index {
                 if workers[cleanup_index].started != 0 {
                     _ = pthread_join(&workers[cleanup_index].thread, null as & &void);
                 }
@@ -1582,74 +1908,29 @@ fn add_process_small_blob_batch(
             }
             return error.AddStoreFailed;
         }
-        workers[batch_index].started = 1;
-        batch_index = batch_index + 1 as usize;
+        workers[worker_index].started = 1;
+        worker_index = worker_index + 1 as usize;
     }
 
-    batch_index = 0 as usize;
-    while batch_index < task_count {
-        if workers[batch_index].started != 0 {
-            _ = pthread_join(&workers[batch_index].thread, null as & &void);
+    worker_index = 0 as usize;
+    while worker_index < worker_count {
+        if workers[worker_index].started != 0 {
+            _ = pthread_join(&workers[worker_index].thread, null as & &void);
         }
-        batch_index = batch_index + 1 as usize;
+        worker_index = worker_index + 1 as usize;
     }
 
-    batch_index = 0 as usize;
-    while batch_index < task_count {
-        const file_entry: &WorkspaceFileEntry = tasks[batch_index].file_entry;
-        const status: usize = workers[batch_index].status;
-        if status == ADD_PREPARE_SMALL_PERMISSION {
-            add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
-            *skipped_count = *skipped_count + 1 as usize;
-            add_progress_mark_file(progress, file_entry);
-            batch_index = batch_index + 1 as usize;
-            continue;
-        }
-        if status == ADD_PREPARE_SMALL_READ_FAILED || status == ADD_PREPARE_SMALL_ALLOC_FAILED {
-            add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
-            *skipped_count = *skipped_count + 1 as usize;
-            add_progress_mark_file(progress, file_entry);
-            batch_index = batch_index + 1 as usize;
-            continue;
-        }
-        if status == ADD_PREPARE_SMALL_ENCODE_FAILED || status == ADD_PREPARE_SMALL_HASH_FAILED {
-            return error.AddStoreFailed;
-        }
-
-        const result: &AddPreparedSmallBlobResult = status as &AddPreparedSmallBlobResult;
-        defer {
-            add_prepared_small_blob_result_free(result);
-        }
-        const store_started_ms: u64 = add_now_ms_or_zero();
-        const stored_id: ObjectId = try add_store_small_blob_encoded(
-            store,
-            &result.object_id,
-            add_owned_bytes_slice(&result.payload),
+    var task_index: usize = 0 as usize;
+    while task_index < task_count {
+        try add_process_completed_object_task(
+            &tasks[task_index],
+            statuses[task_index],
+            processed_results,
+            skipped_count,
+            progress,
+            profile,
         );
-        const store_elapsed_ms: u64 = add_elapsed_ms_since(store_started_ms);
-        const update_index_before: usize = *update_index;
-        add_record_file_result(
-            existing_local_changes,
-            ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-            file_entry,
-            tasks[batch_index].base_entry_index,
-            &stored_id,
-            raw_updates,
-            update_index,
-            raw_change_updates,
-            change_update_index,
-        );
-        add_print_new_stage_entries(
-            raw_updates,
-            update_index_before,
-            *update_index,
-            file_entry.logical_size,
-            result.hash_elapsed_ms,
-            store_elapsed_ms,
-            progress.enabled,
-        );
-        add_progress_mark_file(progress, file_entry);
-        batch_index = batch_index + 1 as usize;
+        task_index = task_index + 1 as usize;
     }
 }
 
@@ -1930,6 +2211,7 @@ fn add_merge_local_changes(arena: &Arena, existing: LocalChangeList, updates: &L
 }
 
 export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) !AddStageResult {
+    var profile: AddProfileState = add_profile_init();
     const arena_storage: &byte = malloc(ADD_ARENA_BYTES) as &byte;
     if arena_storage == null {
         return error.AddAlloc;
@@ -1942,6 +2224,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     arena_init(&arena, arena_storage, ADD_ARENA_BYTES);
 
     const scan_pathspecs: ManifestPathspecList = ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len };
+    const scan_started_ms: u64 = add_maybe_now_ms(profile.enabled);
     const scanned_files: WorkspaceFileList = workspace_scan_files_for_pathspecs(
         &arena,
         repo_path_cstr(root) as &const byte,
@@ -1961,21 +2244,10 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         }
         return error.AddReadFailed;
     };
+    add_profile_add_elapsed(&profile.scan_elapsed_ms, scan_started_ms);
 
     const stage_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STAGE_REL);
     const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
-    const stage_lock: StageFileLock = stage_file_lock_acquire(repo_path_cstr(&stage_path) as &const byte) catch |err| {
-        if @error_id(err) == @error_id(error.StageFileLockFailed) {
-            return error.AddStageLockFailed;
-        }
-        return error.AddStageWriteFailed;
-    };
-    defer {
-        stage_file_lock_release(&stage_lock);
-    }
-    const existing_snapshot: StageSnapshot = try add_load_existing_snapshot(&stage_path, &arena);
-    const existing_local_changes: LocalChangeList = try add_load_local_changes(&local_change_path, &arena);
-
     const matched_count: usize = scanned_files.len;
     var progress: AddProgressState = add_progress_init(&scanned_files);
 
@@ -1983,231 +2255,218 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     const store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
     const chunk_store_root: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_CHUNKS_REL);
     const chunk_store: ChunkStore = try chunk_store_open(repo_path_cstr(&chunk_store_root));
-    const base_inputs: ManifestLeafInputList = try add_load_base_inputs(
-        &arena,
-        &store,
-        &existing_snapshot.state.base_commit,
-        ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
-    );
 
-    var delete_match_count: usize = 0;
-    var base_index: usize = 0;
-    while base_index < base_inputs.len {
-        if !add_workspace_has_path(&scanned_files, &base_inputs.ptr[base_index].path) {
-            delete_match_count = delete_match_count + 1 as usize;
+    var processed_results: &AddFileProcessResult = null as &AddFileProcessResult;
+    if matched_count > 0 as usize {
+        processed_results = malloc(@size_of(AddFileProcessResult) as usize * matched_count) as &AddFileProcessResult;
+        if processed_results == null {
+            return error.AddAlloc;
         }
-        base_index = base_index + 1 as usize;
+        var init_index: usize = 0 as usize;
+        while init_index < matched_count {
+            processed_results[init_index] = add_file_process_result_pending();
+            init_index = init_index + 1 as usize;
+        }
     }
+    defer {
+        if processed_results != null {
+            free(processed_results as &void);
+        }
+    }
+    const process_arena_used: usize = arena.used;
 
-    const max_updates: usize = matched_count + delete_match_count;
-    if max_updates == 0 {
-        return error.AddNoMatches;
-    }
-
-    const raw_updates: &StageEntry = arena_alloc(&arena, @size_of(StageEntry) as usize * max_updates) as &StageEntry;
-    if raw_updates == null {
-        return error.AddAlloc;
-    }
-    const raw_change_updates: &LocalChange = arena_alloc(&arena, @size_of(LocalChange) as usize * max_updates) as &LocalChange;
-    if raw_change_updates == null {
-        return error.AddAlloc;
+    var cached_local_changes: LocalChangeList = LocalChangeList{ ptr: null, len: 0 };
+    if matched_count > 0 as usize {
+        const local_read_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+        cached_local_changes = try add_load_local_changes(&local_change_path, &arena);
+        add_profile_add_elapsed(&profile.local_change_read_elapsed_ms, local_read_started_ms);
     }
 
     const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
     const effective_parallel_workers: usize = add_parallel_worker_count(matched_count, add_parallel_requested_workers());
+    profile.workers = effective_parallel_workers;
+    const object_timing_enabled: bool = progress.print_path_timings || profile.enabled;
 
-    var update_index: usize = 0;
-    var change_update_index: usize = 0;
     var skipped_count: usize = 0;
+    const process_files_started_ms: u64 = add_maybe_now_ms(profile.enabled);
     if effective_parallel_workers > 1 as usize {
-        const batch_tasks: &AddPrepareSmallBlobTask = arena_alloc(
+        const batch_tasks: &AddStoreObjectTask = arena_alloc(
             &arena,
-            @size_of(AddPrepareSmallBlobTask) as usize * effective_parallel_workers,
-        ) as &AddPrepareSmallBlobTask;
+            @size_of(AddStoreObjectTask) as usize * matched_count,
+        ) as &AddStoreObjectTask;
         if batch_tasks == null {
             return error.AddAlloc;
         }
-        const worker_tasks: &AddStoreObjectTask = arena_alloc(
-            &arena,
-            @size_of(AddStoreObjectTask) as usize * effective_parallel_workers,
-        ) as &AddStoreObjectTask;
-        if worker_tasks == null {
-            return error.AddAlloc;
-        }
-        const worker_slots: &AddWorkerSlot = arena_alloc(
-            &arena,
-            @size_of(AddWorkerSlot) as usize * effective_parallel_workers,
-        ) as &AddWorkerSlot;
-        if worker_slots == null {
-            return error.AddAlloc;
-        }
-        const completion_queue: &AddCompletionQueue = arena_alloc(
-            &arena,
-            @size_of(AddCompletionQueue) as usize,
-        ) as &AddCompletionQueue;
-        if completion_queue == null {
-            return error.AddAlloc;
-        }
-        add_completion_queue_init(completion_queue);
-        var started_workers: usize = 0 as usize;
-        while started_workers < effective_parallel_workers {
-            add_worker_slot_init(&worker_slots[started_workers], started_workers, completion_queue);
-            const create_result: i32 = pthread_create(
-                &worker_slots[started_workers].thread,
-                null as &const pthread_attr_t,
-                &add_worker_slot_main as &void,
-                (&worker_slots[started_workers]) as &void,
-            );
-            if create_result != 0 {
-                var stop_index: usize = 0 as usize;
-                while stop_index < started_workers {
-                    add_worker_slot_request_stop(&worker_slots[stop_index]);
-                    _ = pthread_join(&worker_slots[stop_index].thread, null as & &void);
-                    stop_index = stop_index + 1 as usize;
-                }
-                return error.AddStoreFailed;
-            }
-            started_workers = started_workers + 1 as usize;
-        }
-        defer {
-            var stop_index: usize = 0 as usize;
-            while stop_index < started_workers {
-                add_worker_slot_request_stop(&worker_slots[stop_index]);
-                _ = pthread_join(&worker_slots[stop_index].thread, null as & &void);
-                stop_index = stop_index + 1 as usize;
-            }
-        }
-
-        var active_workers: usize = 0 as usize;
-        var assign_search_start: usize = 0 as usize;
         var file_index: usize = 0 as usize;
-
         while file_index < scanned_files.len {
             const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
-            add_progress_print_current_file(&progress, file_entry);
-            const base_entry_index: isize = add_find_base_entry(
-                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-                &file_entry.path,
-            );
+            const cache_lookup_started_ms: u64 = add_maybe_now_ms(profile.enabled);
             const cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(
                 &store,
-                &existing_local_changes,
+                &cached_local_changes,
                 file_entry,
             );
+            add_profile_add_elapsed(&profile.cache_lookup_elapsed_ms, cache_lookup_started_ms);
             if cached_object.hit {
-                const update_index_before: usize = update_index;
-                add_record_file_result(
-                    &existing_local_changes,
-                    ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-                    file_entry,
-                    base_entry_index,
-                    &cached_object.object_id,
-                    raw_updates,
-                    &update_index,
-                    raw_change_updates,
-                    &change_update_index,
-                );
-                add_print_new_stage_entries(
-                    raw_updates,
-                    update_index_before,
-                    update_index,
-                    file_entry.logical_size,
-                    0u64,
-                    0u64,
-                    progress.enabled,
-                );
+                profile.cache_hits = profile.cache_hits + 1 as usize;
+                add_progress_print_current_file(&progress, file_entry);
+                processed_results[file_index] = add_file_process_result_stored(&cached_object.object_id, 0u64, 0u64);
                 add_progress_mark_file(&progress, file_entry);
                 file_index = file_index + 1 as usize;
                 continue;
             }
 
-            const idle_slot_index: usize = add_worker_slots_find_idle(worker_slots, effective_parallel_workers, assign_search_start);
-            if idle_slot_index >= effective_parallel_workers {
-                const completed_slot_index: usize = add_completion_queue_wait_pop(completion_queue);
-                var completed_task: &AddStoreObjectTask = null as &AddStoreObjectTask;
-                var completed_status: usize = 0 as usize;
-                try add_worker_slot_take_completed(
-                    &worker_slots[completed_slot_index],
-                    &completed_task,
-                    &completed_status,
-                );
-                active_workers = active_workers - 1 as usize;
-                try add_process_completed_object_task(
-                    completed_task,
-                    completed_status,
-                    &existing_local_changes,
-                    ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-                    raw_updates,
-                    &update_index,
-                    raw_change_updates,
-                    &change_update_index,
-                    &skipped_count,
-                    &progress,
-                );
-                assign_search_start = completed_slot_index;
-                continue;
+            if add_is_parallel_small_blob_candidate(file_entry) {
+                var batch_count: usize = 0 as usize;
+                var seeded_first_entry: bool = false;
+                while file_index < scanned_files.len {
+                    const batch_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
+                    var batch_cached_hit: bool = false;
+                    var batch_cached_object_id: ObjectId = add_zero_object_id();
+                    if !seeded_first_entry {
+                        seeded_first_entry = true;
+                    } else {
+                        const batch_cache_lookup_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+                        const batch_cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(
+                            &store,
+                            &cached_local_changes,
+                            batch_entry,
+                        );
+                        add_profile_add_elapsed(&profile.cache_lookup_elapsed_ms, batch_cache_lookup_started_ms);
+                        batch_cached_hit = batch_cached_object.hit;
+                        batch_cached_object_id = ObjectId{ hash: add_hash32_clone(&batch_cached_object.object_id.hash) };
+                    }
+                    add_progress_print_current_file(&progress, batch_entry);
+
+                    if batch_cached_hit {
+                        const batch_result_index: usize = file_index;
+                        profile.cache_hits = profile.cache_hits + 1 as usize;
+                        processed_results[batch_result_index] = add_file_process_result_stored(&batch_cached_object_id, 0u64, 0u64);
+                        add_progress_mark_file(&progress, batch_entry);
+                        file_index = file_index + 1 as usize;
+                        continue;
+                    }
+                    if !add_is_parallel_small_blob_candidate(batch_entry) {
+                        break;
+                    }
+
+                    profile.cache_misses = profile.cache_misses + 1 as usize;
+                    profile.small_blob_misses = profile.small_blob_misses + 1 as usize;
+                    const batch_result_index: usize = file_index;
+                    batch_tasks[batch_count] = AddStoreObjectTask{
+                        root_fs_path: &root_fs_path,
+                        file_entry: batch_entry,
+                        result_index: batch_result_index,
+                        measure_object_timing: object_timing_enabled,
+                        measure_prepare_timing: profile.enabled,
+                        store: &store,
+                        chunk_store: &chunk_store,
+                    };
+                    batch_count = batch_count + 1 as usize;
+                    file_index = file_index + 1 as usize;
+                }
+
+                if batch_count > 0 as usize {
+                    profile.parallel_batches = profile.parallel_batches + 1 as usize;
+                    try add_process_small_blob_batch(
+                        batch_count,
+                        effective_parallel_workers,
+                        batch_tasks,
+                        processed_results,
+                        &skipped_count,
+                        &progress,
+                        &profile,
+                    );
+                    continue;
+                }
             }
 
-            worker_tasks[idle_slot_index] = AddStoreObjectTask{
-                root_fs_path: add_fs_path_clone(&root_fs_path),
-                file_entry: file_entry,
-                base_entry_index: base_entry_index,
-                store: &store,
-                chunk_store: &chunk_store,
+            add_progress_print_current_file(&progress, file_entry);
+            profile.cache_misses = profile.cache_misses + 1 as usize;
+            profile.large_blob_misses = profile.large_blob_misses + 1 as usize;
+            const object_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+            const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&root_fs_path, file_entry) catch |err| {
+                if add_error_is_skippable(@error_id(err)) {
+                    processed_results[file_index] = add_file_process_result_skipped(add_file_process_skip_status_for_error(@error_id(err)));
+                    if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
+                    } else {
+                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+                    }
+                    skipped_count = skipped_count + 1 as usize;
+                    add_progress_mark_file(&progress, file_entry);
+                    file_index = file_index + 1 as usize;
+                    continue;
+                }
+                return err;
             };
-            try add_worker_slot_assign(&worker_slots[idle_slot_index], &worker_tasks[idle_slot_index]);
-            active_workers = active_workers + 1 as usize;
-            assign_search_start = (idle_slot_index + 1 as usize) % effective_parallel_workers;
+            defer {
+                add_owned_bytes_free(&file_bytes);
+            }
+            const stored: AddStoredObjectResult = add_store_worktree_object(
+                &store,
+                &chunk_store,
+                file_entry,
+                add_owned_bytes_slice(&file_bytes),
+                object_timing_enabled,
+            ) catch |err| {
+                if add_error_is_skippable(@error_id(err)) {
+                    const skip_status: usize = add_file_process_skip_status_for_error(@error_id(err));
+                    processed_results[file_index] = add_file_process_result_skipped(skip_status);
+                    if skip_status == ADD_FILE_PROCESS_SKIP_PERMISSION {
+                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
+                    } else {
+                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+                    }
+                    skipped_count = skipped_count + 1 as usize;
+                    add_progress_mark_file(&progress, file_entry);
+                    file_index = file_index + 1 as usize;
+                    continue;
+                }
+                return err;
+            };
+            var prepare_ms: u64 = 0u64;
+            if profile.enabled {
+                const object_total_ms: u64 = add_elapsed_ms_since(object_started_ms);
+                if object_total_ms > stored.store_elapsed_ms {
+                    prepare_ms = object_total_ms - stored.store_elapsed_ms;
+                }
+            }
+            add_profile_add_object_timings(&profile, prepare_ms, stored.store_elapsed_ms);
+            processed_results[file_index] = add_file_process_result_stored(
+                &stored.object_id,
+                stored.hash_elapsed_ms,
+                stored.store_elapsed_ms,
+            );
+            add_progress_mark_file(&progress, file_entry);
             file_index = file_index + 1 as usize;
-        }
-
-        while active_workers > 0 as usize {
-            const completed_slot_index: usize = add_completion_queue_wait_pop(completion_queue);
-            var completed_task: &AddStoreObjectTask = null as &AddStoreObjectTask;
-            var completed_status: usize = 0 as usize;
-            try add_worker_slot_take_completed(
-                &worker_slots[completed_slot_index],
-                &completed_task,
-                &completed_status,
-            );
-            active_workers = active_workers - 1 as usize;
-            try add_process_completed_object_task(
-                completed_task,
-                completed_status,
-                &existing_local_changes,
-                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-                raw_updates,
-                &update_index,
-                raw_change_updates,
-                &change_update_index,
-                &skipped_count,
-                &progress,
-            );
         }
     } else {
         var file_index: usize = 0 as usize;
         while file_index < scanned_files.len {
             const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
             add_progress_print_current_file(&progress, file_entry);
-            var file_started_ms: u64 = 0u64;
-            if progress.enabled {
-                file_started_ms = add_now_ms_or_zero();
-            }
-            const base_entry_index: isize = add_find_base_entry(
-                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-                &file_entry.path,
-            );
+            const cache_lookup_started_ms: u64 = add_maybe_now_ms(profile.enabled);
             const cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(
                 &store,
-                &existing_local_changes,
+                &cached_local_changes,
                 file_entry,
             );
-            var stored: AddStoredObjectResult = add_stored_object_result(add_zero_object_id(), 0u64, 0u64);
+            add_profile_add_elapsed(&profile.cache_lookup_elapsed_ms, cache_lookup_started_ms);
             if cached_object.hit {
-                stored = add_stored_object_result(cached_object.object_id, 0u64, 0u64);
+                profile.cache_hits = profile.cache_hits + 1 as usize;
+                processed_results[file_index] = add_file_process_result_stored(&cached_object.object_id, 0u64, 0u64);
             } else {
+                profile.cache_misses = profile.cache_misses + 1 as usize;
+                if add_is_parallel_small_blob_candidate(file_entry) {
+                    profile.small_blob_misses = profile.small_blob_misses + 1 as usize;
+                } else {
+                    profile.large_blob_misses = profile.large_blob_misses + 1 as usize;
+                }
+                const object_started_ms: u64 = add_maybe_now_ms(profile.enabled);
                 const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&root_fs_path, file_entry) catch |err| {
                     if add_error_is_skippable(@error_id(err)) {
+                        processed_results[file_index] = add_file_process_result_skipped(add_file_process_skip_status_for_error(@error_id(err)));
                         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
                             add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
                         } else {
@@ -2223,9 +2482,21 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 defer {
                     add_owned_bytes_free(&file_bytes);
                 }
-                stored = add_store_worktree_object(&store, &chunk_store, file_entry, add_owned_bytes_slice(&file_bytes)) catch |err| {
+                const stored: AddStoredObjectResult = add_store_worktree_object(
+                    &store,
+                    &chunk_store,
+                    file_entry,
+                    add_owned_bytes_slice(&file_bytes),
+                    object_timing_enabled,
+                ) catch |err| {
                     if add_error_is_skippable(@error_id(err)) {
-                        add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+                        const skip_status: usize = add_file_process_skip_status_for_error(@error_id(err));
+                        processed_results[file_index] = add_file_process_result_skipped(skip_status);
+                        if skip_status == ADD_FILE_PROCESS_SKIP_PERMISSION {
+                            add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
+                        } else {
+                            add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+                        }
                         skipped_count = skipped_count + 1 as usize;
                         add_progress_mark_file(&progress, file_entry);
                         file_index = file_index + 1 as usize;
@@ -2233,44 +2504,128 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                     }
                     return err;
                 };
+                var prepare_ms: u64 = 0u64;
+                if profile.enabled {
+                    const object_total_ms: u64 = add_elapsed_ms_since(object_started_ms);
+                    if object_total_ms > stored.store_elapsed_ms {
+                        prepare_ms = object_total_ms - stored.store_elapsed_ms;
+                    }
+                }
+                add_profile_add_object_timings(&profile, prepare_ms, stored.store_elapsed_ms);
+                processed_results[file_index] = add_file_process_result_stored(
+                    &stored.object_id,
+                    stored.hash_elapsed_ms,
+                    stored.store_elapsed_ms,
+                );
             }
-
-            const update_index_before: usize = update_index;
-            add_record_file_result(
-                &existing_local_changes,
-                ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
-                file_entry,
-                base_entry_index,
-                &stored.object_id,
-                raw_updates,
-                &update_index,
-                raw_change_updates,
-                &change_update_index,
-            );
-            add_print_new_stage_entries(
-                raw_updates,
-                update_index_before,
-                update_index,
-                file_entry.logical_size,
-                stored.hash_elapsed_ms,
-                stored.store_elapsed_ms,
-                progress.enabled,
-            );
             add_progress_mark_file(&progress, file_entry);
             file_index = file_index + 1 as usize;
         }
     }
+    add_profile_add_elapsed(&profile.process_files_wall_ms, process_files_started_ms);
 
     add_progress_finish(&progress);
 
+    add_arena_restore(&arena, process_arena_used);
+
+    const stage_lock_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+    const stage_lock: StageFileLock = stage_file_lock_acquire(repo_path_cstr(&stage_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.StageFileLockFailed) {
+            return error.AddStageLockFailed;
+        }
+        return error.AddStageWriteFailed;
+    };
+    add_profile_add_elapsed(&profile.stage_lock_elapsed_ms, stage_lock_started_ms);
+    defer {
+        stage_file_lock_release(&stage_lock);
+    }
+
+    const stage_read_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+    const existing_snapshot: StageSnapshot = try add_load_existing_snapshot(&stage_path, &arena);
+    add_profile_add_elapsed(&profile.stage_read_elapsed_ms, stage_read_started_ms);
+    const local_read_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+    const existing_local_changes: LocalChangeList = try add_load_local_changes(&local_change_path, &arena);
+    add_profile_add_elapsed(&profile.local_change_read_elapsed_ms, local_read_started_ms);
+    const base_manifest_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+    const base_inputs: ManifestLeafInputList = try add_load_base_inputs(
+        &arena,
+        &store,
+        &existing_snapshot.state.base_commit,
+        ManifestPathspecList{ ptr: pathspecs.ptr, len: pathspecs.len },
+    );
+    add_profile_add_elapsed(&profile.base_manifest_elapsed_ms, base_manifest_started_ms);
+
+    var delete_match_count: usize = 0 as usize;
+    var base_index: usize = 0 as usize;
+    while base_index < base_inputs.len {
+        if !add_workspace_has_path(&scanned_files, &base_inputs.ptr[base_index].path) {
+            delete_match_count = delete_match_count + 1 as usize;
+        }
+        base_index = base_index + 1 as usize;
+    }
+
+    const max_updates: usize = matched_count + delete_match_count;
+    if max_updates == 0 as usize {
+        return error.AddNoMatches;
+    }
+
+    const raw_updates: &StageEntry = arena_alloc(&arena, @size_of(StageEntry) as usize * max_updates) as &StageEntry;
+    if raw_updates == null {
+        return error.AddAlloc;
+    }
+    const raw_change_updates: &LocalChange = arena_alloc(&arena, @size_of(LocalChange) as usize * max_updates) as &LocalChange;
+    if raw_change_updates == null {
+        return error.AddAlloc;
+    }
+
+    var update_index: usize = 0 as usize;
+    var change_update_index: usize = 0 as usize;
+    var file_index: usize = 0 as usize;
+    while file_index < matched_count {
+        const processed: &AddFileProcessResult = &processed_results[file_index];
+        if processed.status == ADD_FILE_PROCESS_SKIP_PERMISSION ||
+            processed.status == ADD_FILE_PROCESS_SKIP_UNPROCESSABLE {
+            file_index = file_index + 1 as usize;
+            continue;
+        }
+        if processed.status != ADD_FILE_PROCESS_STORED {
+            return error.AddStoreFailed;
+        }
+
+        const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
+        const base_entry_index: isize = add_find_base_entry(
+            ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+            &file_entry.path,
+        );
+        const update_index_before: usize = update_index;
+        add_record_file_result(
+            &existing_local_changes,
+            ManifestLeafInputList{ ptr: base_inputs.ptr, len: base_inputs.len },
+            file_entry,
+            base_entry_index,
+            &processed.object_id,
+            raw_updates,
+            &update_index,
+            raw_change_updates,
+            &change_update_index,
+        );
+        add_print_new_stage_entries(
+            raw_updates,
+            update_index_before,
+            update_index,
+            file_entry.logical_size,
+            processed.hash_elapsed_ms,
+            processed.store_elapsed_ms,
+            progress.print_path_timings,
+        );
+        file_index = file_index + 1 as usize;
+    }
+
+    const delete_stage_started_ms: u64 = add_maybe_now_ms(profile.enabled);
     base_index = 0;
     while base_index < base_inputs.len {
         const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_index];
         if !add_workspace_has_path(&scanned_files, &base_entry.path) {
-            var delete_started_ms: u64 = 0u64;
-            if progress.enabled {
-                delete_started_ms = add_now_ms_or_zero();
-            }
             const existing_local_change_index: isize = add_find_local_change(&existing_local_changes, &base_entry.path);
             var watcher_seq: u64 = 0u64;
             var reconcile_epoch: u64 = 0u64;
@@ -2301,53 +2656,74 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 file_mode: base_entry.mode,
             };
             update_index = update_index + 1 as usize;
-            add_print_staged_path(&base_entry.path, 0u64, 0u64, 0u64, progress.enabled);
+            add_print_staged_path(&base_entry.path, 0u64, 0u64, 0u64, progress.print_path_timings);
         }
         base_index = base_index + 1 as usize;
     }
+    add_profile_add_elapsed(&profile.delete_stage_elapsed_ms, delete_stage_started_ms);
 
     if update_index == 0 {
         if change_update_index > 0 as usize {
+            const local_sort_started_ms: u64 = add_maybe_now_ms(profile.enabled);
             add_sort_local_changes(raw_change_updates, change_update_index);
+            add_profile_add_elapsed(&profile.local_change_sort_elapsed_ms, local_sort_started_ms);
+            const local_merge_started_ms: u64 = add_maybe_now_ms(profile.enabled);
             const merged_local_changes: LocalChangeList = try add_merge_local_changes(
                 &arena,
                 LocalChangeList{ ptr: existing_local_changes.ptr, len: existing_local_changes.len },
                 raw_change_updates,
                 change_update_index,
             );
+            add_profile_add_elapsed(&profile.local_change_merge_elapsed_ms, local_merge_started_ms);
+            const local_write_started_ms: u64 = add_maybe_now_ms(profile.enabled);
             local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &merged_local_changes) catch {
                 return error.AddLocalChangeWriteFailed;
             };
+            add_profile_add_elapsed(&profile.local_change_write_elapsed_ms, local_write_started_ms);
         }
+        add_profile_print_summary(&profile, matched_count, 0 as usize, delete_match_count, skipped_count);
         return AddStageResult{
             staged_count: 0 as usize,
             skipped_count: skipped_count,
         };
     }
 
+    const stage_sort_started_ms: u64 = add_maybe_now_ms(profile.enabled);
     add_sort_stage_entries(raw_updates, update_index);
+    add_profile_add_elapsed(&profile.stage_sort_elapsed_ms, stage_sort_started_ms);
+    const stage_merge_started_ms: u64 = add_maybe_now_ms(profile.enabled);
     const merged_entries: StageEntryList = try add_merge_entries(&arena, existing_snapshot.entries, raw_updates, update_index);
+    add_profile_add_elapsed(&profile.stage_merge_elapsed_ms, stage_merge_started_ms);
     const current_ms: u64 = now_ms() catch {
         return error.AddTimeFailed;
     };
     const state: StageState = stage_state_with_entry_count(existing_snapshot.state.base_commit, merged_entries.len as u64, current_ms as i64);
     const snapshot: StageSnapshot = stage_snapshot_init(state, merged_entries);
+    const stage_write_started_ms: u64 = add_maybe_now_ms(profile.enabled);
     stage_file_write(repo_path_cstr(&stage_path) as &const byte, &snapshot) catch {
         return error.AddStageWriteFailed;
     };
+    add_profile_add_elapsed(&profile.stage_write_elapsed_ms, stage_write_started_ms);
 
     if change_update_index > 0 as usize {
+        const local_sort_started_ms: u64 = add_maybe_now_ms(profile.enabled);
         add_sort_local_changes(raw_change_updates, change_update_index);
+        add_profile_add_elapsed(&profile.local_change_sort_elapsed_ms, local_sort_started_ms);
+        const local_merge_started_ms: u64 = add_maybe_now_ms(profile.enabled);
         const merged_local_changes: LocalChangeList = try add_merge_local_changes(
             &arena,
             LocalChangeList{ ptr: existing_local_changes.ptr, len: existing_local_changes.len },
             raw_change_updates,
             change_update_index,
         );
+        add_profile_add_elapsed(&profile.local_change_merge_elapsed_ms, local_merge_started_ms);
+        const local_write_started_ms: u64 = add_maybe_now_ms(profile.enabled);
         local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &merged_local_changes) catch {
             return error.AddLocalChangeWriteFailed;
         };
+        add_profile_add_elapsed(&profile.local_change_write_elapsed_ms, local_write_started_ms);
     }
+    add_profile_print_summary(&profile, matched_count, update_index, delete_match_count, skipped_count);
     return AddStageResult{
         staged_count: update_index,
         skipped_count: skipped_count,

@@ -74,6 +74,7 @@ test:
 	$(UYA) test src/hgx/test_head_ref.uya
 	$(UYA) test src/hgx/test_file_remote.uya
 	$(UYA) test src/hgx/test_hydrate_missing_object.uya
+	$(UYA) test src/hgx/test_add_parallel.uya
 	$(UYA) test src/hgx/test_commit_partial_stage.uya
 	$(UYA) test src/hgx/test_checkout_security.uya
 	$(UYA) test src/hgx/test_cli_args.uya

@@ -51,7 +51,7 @@ use workspace.state.ChangeStatus;
 use workspace.state.LocalChange;
 use workspace.state.LocalChangeList;
 
-const STATUS_ARENA_BYTES: usize = 134217728 as usize;
+const STATUS_ARENA_BYTES: usize = 268435456 as usize;
 
 error StatusAlloc;
 error StatusPathTooLong;
