@@ -37,3 +37,6 @@ require_line() {
 
 require_line "Merge Scope:"
 require_line "  merge CLI and conflict workflow remain deferred to v1.1+"
+require_line "Branch / Clone Scope:"
+require_line "  branch CLI remains deferred to v1.1+"
+require_line "  clone CLI remains deferred to v1.1+; use 'hgx init' + 'hgx fetch file://...'"

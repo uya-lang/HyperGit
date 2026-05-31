@@ -1,7 +1,27 @@
 use libc.stderr;
 use libc.fprintf;
 
+use std.string.strcmp;
+
+use cli.EXIT_NOT_IMPLEMENTED;
 use cli.EXIT_USAGE_ERROR;
+
+fn error_same_arg(actual: &byte, expected: &const byte) bool {
+    if actual == null {
+        return false;
+    }
+    return strcmp(actual as &const byte, expected) == 0;
+}
+
+export fn run_deferred_command(command: &byte) i32 {
+    fprintf(stderr, "error: '%s' is deferred and out of v1.0 scope\n" as *byte, command);
+    if error_same_arg(command, "clone") {
+        fprintf(stderr, "use 'hgx init' and then 'hgx fetch file://<repo>' to bootstrap from a file remote.\n" as *byte);
+    } else {
+        fprintf(stderr, "v1.0 only ships the default branch workflow.\n" as *byte);
+    }
+    return EXIT_NOT_IMPLEMENTED;
+}
 
 export fn run_unknown_command(command: &byte) i32 {
     fprintf(stderr, "error: unknown command '%s'\n" as *byte, command);

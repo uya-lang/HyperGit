@@ -24,6 +24,17 @@ HyperGit / 极仓是一个用纯 Uya 设计和实现的 Git-like 版本控制系
 
 当前发布版本：`v0.1.0`（2026-05-31），对应首个 native `hgx` MVP 里程碑。发布说明见 [v0.1.0 里程碑](docs/releases/v0.1.0.md)。
 
+`branch` / `clone` 虽然明确延后，但 `v1.0.0` 仍提供一条发布级 file remote bootstrap 路径。当前推荐流程是先 `init` 一个空仓库，再执行 `fetch`：
+
+```bash
+mkdir demo-clone
+cd demo-clone
+hgx init
+hgx fetch file:///absolute/path/to/remote
+```
+
+这会把远端 `main` materialize 到当前工作区，并同步本地 head / workspace state；`v1.0.0` 默认只承诺这条单分支主路径。
+
 继续阅读：
 
 - [系统设计文档](docs/design.md)

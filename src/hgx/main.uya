@@ -20,6 +20,7 @@ use commands.version.run_version;
 use commands.status.run_status;
 use commands.doctor.run_doctor;
 use commands.init.run_init;
+use commands.errors.run_deferred_command;
 use commands.errors.run_unknown_command;
 
 export fn main() i32 {
@@ -31,6 +32,10 @@ export fn main() i32 {
         return run_help();
     } else if plan.action == DispatchAction.Version {
         return run_version();
+    } else if plan.action == DispatchAction.BranchDeferred {
+        return run_deferred_command(plan.subject);
+    } else if plan.action == DispatchAction.CloneDeferred {
+        return run_deferred_command(plan.subject);
     } else if plan.action == DispatchAction.Fetch {
         return run_fetch();
     } else if plan.action == DispatchAction.Push {

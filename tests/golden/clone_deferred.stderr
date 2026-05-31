@@ -1,0 +1,2 @@
+error: 'clone' is deferred and out of v1.0 scope
+use 'hgx init' and then 'hgx fetch file://<repo>' to bootstrap from a file remote.
