@@ -368,9 +368,18 @@ fn loose_store_put_with_id(self: &LooseObjectStore, id: &ObjectId, kind: ObjectK
         _ = file_close(&file) catch {};
     }
 
-    if (try file_write(&file, encoded.ptr as &const byte, total_len)) != total_len {
-        _ = unlink(store_path_cstr(&temp_path) as &const byte);
-        return error.StoreWriteFailed;
+    var written_total: usize = 0;
+    while written_total < total_len {
+        const chunk_written: usize = try file_write(
+            &file,
+            @ptr_from_usize(@usize_from_ptr(encoded.ptr as &void) + written_total) as &const byte,
+            total_len - written_total,
+        );
+        if chunk_written == 0 {
+            _ = unlink(store_path_cstr(&temp_path) as &const byte);
+            return error.StoreWriteFailed;
+        }
+        written_total = written_total + chunk_written;
     }
 
     _ = file_close(&file) catch {

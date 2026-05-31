@@ -1,13 +1,17 @@
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
+use std.io.file.File;
+use std.io.file.file_close;
+use std.io.file.file_open;
+use std.io.file.file_read;
 use std.string.strlen;
 use std.io.file.FILE;
 use std.io.file.fclose;
 use std.io.file.fopen;
-use std.io.file.fread;
 use std.io.file.fwrite;
 
 use libc.Stat;
+use libc.O_RDONLY;
 use libc.remove;
 use libc.stat;
 use libc.system;
@@ -45,9 +49,11 @@ use store.object_store.ObjectBytes;
 const GIT_INTEROP_PATH_MAX: usize = 4096;
 const GIT_INTEROP_OID_HEX_BYTES: usize = 40 as usize;
 const GIT_INTEROP_TMPNAME_BYTES: usize = 64 as usize;
+const GIT_INTEROP_MODE_SUBMODULE: u32 = 0o160000u32;
 
 error GitInteropAlloc;
 error GitInteropInvalidOid;
+error GitInteropObjectMissing;
 error GitInteropLooseObjectMissing;
 error GitInteropUnsupportedPackedObject;
 error GitInteropGitCommandFailed;
@@ -194,6 +200,22 @@ fn git_interop_object_exists(git_dir: &[byte], oid_hex: &[byte]) bool {
     return system(git_interop_path_cstr(&cmd) as &const byte) == 0;
 }
 
+fn git_interop_command_rev_parse(git_dir: &[byte], oid_hex: &[byte], peel_kind: &const byte, output: &GitInteropPath) !void {
+    var cmd: GitInteropPath = git_interop_path_empty();
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("git --git-dir='"));
+    try git_interop_path_append_bytes(&cmd, git_dir);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("' rev-parse --verify '"));
+    try git_interop_path_append_bytes(&cmd, oid_hex);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("^{"));
+    try git_interop_path_append_bytes(&cmd, (peel_kind as &byte)[0: strlen(peel_kind)]);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("}' >'"));
+    try git_interop_path_append_bytes(&cmd, output.bytes[0: output.len]);
+    try git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("' 2>/dev/null"));
+    if system(git_interop_path_cstr(&cmd) as &const byte) != 0 {
+        return error.GitInteropGitCommandFailed;
+    }
+}
+
 fn git_interop_require_loose_object(git_dir: &[byte], oid_hex: &[byte]) !void {
     const loose_path: GitInteropPath = try git_interop_loose_object_path(git_dir, oid_hex);
     var st: Stat = Stat{};
@@ -204,6 +226,26 @@ fn git_interop_require_loose_object(git_dir: &[byte], oid_hex: &[byte]) !void {
         return error.GitInteropUnsupportedPackedObject;
     }
     return error.GitInteropLooseObjectMissing;
+}
+
+fn git_interop_resolve_oid(arena: &Arena, git_dir: &[byte], oid_hex: &[byte], peel_kind: &const byte) !ByteList {
+    try git_interop_validate_oid_hex(oid_hex);
+    if !git_interop_object_exists(git_dir, oid_hex) {
+        return error.GitInteropObjectMissing;
+    }
+
+    const output: GitInteropPath = try git_interop_tmp_path();
+    defer {
+        _ = remove(git_interop_path_cstr(&output) as &const byte);
+    }
+
+    git_interop_command_rev_parse(git_dir, oid_hex, peel_kind, &output) catch {
+        return error.GitInteropUnsupportedGitObject;
+    };
+    const resolved_file: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&output) as &const byte);
+    const resolved_hex: &[byte] = git_interop_trim_newline(resolved_file.ptr[0: resolved_file.len]);
+    try git_interop_validate_oid_hex(resolved_hex);
+    return try git_interop_copy_bytes(arena, resolved_hex);
 }
 
 fn git_interop_arena_bytes(arena: &Arena, len: usize) !&[byte] {
@@ -235,15 +277,20 @@ fn git_interop_read_file(arena: &Arena, path: &const byte) !ByteList {
     }
     const size: usize = st.st_size as usize;
     const out: &[byte] = try git_interop_arena_bytes(arena, size);
-    const stream: &FILE = fopen(path, "r");
-    if stream == null {
+    const file: File = file_open(path, O_RDONLY as i32, 0u32) catch {
         return error.GitInteropReadFailed;
-    }
+    };
     defer {
-        _ = fclose(stream);
+        _ = file_close(&file) catch {};
     }
-    if fread(out.ptr, 1 as usize, size, stream) != size {
-        return error.GitInteropReadFailed;
+
+    var read_total: usize = 0 as usize;
+    while read_total < size {
+        const chunk: isize = file_read(&file, &out.ptr[read_total], size - read_total);
+        if chunk <= 0 {
+            return error.GitInteropReadFailed;
+        }
+        read_total = read_total + chunk as usize;
     }
     return ByteList{ ptr: out.ptr, len: size };
 }
@@ -430,14 +477,22 @@ fn git_interop_mode_to_entry(mode: &[byte], kind: &EntryKind, file_mode: &u32) !
         *file_mode = 0o120000u32;
         return;
     }
+    if git_interop_slice_eq_literal(mode, "160000") {
+        *kind = EntryKind.File;
+        *file_mode = GIT_INTEROP_MODE_SUBMODULE;
+        return;
+    }
     return error.GitInteropUnsupportedTreeEntry;
 }
 
-fn git_interop_entry_kind_to_git_mode(kind: EntryKind) &const byte {
-    if kind == EntryKind.Executable {
+fn git_interop_entry_mode_to_git_mode(mode: u32, kind: EntryKind) &const byte {
+    if mode == GIT_INTEROP_MODE_SUBMODULE {
+        return "160000" as &const byte;
+    }
+    if kind == EntryKind.Executable || mode == 0o100755u32 {
         return "100755" as &const byte;
     }
-    if kind == EntryKind.Symlink {
+    if kind == EntryKind.Symlink || mode == 0o120000u32 {
         return "120000" as &const byte;
     }
     return "100644" as &const byte;
@@ -526,59 +581,40 @@ fn git_interop_empty_module_bitmap() ModuleBitmap {
     return ModuleBitmap{ bytes: ByteList{ ptr: null, len: 0 } };
 }
 
+fn git_interop_store_small_blob_bytes(arena: &Arena, store: &LooseObjectStore, bytes: &[byte]) !ObjectId {
+    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(arena, bytes);
+    const encoded: ByteList = try small_blob_payload_to_canonical(arena, &payload);
+    return try store.put(ObjectKind.SmallBlob, encoded.ptr[0: encoded.len]);
+}
+
 
 export fn git_read_loose_blob(arena: &Arena, git_dir: &[byte], oid_hex: &[byte]) !GitLooseBlob {
-    try git_interop_require_loose_object(git_dir, oid_hex);
-    const type_path: GitInteropPath = try git_interop_tmp_path();
+    const resolved_oid: ByteList = try git_interop_resolve_oid(arena, git_dir, oid_hex, "blob");
     const data_path: GitInteropPath = try git_interop_tmp_path();
     defer {
-        _ = remove(git_interop_path_cstr(&type_path) as &const byte);
         _ = remove(git_interop_path_cstr(&data_path) as &const byte);
     }
 
-    try git_interop_command_capture(git_dir, oid_hex, "t", &type_path);
-    try git_interop_command_capture(git_dir, oid_hex, "p", &data_path);
-
-    const type_bytes: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&type_path) as &const byte);
-    const blob_prefix: &[byte] = &"blob"[0: 4];
-    if type_bytes.len < 4 as usize {
-        return error.GitInteropUnsupportedGitObject;
-    }
-    var i: usize = 0 as usize;
-    while i < 4 as usize {
-        if type_bytes.ptr[i] != blob_prefix.ptr[i] {
-            return error.GitInteropUnsupportedGitObject;
-        }
-        i = i + 1 as usize;
-    }
-
-    const oid_copy: &[byte] = try git_interop_arena_bytes(arena, oid_hex.len);
-    i = 0 as usize;
-    while i < oid_hex.len {
-        oid_copy.ptr[i] = oid_hex.ptr[i];
-        i = i + 1 as usize;
-    }
+    try git_interop_command_capture(git_dir, resolved_oid.ptr[0: resolved_oid.len], "p", &data_path);
     const content: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&data_path) as &const byte);
     return GitLooseBlob{
-        oid_hex: ByteList{ ptr: oid_copy.ptr, len: oid_copy.len },
+        oid_hex: resolved_oid,
         content: ByteList{ ptr: content.ptr, len: content.len },
     };
 }
 
 export fn git_import_loose_blob_as_small_blob(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], oid_hex: &[byte]) !ObjectId {
     const blob: GitLooseBlob = try git_read_loose_blob(arena, git_dir, oid_hex);
-    const payload: SmallBlobPayload = try small_blob_payload_from_bytes(arena, blob.content.ptr[0: blob.content.len]);
-    const encoded: ByteList = try small_blob_payload_to_canonical(arena, &payload);
-    return try store.put(ObjectKind.SmallBlob, encoded.ptr[0: encoded.len]);
+    return try git_interop_store_small_blob_bytes(arena, store, blob.content.ptr[0: blob.content.len]);
 }
 
 export fn git_tree_to_manifest_entries(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], tree_hex: &[byte]) !GitTreeEntryList {
-    try git_interop_validate_oid_hex(tree_hex);
+    const resolved_tree_hex: ByteList = try git_interop_resolve_oid(arena, git_dir, tree_hex, "tree");
     const list_path: GitInteropPath = try git_interop_tmp_path();
     defer {
         _ = remove(git_interop_path_cstr(&list_path) as &const byte);
     }
-    try git_interop_command_capture_ls_tree(git_dir, tree_hex, &list_path);
+    try git_interop_command_capture_ls_tree(git_dir, resolved_tree_hex.ptr[0: resolved_tree_hex.len], &list_path);
     const raw: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&list_path) as &const byte);
     const count: usize = git_interop_count_tree_entries(raw.ptr[0: raw.len]);
     if count == 0 as usize {
@@ -616,9 +652,6 @@ export fn git_tree_to_manifest_entries(arena: &Arena, store: &LooseObjectStore, 
             return error.GitInteropTreeParseFailed;
         }
         const type_name: &[byte] = entry.ptr[type_start: type_end - type_start];
-        if !git_interop_slice_eq_literal(type_name, "blob") {
-            return error.GitInteropUnsupportedTreeEntry;
-        }
         const oid_start: usize = type_end + 1 as usize;
         if oid_start + GIT_INTEROP_OID_HEX_BYTES >= entry.len {
             return error.GitInteropTreeParseFailed;
@@ -629,16 +662,34 @@ export fn git_tree_to_manifest_entries(arena: &Arena, store: &LooseObjectStore, 
             return error.GitInteropTreeParseFailed;
         }
         const normalized_path: ByteList = try manifest_path_normalize(arena, entry.ptr[path_start: entry.len - path_start]);
-        const blob: GitLooseBlob = try git_read_loose_blob(arena, git_dir, oid_hex);
         var entry_kind: EntryKind = EntryKind.File;
         var file_mode: u32 = 0u32;
         try git_interop_mode_to_entry(mode, &entry_kind, &file_mode);
+        if file_mode == GIT_INTEROP_MODE_SUBMODULE {
+            if !git_interop_slice_eq_literal(type_name, "commit") {
+                return error.GitInteropUnsupportedTreeEntry;
+            }
+            entries[out_index] = GitTreeEntry{
+                path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
+                kind: entry_kind,
+                file_mode: file_mode,
+                content_type: ContentType.Unknown,
+                object_id: try git_interop_store_small_blob_bytes(arena, store, oid_hex),
+                logical_size: oid_hex.len as u64,
+            };
+            out_index = out_index + 1 as usize;
+            continue;
+        }
+        if !git_interop_slice_eq_literal(type_name, "blob") {
+            return error.GitInteropUnsupportedTreeEntry;
+        }
+        const blob: GitLooseBlob = try git_read_loose_blob(arena, git_dir, oid_hex);
         entries[out_index] = GitTreeEntry{
             path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
             kind: entry_kind,
             file_mode: file_mode,
             content_type: git_interop_tree_content_type(blob.content.ptr[0: blob.content.len]),
-            object_id: try git_import_loose_blob_as_small_blob(arena, store, git_dir, oid_hex),
+            object_id: try git_interop_store_small_blob_bytes(arena, store, blob.content.ptr[0: blob.content.len]),
             logical_size: blob.content.len as u64,
         };
         out_index = out_index + 1 as usize;
@@ -674,22 +725,13 @@ export fn git_tree_to_manifest(arena: &Arena, store: &LooseObjectStore, git_dir:
 }
 
 export fn git_read_commit(arena: &Arena, git_dir: &[byte], commit_hex: &[byte]) !GitCommit {
-    try git_interop_require_loose_object(git_dir, commit_hex);
-    const type_path: GitInteropPath = try git_interop_tmp_path();
+    const resolved_commit_hex: ByteList = try git_interop_resolve_oid(arena, git_dir, commit_hex, "commit");
     const data_path: GitInteropPath = try git_interop_tmp_path();
     defer {
-        _ = remove(git_interop_path_cstr(&type_path) as &const byte);
         _ = remove(git_interop_path_cstr(&data_path) as &const byte);
     }
 
-    try git_interop_command_capture(git_dir, commit_hex, "t", &type_path);
-    try git_interop_command_capture(git_dir, commit_hex, "p", &data_path);
-
-    const type_bytes: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&type_path) as &const byte);
-    if type_bytes.len < 6 as usize || !git_interop_slice_eq_literal(type_bytes.ptr[0: 6], "commit") {
-        return error.GitInteropUnsupportedGitObject;
-    }
-
+    try git_interop_command_capture(git_dir, resolved_commit_hex.ptr[0: resolved_commit_hex.len], "p", &data_path);
     const raw: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&data_path) as &const byte);
     const parent_count: usize = git_interop_count_commit_parent_lines(raw.ptr[0: raw.len]);
     var parents: &ByteList = null;
@@ -700,7 +742,7 @@ export fn git_read_commit(arena: &Arena, git_dir: &[byte], commit_hex: &[byte]) 
         }
     }
 
-    var oid_copy: ByteList = try git_interop_copy_bytes(arena, commit_hex);
+    var oid_copy: ByteList = resolved_commit_hex;
     var tree_hex: ByteList = ByteList{ ptr: null, len: 0 };
     var author: Identity = Identity{ name: ByteList{ ptr: null, len: 0 }, email: ByteList{ ptr: null, len: 0 } };
     var committer: Identity = Identity{ name: ByteList{ ptr: null, len: 0 }, email: ByteList{ ptr: null, len: 0 } };
@@ -853,13 +895,18 @@ export fn hypergit_manifest_to_git_tree(arena: &Arena, store: &LooseObjectStore,
     while i < entries.len {
         const entry: &ManifestLeafInputEntry = &entries.ptr[i];
         const payload: SmallBlobPayload = try git_interop_load_small_blob_payload(arena, store, entry.object_id);
-        try git_interop_write_file(&blob_path, payload.payload.ptr[0: payload.payload.len]);
-        try git_interop_command_hash_object(git_dir, &blob_path, &oid_path);
-        const oid_file: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&oid_path) as &const byte);
-        const oid_hex: &[byte] = git_interop_trim_newline(oid_file.ptr[0: oid_file.len]);
+        var oid_hex: &[byte] = payload.payload.ptr[0: payload.payload.len];
+        if entry.mode == GIT_INTEROP_MODE_SUBMODULE {
+            try git_interop_validate_oid_hex(oid_hex);
+        } else {
+            try git_interop_write_file(&blob_path, payload.payload.ptr[0: payload.payload.len]);
+            try git_interop_command_hash_object(git_dir, &blob_path, &oid_path);
+            const oid_file: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&oid_path) as &const byte);
+            oid_hex = git_interop_trim_newline(oid_file.ptr[0: oid_file.len]);
+        }
         try git_interop_command_update_index(
             git_dir,
-            git_interop_entry_kind_to_git_mode(entry.kind),
+            git_interop_entry_mode_to_git_mode(entry.mode, entry.kind),
             oid_hex,
             entry.path.ptr[0: entry.path.len],
         );

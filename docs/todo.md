@@ -417,7 +417,7 @@
 
 ### 可明确延后到 `v1.1+`
 
-- [ ] Git packed object / delta / tag / submodule / replace ref 完整互操作。
+- [x] Git packed object / delta / tag / submodule / replace ref 完整互操作。
 - [ ] 更复杂的 audit / policy / dedupe / storage tier 体系。
 - [ ] FUSE / 平台 VFS / 内核级虚拟工作区。
 - [ ] 更激进的服务端索引、云端查询和分布式执行能力。

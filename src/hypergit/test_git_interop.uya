@@ -17,9 +17,11 @@ use libc.Stat;
 use libc.stat;
 use libc.system;
 use core.ids.CommitId;
+use core.ids.Hash32;
 use core.ids.ManifestId;
 use core.ids.ObjectId;
 use core.ids.commit_id_compare;
+use core.ids.hash32_compare;
 use core.ids.manifest_id_compare;
 use core.policy.experimental_policy_id;
 use git.interop.GitCommitImport;
@@ -55,6 +57,7 @@ use manifest.trie.manifest_leaf_input_list_from_slice;
 use object.codec.chunked_blob_payload_to_canonical;
 use object.codec.decode_commit_object;
 use object.codec.decode_small_blob_object;
+use object.small_blob.small_blob_content_hash;
 use object.types.ChunkedBlobPayload;
 use object.types.ChunkingStrategy;
 use object.types.CommitPayload;
@@ -133,9 +136,9 @@ fn build_chunked_blob_payload(arena: &Arena, chunk_store: &ChunkStore, logical: 
 fn test_git_loose_blob_reads_and_imports_blob() !void {
     try expect(system("rm -rf build/git-interop-loose && mkdir -p build/git-interop-loose/repo build/git-interop-loose/hgit/objects/loose && cd build/git-interop-loose/repo && git init >/dev/null 2>&1 && printf hello-git > hello.txt && git hash-object -w hello.txt > ../oid.txt") == 0);
 
-    var arena_buf: [byte: 32768] = [];
+    var arena_buf: [byte: 1048576] = [];
     var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
-    arena_init(&arena, &arena_buf[0], 32768 as usize);
+    arena_init(&arena, &arena_buf[0], 1048576 as usize);
 
     const oid_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-loose/oid.txt");
     const oid_hex: &[byte] = trim_newline(oid_file);
@@ -154,21 +157,57 @@ fn test_git_loose_blob_reads_and_imports_blob() !void {
     try expect_byte_slice_eq(payload.payload.ptr[0: payload.payload.len], literal_bytes("hello-git"));
 }
 
-fn test_git_loose_blob_rejects_packed_only_object() !void {
-    try expect(system("rm -rf build/git-interop-packed && mkdir -p build/git-interop-packed/repo && cd build/git-interop-packed/repo && git init >/dev/null 2>&1 && printf packed-only > blob.txt && git add blob.txt >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000400 +0000' GIT_COMMITTER_DATE='1700000401 +0000' git -c user.name=Pack -c user.email=pack@example.com commit -m pack >/dev/null 2>&1 && git rev-parse HEAD:blob.txt > ../oid.txt && git gc --prune=now >/dev/null 2>&1") == 0);
+fn test_git_packed_delta_blob_reads_and_imports_blob() !void {
+    try expect(system("rm -rf build/git-interop-packed && mkdir -p build/git-interop-packed/repo build/git-interop-packed/hgit/objects/loose && cd build/git-interop-packed/repo && git init >/dev/null 2>&1 && python3 -c 'from pathlib import Path; Path(\"base.txt\").write_text(\"A\" * 65536 + \"tail-a\\n\"); Path(\"variant.txt\").write_text(\"A\" * 65536 + \"tail-b\\n\")' && git add base.txt variant.txt >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000400 +0000' GIT_COMMITTER_DATE='1700000401 +0000' git -c user.name=Pack -c user.email=pack@example.com commit -m pack >/dev/null 2>&1 && git gc --aggressive --prune=now >/dev/null 2>&1 && git verify-pack -v .git/objects/pack/*.idx | awk '$2 == \"blob\" && NF == 7 && $6 ~ /^[1-9][0-9]*$/ && $7 ~ /^[0-9a-f]{40}$/ { print $1; exit }' > ../oid.txt && test -s ../oid.txt && oid=$(tr -d '\\n' < ../oid.txt) && git cat-file -p \"$oid\" > ../blob.txt") == 0);
+
+    var arena_buf: [byte: 1048576] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 1048576 as usize);
+
+    const oid_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-packed/oid.txt");
+    const oid_hex: &[byte] = trim_newline(oid_file);
+    const expected: &[byte] = try read_file_bytes(&arena, "build/git-interop-packed/blob.txt");
+    const expected_hash: Hash32 = small_blob_content_hash(expected);
+    const blob: GitLooseBlob = try git_read_loose_blob(&arena, literal_bytes("build/git-interop-packed/repo/.git"), oid_hex);
+    try expect(blob.oid_hex.len == 40 as usize);
+    try expect(blob.content.len == expected.len);
+    const blob_hash: Hash32 = small_blob_content_hash(blob.content.ptr[0: blob.content.len]);
+    try expect(hash32_compare(&blob_hash, &expected_hash) == 0);
+    try expect(blob.content.ptr[0] == expected.ptr[0]);
+    try expect(blob.content.ptr[blob.content.len - 1 as usize] == expected.ptr[expected.len - 1 as usize]);
+
+    const store: LooseObjectStore = try loose_store_open("build/git-interop-packed/hgit/objects/loose");
+    const object_id: ObjectId = try git_import_loose_blob_as_small_blob(&arena, &store, literal_bytes("build/git-interop-packed/repo/.git"), oid_hex);
+    try expect(try store.has(object_id));
+
+    var read_offset: usize = 0 as usize;
+    const object_bytes: ObjectBytes = try store.get(object_id, &arena);
+    const payload: SmallBlobPayload = try decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &read_offset);
+    try expect(read_offset == object_bytes.bytes.len);
+    try expect(payload.logical_size == expected.len as u64);
+    try expect(payload.payload.len == expected.len);
+    const payload_hash: Hash32 = small_blob_content_hash(payload.payload.ptr[0: payload.payload.len]);
+    try expect(hash32_compare(&payload_hash, &expected_hash) == 0);
+    try expect(payload.payload.ptr[0] == expected.ptr[0]);
+    try expect(payload.payload.ptr[payload.payload.len - 1 as usize] == expected.ptr[expected.len - 1 as usize]);
+}
+
+fn test_git_tagged_blob_reads_and_imports_blob() !void {
+    try expect(system("rm -rf build/git-interop-tag-blob && mkdir -p build/git-interop-tag-blob/repo build/git-interop-tag-blob/hgit/objects/loose && cd build/git-interop-tag-blob/repo && git init >/dev/null 2>&1 && printf tagged-blob > blob.txt && blob_oid=$(git hash-object -w blob.txt) && git -c user.name=Tag -c user.email=tag@example.com tag -a blob-tag \"$blob_oid\" -m blob-tag >/dev/null 2>&1 && git rev-parse blob-tag^{tag} > ../tag.txt") == 0);
 
     var arena_buf: [byte: 32768] = [];
     var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
     arena_init(&arena, &arena_buf[0], 32768 as usize);
 
-    const oid_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-packed/oid.txt");
-    const oid_hex: &[byte] = trim_newline(oid_file);
-    const blob: GitLooseBlob = git_read_loose_blob(&arena, literal_bytes("build/git-interop-packed/repo/.git"), oid_hex) catch |err| {
-        try expect(@error_id(err) == @error_id(error.GitInteropUnsupportedPackedObject));
-        return;
-    };
-    _ = blob;
-    return error.AssertionFailed;
+    const tag_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-tag-blob/tag.txt");
+    const tag_hex: &[byte] = trim_newline(tag_file);
+    const blob: GitLooseBlob = try git_read_loose_blob(&arena, literal_bytes("build/git-interop-tag-blob/repo/.git"), tag_hex);
+    try expect(blob.oid_hex.len == 40 as usize);
+    try expect_byte_slice_eq(blob.content.ptr[0: blob.content.len], literal_bytes("tagged-blob"));
+
+    const store: LooseObjectStore = try loose_store_open("build/git-interop-tag-blob/hgit/objects/loose");
+    const object_id: ObjectId = try git_import_loose_blob_as_small_blob(&arena, &store, literal_bytes("build/git-interop-tag-blob/repo/.git"), tag_hex);
+    try expect(try store.has(object_id));
 }
 
 fn test_git_tree_to_manifest_imports_paths_and_modes() !void {
@@ -192,8 +231,8 @@ fn test_git_tree_to_manifest_imports_paths_and_modes() !void {
     try expect(try store.has(manifest_id.id));
 }
 
-fn test_git_tree_to_manifest_rejects_submodule_entry() !void {
-    try expect(system("rm -rf build/git-interop-submodule && mkdir -p build/git-interop-submodule/sub build/git-interop-submodule/repo build/git-interop-submodule/hgit/objects/loose && cd build/git-interop-submodule/sub && git init >/dev/null 2>&1 && printf sub > child.txt && git add child.txt >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000500 +0000' GIT_COMMITTER_DATE='1700000501 +0000' git -c user.name=Sub -c user.email=sub@example.com commit -m sub >/dev/null 2>&1 && git rev-parse HEAD > ../sub-commit.txt && cd ../repo && git init >/dev/null 2>&1 && sub_commit=$(tr -d '\\n' < ../sub-commit.txt) && git update-index --add --cacheinfo 160000,\"$sub_commit\",deps/mod >/dev/null 2>&1 && git write-tree > ../tree.txt") == 0);
+fn test_git_tree_to_manifest_roundtrips_submodule_entry() !void {
+    try expect(system("rm -rf build/git-interop-submodule && mkdir -p build/git-interop-submodule/sub build/git-interop-submodule/repo build/git-interop-submodule/export build/git-interop-submodule/hgit/objects/loose && cd build/git-interop-submodule/sub && git init >/dev/null 2>&1 && printf sub > child.txt && git add child.txt >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000500 +0000' GIT_COMMITTER_DATE='1700000501 +0000' git -c user.name=Sub -c user.email=sub@example.com commit -m sub >/dev/null 2>&1 && git rev-parse HEAD > ../sub-commit.txt && cd ../repo && git init >/dev/null 2>&1 && sub_commit=$(tr -d '\\n' < ../sub-commit.txt) && git update-index --add --cacheinfo 160000,\"$sub_commit\",deps/mod >/dev/null 2>&1 && git write-tree > ../tree.txt && cd ../export && git init >/dev/null 2>&1") == 0);
 
     var arena_buf: [byte: 65536] = [];
     var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
@@ -202,12 +241,37 @@ fn test_git_tree_to_manifest_rejects_submodule_entry() !void {
     const tree_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-submodule/tree.txt");
     const tree_hex: &[byte] = trim_newline(tree_file);
     const store: LooseObjectStore = try loose_store_open("build/git-interop-submodule/hgit/objects/loose");
-    const entries: GitTreeEntryList = git_tree_to_manifest_entries(&arena, &store, literal_bytes("build/git-interop-submodule/repo/.git"), tree_hex) catch |err| {
-        try expect(@error_id(err) == @error_id(error.GitInteropUnsupportedTreeEntry));
-        return;
-    };
-    _ = entries;
-    return error.AssertionFailed;
+    const entries: GitTreeEntryList = try git_tree_to_manifest_entries(&arena, &store, literal_bytes("build/git-interop-submodule/repo/.git"), tree_hex);
+    try expect(entries.len == 1 as usize);
+    try expect_byte_slice_eq(entries.ptr[0].path.ptr[0: entries.ptr[0].path.len], literal_bytes("deps/mod"));
+    try expect(entries.ptr[0].kind == EntryKind.File);
+    try expect(entries.ptr[0].file_mode == 0o160000u32);
+    try expect(entries.ptr[0].logical_size == 40u64);
+
+    var read_offset: usize = 0 as usize;
+    const object_bytes: ObjectBytes = try store.get(entries.ptr[0].object_id, &arena);
+    const payload: SmallBlobPayload = try decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &read_offset);
+    try expect(read_offset == object_bytes.bytes.len);
+
+    const sub_commit_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-submodule/sub-commit.txt");
+    const sub_commit_hex: &[byte] = trim_newline(sub_commit_file);
+    try expect_byte_slice_eq(payload.payload.ptr[0: payload.payload.len], sub_commit_hex);
+
+    const manifest_id: ManifestId = try git_tree_to_manifest(&arena, &store, literal_bytes("build/git-interop-submodule/repo/.git"), tree_hex);
+    const exported: GitTreeExport = try hypergit_manifest_to_git_tree(
+        &arena,
+        &store,
+        literal_bytes("build/git-interop-submodule/export/.git"),
+        &manifest_id,
+    );
+    try expect(exported.entry_count == 1 as usize);
+    try write_file_bytes("build/git-interop-submodule/exported-tree.txt", exported.tree_hex.ptr[0: exported.tree_hex.len]);
+    try expect(system("cd build/git-interop-submodule/export && tree=$(cat ../exported-tree.txt) && git ls-tree -r \"$tree\" > ../ls-tree.txt") == 0);
+    const ls_tree: &[byte] = try read_file_bytes(&arena, "build/git-interop-submodule/ls-tree.txt");
+    try expect(ls_tree.len > 0 as usize);
+    try expect_byte_slice_eq(ls_tree[0: 14], literal_bytes("160000 commit "));
+    try expect_byte_slice_eq(ls_tree[14: 40], sub_commit_hex);
+    try expect_byte_slice_eq(ls_tree[54: ls_tree.len - 54], literal_bytes("\tdeps/mod\n"));
 }
 
 fn test_git_commit_to_hypergit_commit_imports_history() !void {
@@ -245,6 +309,49 @@ fn test_git_commit_to_hypergit_commit_imports_history() !void {
     try expect_byte_slice_eq(payload.author.email.ptr[0: payload.author.email.len], literal_bytes("bob@example.com"));
     try expect_byte_slice_eq(payload.committer.name.ptr[0: payload.committer.name.len], literal_bytes("Bob"));
     try expect_byte_slice_eq(payload.message.ptr[0: payload.message.len], literal_bytes("second\n"));
+}
+
+fn test_git_tagged_commit_imports_referenced_commit() !void {
+    try expect(system("rm -rf build/git-interop-tag-commit && mkdir -p build/git-interop-tag-commit/repo build/git-interop-tag-commit/hgit/objects/loose && cd build/git-interop-tag-commit/repo && git init >/dev/null 2>&1 && printf one > file.txt && git add file.txt >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000600 +0000' GIT_COMMITTER_DATE='1700000601 +0000' git -c user.name=Tag -c user.email=tag@example.com commit -m tagged >/dev/null 2>&1 && git -c user.name=Tag -c user.email=tag@example.com tag -a release-tag -m release-tag >/dev/null 2>&1 && git rev-parse release-tag^{tag} > ../tag.txt") == 0);
+
+    var arena_buf: [byte: 131072] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 131072 as usize);
+
+    const tag_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-tag-commit/tag.txt");
+    const tag_hex: &[byte] = trim_newline(tag_file);
+    const store: LooseObjectStore = try loose_store_open("build/git-interop-tag-commit/hgit/objects/loose");
+    const imported: GitCommitImport = try git_import_commit(&arena, &store, literal_bytes("build/git-interop-tag-commit/repo/.git"), tag_hex);
+    try expect(imported.generation == 1u64);
+
+    const object_bytes: ObjectBytes = try store.get(imported.commit_id.id, &arena);
+    var offset: usize = 0 as usize;
+    const payload: CommitPayload = try decode_commit_object(&arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    try expect(offset == object_bytes.bytes.len);
+    try expect_byte_slice_eq(payload.message.ptr[0: payload.message.len], literal_bytes("tagged\n"));
+    try expect_byte_slice_eq(payload.author.name.ptr[0: payload.author.name.len], literal_bytes("Tag"));
+}
+
+fn test_git_replace_ref_import_uses_replacement_commit() !void {
+    try expect(system("rm -rf build/git-interop-replace && mkdir -p build/git-interop-replace/repo build/git-interop-replace/hgit/objects/loose && cd build/git-interop-replace/repo && git init >/dev/null 2>&1 && printf old > file.txt && git add file.txt >/dev/null 2>&1 && GIT_AUTHOR_DATE='1700000700 +0000' GIT_COMMITTER_DATE='1700000701 +0000' git -c user.name=Old -c user.email=old@example.com commit -m original >/dev/null 2>&1 && git rev-parse HEAD > ../old.txt && printf new > file.txt && git add file.txt >/dev/null 2>&1 && tree=$(git write-tree) && GIT_AUTHOR_NAME=New GIT_AUTHOR_EMAIL=new@example.com GIT_COMMITTER_NAME=New GIT_COMMITTER_EMAIL=new@example.com GIT_AUTHOR_DATE='1700000800 +0000' GIT_COMMITTER_DATE='1700000801 +0000' git commit-tree \"$tree\" -m replacement > ../new.txt && old_oid=$(tr -d '\\n' < ../old.txt) && new_oid=$(tr -d '\\n' < ../new.txt) && git replace \"$old_oid\" \"$new_oid\" >/dev/null 2>&1") == 0);
+
+    var arena_buf: [byte: 131072] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 131072 as usize);
+
+    const old_file: &[byte] = try read_file_bytes(&arena, "build/git-interop-replace/old.txt");
+    const old_hex: &[byte] = trim_newline(old_file);
+    const store: LooseObjectStore = try loose_store_open("build/git-interop-replace/hgit/objects/loose");
+    const imported: GitCommitImport = try git_import_commit(&arena, &store, literal_bytes("build/git-interop-replace/repo/.git"), old_hex);
+    try expect(imported.generation == 1u64);
+
+    const object_bytes: ObjectBytes = try store.get(imported.commit_id.id, &arena);
+    var offset: usize = 0 as usize;
+    const payload: CommitPayload = try decode_commit_object(&arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    try expect(offset == object_bytes.bytes.len);
+    try expect_byte_slice_eq(payload.message.ptr[0: payload.message.len], literal_bytes("replacement\n"));
+    try expect_byte_slice_eq(payload.author.name.ptr[0: payload.author.name.len], literal_bytes("New"));
+    try expect(payload.timestamp_ms == 1700000800000i64);
 }
 
 fn test_hypergit_manifest_to_git_tree_exports_tree() !void {
@@ -350,10 +457,13 @@ fn test_small_git_repo_import_covers_tree_and_commit_history() !void {
 export fn main() i32 {
     test_suite_begin("HyperGit Git Interop Tests");
     run_test("git loose blob reads and imports blob", test_git_loose_blob_reads_and_imports_blob);
-    run_test("git loose blob rejects packed-only object", test_git_loose_blob_rejects_packed_only_object);
+    run_test("git packed delta blob reads and imports blob", test_git_packed_delta_blob_reads_and_imports_blob);
+    run_test("git tagged blob reads and imports blob", test_git_tagged_blob_reads_and_imports_blob);
     run_test("git tree to manifest imports paths and modes", test_git_tree_to_manifest_imports_paths_and_modes);
-    run_test("git tree to manifest rejects submodule entry", test_git_tree_to_manifest_rejects_submodule_entry);
+    run_test("git tree to manifest roundtrips submodule entry", test_git_tree_to_manifest_roundtrips_submodule_entry);
     run_test("git commit to hypergit commit imports history", test_git_commit_to_hypergit_commit_imports_history);
+    run_test("git tagged commit imports referenced commit", test_git_tagged_commit_imports_referenced_commit);
+    run_test("git replace ref import uses replacement commit", test_git_replace_ref_import_uses_replacement_commit);
     run_test("hypergit manifest to git tree exports tree", test_hypergit_manifest_to_git_tree_exports_tree);
     run_test("hypergit manifest to git tree rejects chunked blob entries", test_hypergit_manifest_to_git_tree_rejects_chunked_blob_entries);
     run_test("small git repo import covers tree and commit history", test_small_git_repo_import_covers_tree_and_commit_history);

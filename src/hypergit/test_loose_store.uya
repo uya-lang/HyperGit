@@ -66,8 +66,42 @@ fn test_loose_store_roundtrip() !void {
     return error.AssertionFailed;
 }
 
+fn test_loose_store_large_payload_roundtrip() !void {
+    try expect(system("rm -rf build/loose-store-large && mkdir -p build/loose-store-large/objects/loose") == 0);
+
+    const store: LooseObjectStore = try loose_store_open("build/loose-store-large/objects/loose");
+    var payload: [byte: 70000] = [];
+    const payload_len: usize = @len(payload);
+    var i: usize = 0 as usize;
+    while i < payload_len {
+        payload[i] = ('a' as byte) + (i % 26 as usize) as byte;
+        i = i + 1 as usize;
+    }
+
+    const id: ObjectId = try store.put(ObjectKind.SmallBlob, payload[0: payload_len]);
+    try expect(try store.has(id));
+
+    var arena_buf: [byte: 262144] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 262144 as usize);
+
+    const object_bytes: ObjectBytes = try store.get(id, &arena);
+    var offset: usize = 0 as usize;
+    const decoded: DecodedObject = try codec_decode_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    try expect(offset == object_bytes.bytes.len);
+    try expect(decoded.envelope.kind == 2 as u16);
+    try expect(decoded.payload.len == payload_len);
+
+    i = 0 as usize;
+    while i < payload_len {
+        try expect(decoded.payload.ptr[i] == payload[i]);
+        i = i + 1 as usize;
+    }
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Loose Store Tests");
     run_test("loose store roundtrip", test_loose_store_roundtrip);
+    run_test("loose store large payload roundtrip", test_loose_store_large_payload_roundtrip);
     return test_suite_end();
 }
