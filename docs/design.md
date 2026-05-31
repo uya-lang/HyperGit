@@ -222,6 +222,8 @@ HyperGit 本地元数据目录使用 `.hgit/`，避免与 `.git/` 混淆：
 ```text
 .hgit/
   config.json
+  audit/
+    events.jsonl
   policy.json
   refs/
     heads/main
@@ -1071,6 +1073,37 @@ repo-local 持久化格式当前收敛为 `JSON v1`：
 - `dedupe_scope` 文本当前支持 `repository`、`global`、`tenant:<name>`、`org:<name>`。
 - `audit` 文本当前支持 `enabled` / `disabled`。
 - `cache_ttl_secs` 使用非负整数秒，后续接入实际缓存/执行路径时不再重新解释自由格式字符串。
+
+repo-local audit log 当前收敛为 `JSONL v1`，默认路径：
+
+```text
+.hgit/audit/events.jsonl
+```
+
+每一行都是一个独立事件，字段固定为：
+
+```json
+{
+  "version": 1,
+  "kind": "commit",
+  "timestamp_ms": 1700000000000,
+  "target": "main",
+  "head_before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "head_after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "policy_id": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+  "dedupe_scope": "repository",
+  "audit_enabled": true,
+  "affected_path_count": 2,
+  "affected_byte_count": 123
+}
+```
+
+当前轮转与写入约束：
+
+- 默认轮转阈值 `4 MiB`。
+- 默认保留 `4` 代历史文件：`events.jsonl.1` 到 `events.jsonl.4`。
+- 追加写入在同一条事件上使用单次 JSONL 编码和带锁的 append，避免多进程交错写半条记录。
+- 轮转与追加共用同一把 repo-local lock，先判定是否超阈值，再执行 rename 链和本次写入。
 
 本地安全：
 

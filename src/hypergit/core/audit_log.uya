@@ -1,0 +1,734 @@
+use std.io.file.File;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.file_close;
+use std.io.file.file_open;
+use std.io.file.file_write;
+use std.json.encoder.json_expect_bool;
+use std.json.encoder.json_expect_i64;
+use std.json.encoder.json_expect_str;
+use std.json.encoder.json_object_find_index;
+use std.json.parser.parse;
+use std.json.value.JsonObject;
+use std.json.value.JsonStrView;
+use std.json.value.JsonValue;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.string.strlen;
+
+use libc.Stat;
+use libc.EEXIST;
+use libc.O_APPEND;
+use libc.O_CREAT;
+use libc.O_EXCL;
+use libc.O_WRONLY;
+use libc.S_IRWXU;
+use libc.errno;
+use libc.mkdir;
+use libc.remove;
+use libc.rename;
+use libc.stat;
+use libc.unlink;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.PolicyId;
+use core.ids.policy_id_decode_hex;
+use core.ids.policy_id_encode_hex;
+use object.types.ByteList;
+
+export const AUDIT_LOG_VERSION: i64 = 1i64;
+export const AUDIT_LOG_ROTATE_BYTES_DEFAULT: usize = 4194304 as usize;
+export const AUDIT_LOG_ROTATE_KEEP_DEFAULT: usize = 4 as usize;
+export const AUDIT_LOG_REL: &const byte = ".hgit/audit/events.jsonl";
+
+const AUDIT_LOG_BYTES_MAX: usize = 16777216 as usize;
+const AUDIT_LOG_PATH_MAX: usize = 4096 as usize;
+
+error AuditLogAlloc;
+error AuditLogInvalid;
+error AuditLogNotFound;
+error AuditLogOpenFailed;
+error AuditLogReadFailed;
+error AuditLogWriteFailed;
+error AuditLogTooLarge;
+error AuditLogPathTooLong;
+error AuditLogLockFailed;
+
+export enum AuditLogEventKind {
+    Checkout,
+    Commit,
+    Fetch,
+    Push
+}
+
+export struct AuditLogEvent {
+    kind: AuditLogEventKind,
+    timestamp_ms: i64,
+    target: ByteList,
+    head_before: ByteList,
+    head_after: ByteList,
+    policy_id: PolicyId,
+    dedupe_scope: ByteList,
+    audit_enabled: bool,
+    affected_path_count: u64,
+    affected_byte_count: u64
+}
+
+export struct AuditLogEventList {
+    ptr: &AuditLogEvent,
+    len: usize
+}
+
+struct AuditLogPath {
+    bytes: [byte: AUDIT_LOG_PATH_MAX] = [],
+    len: usize = 0
+}
+
+struct AuditLogLock {
+    path: AuditLogPath,
+    held: bool
+}
+
+fn audit_log_path_from_cstr(text: &const byte) !AuditLogPath {
+    if text == null {
+        return error.AuditLogPathTooLong;
+    }
+    const len: usize = strlen(text);
+    if len >= AUDIT_LOG_PATH_MAX {
+        return error.AuditLogPathTooLong;
+    }
+    var out: AuditLogPath = AuditLogPath{ bytes: [], len: len };
+    var i: usize = 0 as usize;
+    while i < len {
+        out.bytes[i] = text[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[len] = 0 as byte;
+    return out;
+}
+
+fn audit_log_path_with_suffix(path: &AuditLogPath, suffix: &const byte) !AuditLogPath {
+    const suffix_len: usize = strlen(suffix);
+    if path.len + suffix_len >= AUDIT_LOG_PATH_MAX {
+        return error.AuditLogPathTooLong;
+    }
+    var out: AuditLogPath = *path;
+    var i: usize = 0 as usize;
+    while i < suffix_len {
+        out.bytes[path.len + i] = suffix[i];
+        i = i + 1 as usize;
+    }
+    out.len = path.len + suffix_len;
+    out.bytes[out.len] = 0 as byte;
+    return out;
+}
+
+fn audit_log_append_decimal(path: &AuditLogPath, value: usize) !void {
+    var buf: [byte: 32] = [];
+    var temp: usize = value;
+    var count: usize = 0 as usize;
+    if temp == 0 as usize {
+        buf[0] = '0' as byte;
+        count = 1 as usize;
+    } else {
+        while temp > 0 as usize {
+            buf[count] = ('0' as byte) + (temp % 10 as usize) as byte;
+            temp = temp / 10 as usize;
+            count = count + 1 as usize;
+        }
+    }
+    if path.len + count >= AUDIT_LOG_PATH_MAX {
+        return error.AuditLogPathTooLong;
+    }
+    while count > 0 as usize {
+        count = count - 1 as usize;
+        const idx: usize = count;
+        if idx >= 32 as usize {
+            return error.AuditLogPathTooLong;
+        }
+        path.bytes[path.len] = buf[idx];
+        path.len = path.len + 1 as usize;
+    }
+    path.bytes[path.len] = 0 as byte;
+}
+
+fn audit_log_rotated_path(path: &AuditLogPath, generation: usize) !AuditLogPath {
+    var out: AuditLogPath = *path;
+    if out.len + 2 as usize >= AUDIT_LOG_PATH_MAX {
+        return error.AuditLogPathTooLong;
+    }
+    out.bytes[out.len] = '.' as byte;
+    out.len = out.len + 1 as usize;
+    out.bytes[out.len] = 0 as byte;
+    try audit_log_append_decimal(&out, generation);
+    return out;
+}
+
+fn audit_log_parent_dir(path: &AuditLogPath) !AuditLogPath {
+    if path.len == 0 as usize {
+        return error.AuditLogPathTooLong;
+    }
+    var end: usize = path.len;
+    while end > 0 as usize {
+        end = end - 1 as usize;
+        if end >= AUDIT_LOG_PATH_MAX {
+            return error.AuditLogPathTooLong;
+        }
+        if path.bytes[end] == '/' as byte {
+            var out: AuditLogPath = AuditLogPath{ bytes: [], len: end };
+            var i: usize = 0 as usize;
+            while i < end {
+                out.bytes[i] = path.bytes[i];
+                i = i + 1 as usize;
+            }
+            out.bytes[end] = 0 as byte;
+            return out;
+        }
+    }
+    return error.AuditLogPathTooLong;
+}
+
+fn audit_log_ensure_parent_dir(path: &AuditLogPath) !void {
+    const parent: AuditLogPath = try audit_log_parent_dir(path);
+    if audit_log_path_exists(&parent) {
+        return;
+    }
+    if mkdir(&parent.bytes[0] as &const byte, S_IRWXU as i32) == 0 {
+        return;
+    }
+    if errno == EEXIST {
+        return;
+    }
+    return error.AuditLogWriteFailed;
+}
+
+fn audit_log_path_exists(path: &AuditLogPath) bool {
+    var st: Stat = Stat{};
+    return stat(&path.bytes[0] as &const byte, &st) == 0;
+}
+
+fn audit_log_file_size(path: &AuditLogPath) !usize {
+    var st: Stat = Stat{};
+    if stat(&path.bytes[0] as &const byte, &st) != 0 {
+        return error.AuditLogNotFound;
+    }
+    return st.st_size as usize;
+}
+
+fn audit_log_lock_acquire(path: &AuditLogPath) !AuditLogLock {
+    const lock_path: AuditLogPath = try audit_log_path_with_suffix(path, ".lock");
+    const file: File = file_open(&lock_path.bytes[0] as &const byte, (O_WRONLY | O_CREAT | O_EXCL) as i32, S_IRWXU as u32) catch {
+        return error.AuditLogLockFailed;
+    };
+    _ = file_close(&file) catch {
+        _ = unlink(&lock_path.bytes[0] as &const byte);
+        return error.AuditLogLockFailed;
+    };
+    return AuditLogLock{ path: lock_path, held: true };
+}
+
+fn audit_log_lock_release(lock: &AuditLogLock) void {
+    if !lock.held {
+        return;
+    }
+    _ = unlink(&lock.path.bytes[0] as &const byte);
+    lock.held = false;
+}
+
+fn audit_log_u64_text_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1 as usize;
+    while temp >= 10u64 {
+        temp = temp / 10u64;
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn audit_log_i64_text_len(value: i64) usize {
+    if value < 0i64 {
+        return 1 as usize + audit_log_u64_text_len((0i64 - value) as u64);
+    }
+    return audit_log_u64_text_len(value as u64);
+}
+
+fn audit_log_write_literal(output: &[byte], offset: &usize, text: &const byte) !void {
+    const len: usize = strlen(text);
+    if *offset + len > output.len {
+        return error.AuditLogWriteFailed;
+    }
+    var i: usize = 0 as usize;
+    while i < len {
+        output.ptr[*offset + i] = text[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + len;
+}
+
+fn audit_log_json_string_len(value: &ByteList) usize {
+    var total: usize = 2 as usize;
+    var i: usize = 0 as usize;
+    while i < value.len {
+        const ch: byte = value.ptr[i];
+        if ch == '"' as byte || ch == '\\' as byte {
+            total = total + 2 as usize;
+        } else {
+            total = total + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn audit_log_write_json_string(output: &[byte], offset: &usize, value: &ByteList) !void {
+    if *offset + audit_log_json_string_len(value) > output.len {
+        return error.AuditLogWriteFailed;
+    }
+    output.ptr[*offset] = '"' as byte;
+    *offset = *offset + 1 as usize;
+    var i: usize = 0 as usize;
+    while i < value.len {
+        const ch: byte = value.ptr[i];
+        if ch == '"' as byte || ch == '\\' as byte {
+            output.ptr[*offset] = '\\' as byte;
+            *offset = *offset + 1 as usize;
+        }
+        output.ptr[*offset] = ch;
+        *offset = *offset + 1 as usize;
+        i = i + 1 as usize;
+    }
+    output.ptr[*offset] = '"' as byte;
+    *offset = *offset + 1 as usize;
+}
+
+fn audit_log_write_u64(output: &[byte], offset: &usize, value: u64) !void {
+    const count: usize = audit_log_u64_text_len(value);
+    if *offset + count > output.len {
+        return error.AuditLogWriteFailed;
+    }
+    var temp: u64 = value;
+    var i: usize = 0 as usize;
+    while i < count {
+        output.ptr[*offset + count - 1 as usize - i] = ('0' as byte) + (temp % 10u64) as byte;
+        temp = temp / 10u64;
+        i = i + 1 as usize;
+    }
+    *offset = *offset + count;
+}
+
+fn audit_log_write_i64(output: &[byte], offset: &usize, value: i64) !void {
+    if value < 0i64 {
+        if *offset + 1 as usize > output.len {
+            return error.AuditLogWriteFailed;
+        }
+        output.ptr[*offset] = '-' as byte;
+        *offset = *offset + 1 as usize;
+        return audit_log_write_u64(output, offset, (0i64 - value) as u64);
+    }
+    return audit_log_write_u64(output, offset, value as u64);
+}
+
+fn audit_log_kind_text(kind: AuditLogEventKind) &const byte {
+    if kind == AuditLogEventKind.Checkout {
+        return "checkout" as &const byte;
+    }
+    if kind == AuditLogEventKind.Commit {
+        return "commit" as &const byte;
+    }
+    if kind == AuditLogEventKind.Fetch {
+        return "fetch" as &const byte;
+    }
+    return "push" as &const byte;
+}
+
+fn audit_log_kind_from_str(value: JsonStrView) !AuditLogEventKind {
+    if value.len == 8 as usize &&
+        value.ptr[0] == 'c' as byte &&
+        value.ptr[1] == 'h' as byte &&
+        value.ptr[2] == 'e' as byte &&
+        value.ptr[3] == 'c' as byte &&
+        value.ptr[4] == 'k' as byte &&
+        value.ptr[5] == 'o' as byte &&
+        value.ptr[6] == 'u' as byte &&
+        value.ptr[7] == 't' as byte {
+        return AuditLogEventKind.Checkout;
+    }
+    if value.len == 6 as usize &&
+        value.ptr[0] == 'c' as byte &&
+        value.ptr[1] == 'o' as byte &&
+        value.ptr[2] == 'm' as byte &&
+        value.ptr[3] == 'm' as byte &&
+        value.ptr[4] == 'i' as byte &&
+        value.ptr[5] == 't' as byte {
+        return AuditLogEventKind.Commit;
+    }
+    if value.len == 5 as usize &&
+        value.ptr[0] == 'f' as byte &&
+        value.ptr[1] == 'e' as byte &&
+        value.ptr[2] == 't' as byte &&
+        value.ptr[3] == 'c' as byte &&
+        value.ptr[4] == 'h' as byte {
+        return AuditLogEventKind.Fetch;
+    }
+    if value.len == 4 as usize &&
+        value.ptr[0] == 'p' as byte &&
+        value.ptr[1] == 'u' as byte &&
+        value.ptr[2] == 's' as byte &&
+        value.ptr[3] == 'h' as byte {
+        return AuditLogEventKind.Push;
+    }
+    return error.AuditLogInvalid;
+}
+
+fn audit_log_copy_json_str(arena: &Arena, value: JsonStrView) !ByteList {
+    var want: usize = value.len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const out: &byte = arena_alloc(arena, want) as &byte;
+    if out == null {
+        return error.AuditLogAlloc;
+    }
+    var i: usize = 0 as usize;
+    while i < value.len {
+        out[i] = value.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out, len: value.len };
+}
+
+fn audit_log_event_json_len(event: &AuditLogEvent) usize {
+    var audit_text: &const byte = "false" as &const byte;
+    if event.audit_enabled {
+        audit_text = "true" as &const byte;
+    }
+    return strlen("{\"version\":1,\"kind\":\"") +
+        strlen(audit_log_kind_text(event.kind)) +
+        strlen("\",\"timestamp_ms\":") +
+        audit_log_i64_text_len(event.timestamp_ms) +
+        strlen(",\"target\":") +
+        audit_log_json_string_len(&event.target) +
+        strlen(",\"head_before\":") +
+        audit_log_json_string_len(&event.head_before) +
+        strlen(",\"head_after\":") +
+        audit_log_json_string_len(&event.head_after) +
+        strlen(",\"policy_id\":\"") +
+        HASH32_HEX_BYTES +
+        strlen("\",\"dedupe_scope\":") +
+        audit_log_json_string_len(&event.dedupe_scope) +
+        strlen(",\"audit_enabled\":") +
+        strlen(audit_text) +
+        strlen(",\"affected_path_count\":") +
+        audit_log_u64_text_len(event.affected_path_count) +
+        strlen(",\"affected_byte_count\":") +
+        audit_log_u64_text_len(event.affected_byte_count) +
+        strlen("}\n");
+}
+
+fn audit_log_write_event_json(output: &[byte], event: &AuditLogEvent) !usize {
+    var offset: usize = 0 as usize;
+    var policy_hex: [byte: HASH32_HEX_BYTES] = [];
+
+    try audit_log_write_literal(output, &offset, "{\"version\":1,\"kind\":\"");
+    try audit_log_write_literal(output, &offset, audit_log_kind_text(event.kind));
+    try audit_log_write_literal(output, &offset, "\",\"timestamp_ms\":");
+    try audit_log_write_i64(output, &offset, event.timestamp_ms);
+    try audit_log_write_literal(output, &offset, ",\"target\":");
+    try audit_log_write_json_string(output, &offset, &event.target);
+    try audit_log_write_literal(output, &offset, ",\"head_before\":");
+    try audit_log_write_json_string(output, &offset, &event.head_before);
+    try audit_log_write_literal(output, &offset, ",\"head_after\":");
+    try audit_log_write_json_string(output, &offset, &event.head_after);
+    try audit_log_write_literal(output, &offset, ",\"policy_id\":\"");
+    _ = try policy_id_encode_hex(&event.policy_id, policy_hex[0: HASH32_HEX_BYTES]);
+    if offset + HASH32_HEX_BYTES > output.len {
+        return error.AuditLogWriteFailed;
+    }
+    var i: usize = 0 as usize;
+    while i < HASH32_HEX_BYTES {
+        output.ptr[offset + i] = policy_hex[i];
+        i = i + 1 as usize;
+    }
+    offset = offset + HASH32_HEX_BYTES;
+    try audit_log_write_literal(output, &offset, "\",\"dedupe_scope\":");
+    try audit_log_write_json_string(output, &offset, &event.dedupe_scope);
+    try audit_log_write_literal(output, &offset, ",\"audit_enabled\":");
+    if event.audit_enabled {
+        try audit_log_write_literal(output, &offset, "true");
+    } else {
+        try audit_log_write_literal(output, &offset, "false");
+    }
+    try audit_log_write_literal(output, &offset, ",\"affected_path_count\":");
+    try audit_log_write_u64(output, &offset, event.affected_path_count);
+    try audit_log_write_literal(output, &offset, ",\"affected_byte_count\":");
+    try audit_log_write_u64(output, &offset, event.affected_byte_count);
+    try audit_log_write_literal(output, &offset, "}\n");
+    return offset;
+}
+
+fn audit_log_rotate_files(path: &AuditLogPath, keep_count: usize) !void {
+    if keep_count == 0 as usize {
+        return;
+    }
+    var index: usize = keep_count;
+    while index > 1 as usize {
+        const older: AuditLogPath = try audit_log_rotated_path(path, index - 1 as usize);
+        if audit_log_path_exists(&older) {
+            const newer: AuditLogPath = try audit_log_rotated_path(path, index);
+            _ = remove(&newer.bytes[0] as &const byte);
+            if rename(&older.bytes[0] as &const byte, &newer.bytes[0] as &const byte) != 0 {
+                return error.AuditLogWriteFailed;
+            }
+        }
+        index = index - 1 as usize;
+    }
+    if audit_log_path_exists(path) {
+        const first_rotated: AuditLogPath = try audit_log_rotated_path(path, 1 as usize);
+        _ = remove(&first_rotated.bytes[0] as &const byte);
+        if rename(&path.bytes[0] as &const byte, &first_rotated.bytes[0] as &const byte) != 0 {
+            return error.AuditLogWriteFailed;
+        }
+    }
+}
+
+fn audit_log_append_bytes(path: &AuditLogPath, line: &[byte]) !void {
+    const file: File = file_open(&path.bytes[0] as &const byte, (O_WRONLY | O_CREAT | O_APPEND) as i32, S_IRWXU as u32) catch {
+        return error.AuditLogOpenFailed;
+    };
+    defer {
+        _ = file_close(&file) catch {};
+    }
+
+    var written_total: usize = 0 as usize;
+    while written_total < line.len {
+        const written: usize = try file_write(
+            &file,
+            @ptr_from_usize(@usize_from_ptr(line.ptr as &void) + written_total) as &const byte,
+            line.len - written_total,
+        );
+        if written == 0 as usize {
+            return error.AuditLogWriteFailed;
+        }
+        written_total = written_total + written;
+    }
+}
+
+export fn audit_log_event_list_from_slice(slice: &[AuditLogEvent]) AuditLogEventList {
+    return AuditLogEventList{ ptr: slice.ptr, len: slice.len };
+}
+
+export fn audit_log_file_append(path: &const byte, event: &AuditLogEvent) !void {
+    return try audit_log_file_append_with_options(path, event, AUDIT_LOG_ROTATE_BYTES_DEFAULT, AUDIT_LOG_ROTATE_KEEP_DEFAULT);
+}
+
+export fn audit_log_file_append_with_options(
+    path: &const byte,
+    event: &AuditLogEvent,
+    rotate_bytes: usize,
+    keep_count: usize,
+) !void {
+    const final_path: AuditLogPath = try audit_log_path_from_cstr(path);
+    try audit_log_ensure_parent_dir(&final_path);
+    const lock: AuditLogLock = try audit_log_lock_acquire(&final_path);
+    defer {
+        audit_log_lock_release(&lock);
+    }
+
+    const total_len: usize = audit_log_event_json_len(event);
+    if total_len > AUDIT_LOG_BYTES_MAX {
+        return error.AuditLogTooLarge;
+    }
+
+    const payload: &byte = malloc(total_len) as &byte;
+    if payload == null {
+        return error.AuditLogAlloc;
+    }
+    defer {
+        free(payload as &void);
+    }
+    const output: &[byte] = payload[0: total_len];
+    const written: usize = try audit_log_write_event_json(output, event);
+
+    if rotate_bytes > 0 as usize {
+        var existing_size: usize = 0 as usize;
+        if audit_log_path_exists(&final_path) {
+            existing_size = try audit_log_file_size(&final_path);
+        }
+        if existing_size > 0 as usize && existing_size + written > rotate_bytes {
+            try audit_log_rotate_files(&final_path, keep_count);
+        }
+    }
+
+    try audit_log_append_bytes(&final_path, output.ptr[0: written]);
+}
+
+export fn audit_log_file_read(arena: &Arena, path: &const byte) !AuditLogEventList {
+    if path == null {
+        return error.AuditLogNotFound;
+    }
+    const file_path: AuditLogPath = try audit_log_path_from_cstr(path);
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return error.AuditLogNotFound;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var st: Stat = Stat{};
+    if stat(&file_path.bytes[0] as &const byte, &st) != 0 {
+        return error.AuditLogReadFailed;
+    }
+    const size: usize = st.st_size as usize;
+    if size == 0 as usize {
+        return AuditLogEventList{ ptr: null, len: 0 as usize };
+    }
+    if size > AUDIT_LOG_BYTES_MAX {
+        return error.AuditLogTooLarge;
+    }
+
+    var want: usize = size;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw_input: &byte = arena_alloc(arena, want) as &byte;
+    if raw_input == null && size > 0 as usize {
+        return error.AuditLogAlloc;
+    }
+    const input: &[byte] = raw_input[0: size];
+    const count: usize = fread(input.ptr, 1 as usize, size, stream);
+    if count != size {
+        return error.AuditLogReadFailed;
+    }
+
+    var line_count: usize = 0 as usize;
+    var cursor: usize = 0 as usize;
+    while cursor < size {
+        if input.ptr[cursor] == '\n' as byte {
+            line_count = line_count + 1 as usize;
+        }
+        cursor = cursor + 1 as usize;
+    }
+    if size > 0 as usize && input.ptr[size - 1 as usize] != '\n' as byte {
+        line_count = line_count + 1 as usize;
+    }
+    if line_count == 0 as usize {
+        return AuditLogEventList{ ptr: null, len: 0 as usize };
+    }
+
+    const raw_events: &AuditLogEvent = arena_alloc(arena, @size_of(AuditLogEvent) as usize * line_count) as &AuditLogEvent;
+    if raw_events == null {
+        return error.AuditLogAlloc;
+    }
+
+    var event_index: usize = 0 as usize;
+    var line_start: usize = 0 as usize;
+    cursor = 0 as usize;
+    while cursor <= size {
+        if cursor == size || input.ptr[cursor] == '\n' as byte {
+            if cursor > line_start {
+                const line_len: usize = cursor - line_start;
+                const value: JsonValue = parse(arena, &input.ptr[line_start], line_len) catch {
+                    return error.AuditLogInvalid;
+                };
+                var object: JsonObject = JsonObject{ pairs: null, len: 0 };
+                match value {
+                    .obj(o) => { object = o; },
+                    else => { return error.AuditLogInvalid; },
+                }
+                const version_index: usize = json_object_find_index(&object, "version", 7 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const kind_index: usize = json_object_find_index(&object, "kind", 4 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const timestamp_index: usize = json_object_find_index(&object, "timestamp_ms", 12 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const target_index: usize = json_object_find_index(&object, "target", 6 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const before_index: usize = json_object_find_index(&object, "head_before", 11 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const after_index: usize = json_object_find_index(&object, "head_after", 10 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const policy_index: usize = json_object_find_index(&object, "policy_id", 9 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const scope_index: usize = json_object_find_index(&object, "dedupe_scope", 12 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const audit_index: usize = json_object_find_index(&object, "audit_enabled", 13 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const path_count_index: usize = json_object_find_index(&object, "affected_path_count", 19 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+                const byte_count_index: usize = json_object_find_index(&object, "affected_byte_count", 19 as usize) catch {
+                    return error.AuditLogInvalid;
+                };
+
+                const version: i64 = json_expect_i64(&object.pairs[version_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                if version != AUDIT_LOG_VERSION {
+                    return error.AuditLogInvalid;
+                }
+                const kind_text: JsonStrView = json_expect_str(&object.pairs[kind_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                const timestamp_ms: i64 = json_expect_i64(&object.pairs[timestamp_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                const target: JsonStrView = json_expect_str(&object.pairs[target_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                const head_before: JsonStrView = json_expect_str(&object.pairs[before_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                const head_after: JsonStrView = json_expect_str(&object.pairs[after_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                const policy_text: JsonStrView = json_expect_str(&object.pairs[policy_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                const scope_text: JsonStrView = json_expect_str(&object.pairs[scope_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                const audit_enabled: bool = json_expect_bool(&object.pairs[audit_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                const path_count_i64: i64 = json_expect_i64(&object.pairs[path_count_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                const byte_count_i64: i64 = json_expect_i64(&object.pairs[byte_count_index].value) catch {
+                    return error.AuditLogInvalid;
+                };
+                if path_count_i64 < 0i64 || byte_count_i64 < 0i64 {
+                    return error.AuditLogInvalid;
+                }
+
+                raw_events[event_index] = AuditLogEvent{
+                    kind: try audit_log_kind_from_str(kind_text),
+                    timestamp_ms: timestamp_ms,
+                    target: try audit_log_copy_json_str(arena, target),
+                    head_before: try audit_log_copy_json_str(arena, head_before),
+                    head_after: try audit_log_copy_json_str(arena, head_after),
+                    policy_id: try policy_id_decode_hex(policy_text.ptr[0: policy_text.len]),
+                    dedupe_scope: try audit_log_copy_json_str(arena, scope_text),
+                    audit_enabled: audit_enabled,
+                    affected_path_count: path_count_i64 as u64,
+                    affected_byte_count: byte_count_i64 as u64,
+                };
+                event_index = event_index + 1 as usize;
+            }
+            line_start = cursor + 1 as usize;
+        }
+        cursor = cursor + 1 as usize;
+    }
+
+    return audit_log_event_list_from_slice(raw_events[0: event_index]);
+}

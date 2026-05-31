@@ -1,0 +1,217 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.system;
+use core.audit_log.AuditLogEvent;
+use core.audit_log.AuditLogEventKind;
+use core.audit_log.AuditLogEventList;
+use core.audit_log.audit_log_file_append;
+use core.audit_log.audit_log_file_append_with_options;
+use core.audit_log.audit_log_file_read;
+use core.ids.Hash32;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_compare;
+use core.ids.policy_id_from_object;
+use object.types.ByteList;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(object_id_from_hash(make_hash(seed)));
+}
+
+fn byte_list_from_literal(text: &const byte) ByteList {
+    const bytes: &[byte] = literal_bytes(text);
+    return ByteList{ ptr: bytes.ptr, len: bytes.len };
+}
+
+fn expect_byte_list_eq(value: &ByteList, expected: &const byte) !void {
+    const bytes: &[byte] = literal_bytes(expected);
+    try expect(value.len == bytes.len);
+    var i: usize = 0 as usize;
+    while i < value.len {
+        try expect(value.ptr[i] == bytes.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn make_event(
+    kind: AuditLogEventKind,
+    timestamp_ms: i64,
+    target: &const byte,
+    before: &const byte,
+    after: &const byte,
+    policy_seed: byte,
+    dedupe_scope: &const byte,
+    audit_enabled: bool,
+    affected_paths: u64,
+    affected_bytes: u64,
+) AuditLogEvent {
+    return AuditLogEvent{
+        kind: kind,
+        timestamp_ms: timestamp_ms,
+        target: byte_list_from_literal(target),
+        head_before: byte_list_from_literal(before),
+        head_after: byte_list_from_literal(after),
+        policy_id: make_policy_id(policy_seed),
+        dedupe_scope: byte_list_from_literal(dedupe_scope),
+        audit_enabled: audit_enabled,
+        affected_path_count: affected_paths,
+        affected_byte_count: affected_bytes,
+    };
+}
+
+fn test_audit_log_append_and_read_roundtrip() !void {
+    try expect(system("rm -rf build/audit-log-roundtrip && mkdir -p build/audit-log-roundtrip/repo/.hgit/audit") == 0);
+
+    const first: AuditLogEvent = make_event(
+        AuditLogEventKind.Commit,
+        1700000000000i64,
+        "main",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        11 as byte,
+        "repository",
+        true,
+        2u64,
+        123u64,
+    );
+    const second: AuditLogEvent = make_event(
+        AuditLogEventKind.Fetch,
+        1700000001234i64,
+        "file:///tmp/remote",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        12 as byte,
+        "global",
+        false,
+        4u64,
+        456u64,
+    );
+
+    try audit_log_file_append("build/audit-log-roundtrip/repo/.hgit/audit/events.jsonl", &first);
+    try audit_log_file_append("build/audit-log-roundtrip/repo/.hgit/audit/events.jsonl", &second);
+
+    var arena_buf: [byte: 65536] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 65536 as usize);
+    const events: AuditLogEventList = try audit_log_file_read(&arena, "build/audit-log-roundtrip/repo/.hgit/audit/events.jsonl");
+    try expect(events.len == 2 as usize);
+    try expect(events.ptr[0].kind == AuditLogEventKind.Commit);
+    try expect(events.ptr[1].kind == AuditLogEventKind.Fetch);
+    try expect(events.ptr[0].timestamp_ms == 1700000000000i64);
+    try expect(events.ptr[1].timestamp_ms == 1700000001234i64);
+    try expect(policy_id_compare(&events.ptr[0].policy_id, &first.policy_id) == 0);
+    try expect(policy_id_compare(&events.ptr[1].policy_id, &second.policy_id) == 0);
+    try expect(events.ptr[0].audit_enabled);
+    try expect(!events.ptr[1].audit_enabled);
+    try expect(events.ptr[0].affected_path_count == 2u64);
+    try expect(events.ptr[1].affected_byte_count == 456u64);
+    try expect_byte_list_eq(&events.ptr[0].dedupe_scope, "repository");
+    try expect_byte_list_eq(&events.ptr[1].target, "file:///tmp/remote");
+}
+
+fn test_audit_log_rotates_when_size_limit_is_hit() !void {
+    try expect(system("rm -rf build/audit-log-rotate && mkdir -p build/audit-log-rotate/repo/.hgit/audit") == 0);
+
+    const first: AuditLogEvent = make_event(
+        AuditLogEventKind.Checkout,
+        1700000100000i64,
+        "feature",
+        "1111111111111111111111111111111111111111111111111111111111111111",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        21 as byte,
+        "repository",
+        true,
+        1u64,
+        64u64,
+    );
+    const second: AuditLogEvent = make_event(
+        AuditLogEventKind.Push,
+        1700000200000i64,
+        "file:///tmp/remote",
+        "2222222222222222222222222222222222222222222222222222222222222222",
+        "3333333333333333333333333333333333333333333333333333333333333333",
+        22 as byte,
+        "global",
+        true,
+        3u64,
+        128u64,
+    );
+
+    try audit_log_file_append_with_options(
+        "build/audit-log-rotate/repo/.hgit/audit/events.jsonl",
+        &first,
+        300 as usize,
+        2 as usize,
+    );
+    try audit_log_file_append_with_options(
+        "build/audit-log-rotate/repo/.hgit/audit/events.jsonl",
+        &second,
+        300 as usize,
+        2 as usize,
+    );
+
+    try expect(system("test -f build/audit-log-rotate/repo/.hgit/audit/events.jsonl") == 0);
+    try expect(system("test -f build/audit-log-rotate/repo/.hgit/audit/events.jsonl.1") == 0);
+
+    var current_arena_buf: [byte: 65536] = [];
+    var current_arena: Arena = Arena{ buffer: &current_arena_buf[0], size: 0, used: 0 };
+    arena_init(&current_arena, &current_arena_buf[0], 65536 as usize);
+    const current_events: AuditLogEventList = try audit_log_file_read(&current_arena, "build/audit-log-rotate/repo/.hgit/audit/events.jsonl");
+    try expect(current_events.len == 1 as usize);
+    try expect(current_events.ptr[0].kind == AuditLogEventKind.Push);
+
+    var rotated_arena_buf: [byte: 65536] = [];
+    var rotated_arena: Arena = Arena{ buffer: &rotated_arena_buf[0], size: 0, used: 0 };
+    arena_init(&rotated_arena, &rotated_arena_buf[0], 65536 as usize);
+    const rotated_events: AuditLogEventList = try audit_log_file_read(&rotated_arena, "build/audit-log-rotate/repo/.hgit/audit/events.jsonl.1");
+    try expect(rotated_events.len == 1 as usize);
+    try expect(rotated_events.ptr[0].kind == AuditLogEventKind.Checkout);
+}
+
+fn test_audit_log_append_creates_parent_dir() !void {
+    try expect(system("rm -rf build/audit-log-parent && mkdir -p build/audit-log-parent/repo/.hgit") == 0);
+
+    const event: AuditLogEvent = make_event(
+        AuditLogEventKind.Commit,
+        1700000300000i64,
+        "main",
+        "",
+        "4444444444444444444444444444444444444444444444444444444444444444",
+        31 as byte,
+        "repository",
+        true,
+        1u64,
+        32u64,
+    );
+    try audit_log_file_append("build/audit-log-parent/repo/.hgit/audit/events.jsonl", &event);
+    try expect(system("test -d build/audit-log-parent/repo/.hgit/audit && test -f build/audit-log-parent/repo/.hgit/audit/events.jsonl") == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Audit Log Tests");
+    run_test("audit log append and read roundtrip", test_audit_log_append_and_read_roundtrip);
+    run_test("audit log rotates when size limit is hit", test_audit_log_rotates_when_size_limit_is_hit);
+    run_test("audit log append creates parent dir", test_audit_log_append_creates_parent_dir);
+    return test_suite_end();
+}
