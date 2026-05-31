@@ -17,6 +17,7 @@ c99:
 	$(UYA) build $(SRC) -o $(C99) --c99
 
 test:
+	./tests/test_ci_workflow.sh
 	$(UYA) test src/hypergit/test_object_model.uya
 	$(UYA) test src/hypergit/test_policy_placeholder.uya
 	$(UYA) test src/hypergit/test_object_codec.uya

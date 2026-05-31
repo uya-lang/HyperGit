@@ -403,7 +403,7 @@
 - [x] 冻结 `v1.0.0` CLI 支持面，明确 `merge` / `branch` / `clone` / HTTP remote / Git 互操作哪些进入 1.0，哪些明确延后。
 - [x] 为 1.0 选定至少一条发布级远端主路径：要么把 HTTP remote 补到 CLI 端到端可用，要么明确 1.0 只支持 file remote 并完成文档、帮助和测试收口。
 - [x] 为删除提交、diverged stage、fetch/push happy path、远端冲突、损坏恢复补齐端到端测试。
-- [ ] 建立自动化 CI，默认执行 `make test`、native build、C99 smoke，并固定失败门槛。
+- [x] 建立自动化 CI，默认执行 `make test`、native build、C99 smoke，并固定失败门槛。
 - [x] 更新 `readme.md`、`docs/design.md`、release notes 和命令帮助，使 1.0 承诺范围与真实实现一致。
 
 ### P1 / 强烈建议在 `v1.0.0` 前完成
