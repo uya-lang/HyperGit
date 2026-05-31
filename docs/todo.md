@@ -426,5 +426,9 @@
 - [x] 定义 repo-local audit log 文件格式、轮转边界和事件字段，并实现原子追加写入。
 - [x] 将 audit log 接入 checkout / fetch / push / commit 成功路径，记录 policy_id / dedupe_scope / audit_enabled 等最终生效元数据。
 - [x] 扩展 `hgx doctor` 对 audit log 的可见性与诊断，并补齐命令级回归测试。
-- [ ] FUSE / 平台 VFS / 内核级虚拟工作区。
+- [~] FUSE / 平台 VFS / 内核级虚拟工作区。
+- [~] 定义 VFS provider / placeholder entry / materialization request 数据结构与规划器，并补齐单元测试。
+- [ ] 将 sparse / hydrate / dehydrate / workspace local view 接入 VFS 规划层，并补齐回归测试。
+- [ ] 实现 Linux FUSE adapter、mount 生命周期和错误恢复。
+- [ ] 为 macOS / Windows 平台抽象 VFS 边界与降级策略。
 - [ ] 更激进的服务端索引、云端查询和分布式执行能力。
