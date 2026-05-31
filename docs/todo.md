@@ -422,7 +422,7 @@
 - [x] 定义可持久化的 path policy / dedupe scope / audit / cache TTL 配置格式，并实现 repo-local 读写与 matcher。
 - [x] 将 policy / dedupe / audit 规则接入 add / commit / manifest / chunked blob 构建路径，替换当前 experimental default 常量直写。
 - [x] 为 chunk / object 存储实现 tier-aware 放置与查询策略，并补齐 `StorageTier` 的真实选择、回退和测试。
-- [~] 为 checkout / fetch / push / commit 生成可落盘 audit log，并补齐 doctor / CLI 可见性与回归测试。
+- [x] 为 checkout / fetch / push / commit 生成可落盘 audit log，并补齐 doctor / CLI 可见性与回归测试。
 - [x] 定义 repo-local audit log 文件格式、轮转边界和事件字段，并实现原子追加写入。
 - [x] 将 audit log 接入 checkout / fetch / push / commit 成功路径，记录 policy_id / dedupe_scope / audit_enabled 等最终生效元数据。
 - [x] 扩展 `hgx doctor` 对 audit log 的可见性与诊断，并补齐命令级回归测试。
