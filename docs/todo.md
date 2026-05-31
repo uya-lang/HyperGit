@@ -389,3 +389,35 @@
 - [x] `docs/design.md` 与实际模块命名一致。
 - [x] `docs/todo.md` 已更新真实完成状态。
 - [x] 发布首个里程碑版本 `v0.1.0` 并记录 release notes。
+
+## 24. `v1.0.0` 发布清单
+
+以下清单用于把 `v0.1.0` 的“可运行 MVP”推进到“可对外承诺的 `v1.0.0`”。
+要求：不再用 prototype / placeholder / smoke test 作为 1.0 主路径完成标准。
+
+### P0 / `v1.0.0` 发布阻塞项
+
+- [ ] 补齐 `hgx commit` 对 staged deletion 的完整提交路径，移除 `commit with staged deletions or unsupported entries is not implemented yet` 分支。
+- [ ] 补齐 `stage base commit != HEAD` 时的安全提交流程，移除 `commit from an existing history is not implemented yet` 分支。
+- [ ] 将 `hgx doctor` 从占位命令提升为真实诊断命令，至少覆盖对象损坏、索引落后、workspace state 不一致、stale lock。
+- [ ] 冻结 `v1.0.0` CLI 支持面，明确 `merge` / `branch` / `clone` / HTTP remote / Git 互操作哪些进入 1.0，哪些明确延后。
+- [ ] 为 1.0 选定至少一条发布级远端主路径：要么把 HTTP remote 补到 CLI 端到端可用，要么明确 1.0 只支持 file remote 并完成文档、帮助和测试收口。
+- [ ] 为删除提交、diverged stage、fetch/push happy path、远端冲突、损坏恢复补齐端到端测试。
+- [ ] 建立自动化 CI，默认执行 `make test`、native build、C99 smoke，并固定失败门槛。
+- [ ] 更新 `readme.md`、`docs/design.md`、release notes 和命令帮助，使 1.0 承诺范围与真实实现一致。
+
+### P1 / 强烈建议在 `v1.0.0` 前完成
+
+- [ ] 如果 `merge` 进入 1.0 范围，补齐用户可见命令、冲突处理流程和 shell 测试，而不只停留在底层模块。
+- [ ] 如果 `branch` / `clone` 进入 1.0 范围，补齐 CLI、仓库引用操作、远端初始化流程和文档。
+- [ ] 将 policy / dedupe scope / audit event 从占位实现升级为最小可用实现，或明确标记为实验特性并从 1.0 承诺中移出。
+- [ ] 将 HTTP remote 从当前 smoke 级验证提升为更完整的协议验证，覆盖鉴权失败、对象批量传输、fetch、push、尺寸限制和服务端错误路径。
+- [ ] 将 Git 互操作从 prototype 收敛为“支持子集”并写清兼容矩阵、限制条件和失败行为。
+- [ ] 基于 `docs/benchmarks.md` 当前结果继续优化明显热点，至少解释并处理“parallel diff 慢于 serial”和“segment pack lookup 偏慢”的现状。
+
+### 可明确延后到 `v1.1+`
+
+- [ ] Git packed object / delta / tag / submodule / replace ref 完整互操作。
+- [ ] 更复杂的 audit / policy / dedupe / storage tier 体系。
+- [ ] FUSE / 平台 VFS / 内核级虚拟工作区。
+- [ ] 更激进的服务端索引、云端查询和分布式执行能力。

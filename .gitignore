@@ -7,3 +7,6 @@ build/*
 !build/.gitkeep
 .marscode/deviceInfo.json
 tmp
+
+.agent/logs/*
+.agent/state*.json
