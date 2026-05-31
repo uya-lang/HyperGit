@@ -1,0 +1,333 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.string.strlen;
+
+use core.audit_log.AUDIT_LOG_REL;
+use core.audit_log.AuditLogEvent;
+use core.audit_log.audit_log_file_append;
+use core.ids.CommitId;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.commit_id_encode_hex;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_compare;
+use core.ids.policy_id_from_object;
+use core.path_policy.PathPolicyDedupeScopeKind;
+use core.path_policy.PathPolicyMatch;
+use core.path_policy.PathPolicyProfile;
+use core.path_policy.PathPolicyRuleList;
+use core.path_policy.path_policy_default;
+use core.path_policy.path_policy_file_default;
+use core.path_policy.path_policy_match;
+use manifest.flat_diff.ManifestFlatDiffEntry;
+use manifest.flat_diff.ManifestFlatDiffEntryKind;
+use manifest.flat_diff.ManifestFlatDiffEntryList;
+use manifest.flat_diff.manifest_flat_diff;
+use manifest.query.ManifestPathspecList;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use object.types.ByteList;
+use store.repo_layout.HGIT_POLICY_REL;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_join_literal;
+
+error AuditSupportFailure;
+
+export struct AuditSummary {
+    policy_id: PolicyId,
+    dedupe_scope: ByteList,
+    audit_enabled: bool,
+    affected_path_count: u64,
+    affected_byte_count: u64
+}
+
+struct AuditSummaryBuilder {
+    initialized: bool,
+    uniform_policy: bool,
+    uniform_scope: bool,
+    uniform_audit: bool,
+    policy_id: PolicyId,
+    dedupe_scope: ByteList,
+    audit_enabled: bool,
+    affected_path_count: u64,
+    affected_byte_count: u64
+}
+
+fn audit_zero_policy_id() PolicyId {
+    return policy_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
+}
+
+fn audit_empty_policy_profile() PathPolicyProfile {
+    return PathPolicyProfile{
+        rules: PathPolicyRuleList{ ptr: null, len: 0 as usize },
+        profile_id: Hash32{ bytes: [] },
+    };
+}
+
+fn audit_empty_summary() AuditSummary {
+    return AuditSummary{
+        policy_id: audit_zero_policy_id(),
+        dedupe_scope: audit_literal_byte_list("repository"),
+        audit_enabled: false,
+        affected_path_count: 0u64,
+        affected_byte_count: 0u64,
+    };
+}
+
+fn audit_literal_byte_list(text: &const byte) ByteList {
+    return ByteList{
+        ptr: text,
+        len: strlen(text),
+    };
+}
+
+fn audit_byte_list_equals(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0 as usize;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn audit_builder_init() AuditSummaryBuilder {
+    return AuditSummaryBuilder{
+        initialized: false,
+        uniform_policy: true,
+        uniform_scope: true,
+        uniform_audit: true,
+        policy_id: audit_zero_policy_id(),
+        dedupe_scope: audit_literal_byte_list("repository"),
+        audit_enabled: false,
+        affected_path_count: 0u64,
+        affected_byte_count: 0u64,
+    };
+}
+
+fn audit_builder_add(
+    builder: &AuditSummaryBuilder,
+    policy_id: &PolicyId,
+    dedupe_scope: &ByteList,
+    audit_enabled: bool,
+    logical_size: u64,
+) void {
+    if !builder.initialized {
+        builder.initialized = true;
+        builder.policy_id = policy_id[0];
+        builder.dedupe_scope = ByteList{
+            ptr: dedupe_scope.ptr,
+            len: dedupe_scope.len,
+        };
+        builder.audit_enabled = audit_enabled;
+    } else {
+        if policy_id_compare(&builder.policy_id, policy_id) != 0 {
+            builder.uniform_policy = false;
+        }
+        if !audit_byte_list_equals(&builder.dedupe_scope, dedupe_scope) {
+            builder.uniform_scope = false;
+        }
+        if builder.audit_enabled != audit_enabled {
+            builder.uniform_audit = false;
+        }
+    }
+    builder.affected_path_count = builder.affected_path_count + 1u64;
+    builder.affected_byte_count = builder.affected_byte_count + logical_size;
+}
+
+fn audit_builder_finish(builder: &AuditSummaryBuilder) AuditSummary {
+    if !builder.initialized {
+        return AuditSummary{
+            policy_id: audit_zero_policy_id(),
+            dedupe_scope: audit_literal_byte_list("repository"),
+            audit_enabled: false,
+            affected_path_count: 0u64,
+            affected_byte_count: 0u64,
+        };
+    }
+    var final_policy_id: PolicyId = builder.policy_id;
+    if !builder.uniform_policy {
+        final_policy_id = audit_zero_policy_id();
+    }
+    var final_scope: ByteList = builder.dedupe_scope;
+    if !builder.uniform_scope {
+        final_scope = audit_literal_byte_list("mixed");
+    }
+    return AuditSummary{
+        policy_id: final_policy_id,
+        dedupe_scope: final_scope,
+        audit_enabled: builder.uniform_audit && builder.audit_enabled,
+        affected_path_count: builder.affected_path_count,
+        affected_byte_count: builder.affected_byte_count,
+    };
+}
+
+fn audit_scope_text_from_policy_match(matched: &PathPolicyMatch) ByteList {
+    if matched.dedupe_scope_kind == PathPolicyDedupeScopeKind.Repository {
+        return audit_literal_byte_list("repository");
+    }
+    return audit_literal_byte_list("global");
+}
+
+fn audit_policy_match_applies(match_result: &PathPolicyMatch, policy_id: &PolicyId) bool {
+    if !match_result.matched {
+        return false;
+    }
+    return policy_id_compare(&match_result.policy_id, policy_id) == 0;
+}
+
+fn audit_manifest_entry_scope(
+    arena: &Arena,
+    policy: &PathPolicyProfile,
+    entry: &ManifestLeafInputEntry,
+) !AuditSummary {
+    const matched: PathPolicyMatch = path_policy_match(policy, &entry.path);
+    const matched_policy: bool = audit_policy_match_applies(&matched, &entry.policy_id);
+    var scope: ByteList = audit_literal_byte_list("repository");
+    _ = arena;
+    if matched_policy {
+        scope = audit_scope_text_from_policy_match(&matched);
+    }
+    return AuditSummary{
+        policy_id: entry.policy_id,
+        dedupe_scope: scope,
+        audit_enabled: matched_policy && matched.audit_enabled,
+        affected_path_count: 1u64,
+        affected_byte_count: entry.logical_size,
+    };
+}
+
+fn audit_empty_pathspecs() ManifestPathspecList {
+    return ManifestPathspecList{ ptr: null, len: 0 as usize };
+}
+
+fn audit_policy_profile_default_impl(arena: &Arena, root: &RepoPath) !PathPolicyProfile {
+    const policy_path: RepoPath = repo_path_join_literal(root, HGIT_POLICY_REL) catch {
+        return path_policy_default(arena) catch {
+            return error.AuditSupportFailure;
+        };
+    };
+    return path_policy_file_default(arena, repo_path_cstr(&policy_path) as &const byte) catch {
+        return path_policy_default(arena) catch {
+            return error.AuditSupportFailure;
+        };
+    };
+}
+
+export fn audit_policy_profile_default(arena: &Arena, root: &RepoPath) PathPolicyProfile {
+    return audit_policy_profile_default_impl(arena, root) catch {
+        return audit_empty_policy_profile();
+    };
+}
+
+fn audit_summary_from_manifest_diff_impl(
+    arena: &Arena,
+    policy: &PathPolicyProfile,
+    left_inputs: &ManifestLeafInputList,
+    right_inputs: &ManifestLeafInputList,
+) !AuditSummary {
+    const diff: ManifestFlatDiffEntryList = manifest_flat_diff(
+        arena,
+        left_inputs,
+        right_inputs,
+        audit_empty_pathspecs(),
+    ) catch {
+        return error.AuditSupportFailure;
+    };
+    var builder: AuditSummaryBuilder = audit_builder_init();
+    var i: usize = 0 as usize;
+    while i < diff.len {
+        const entry: &ManifestFlatDiffEntry = &diff.ptr[i];
+        var summary_entry: &ManifestLeafInputEntry = null;
+        if entry.kind == ManifestFlatDiffEntryKind.Removed {
+            summary_entry = &left_inputs.ptr[entry.left_index];
+        } else {
+            summary_entry = &right_inputs.ptr[entry.right_index];
+        }
+        const entry_summary: AuditSummary = audit_manifest_entry_scope(
+            arena,
+            policy,
+            summary_entry,
+        ) catch {
+            return error.AuditSupportFailure;
+        };
+        audit_builder_add(
+            &builder,
+            &entry_summary.policy_id,
+            &entry_summary.dedupe_scope,
+            entry_summary.audit_enabled,
+            entry_summary.affected_byte_count,
+        );
+        i = i + 1 as usize;
+    }
+    return audit_builder_finish(&builder);
+}
+
+export fn audit_summary_from_manifest_diff(
+    arena: &Arena,
+    policy: &PathPolicyProfile,
+    left_inputs: &ManifestLeafInputList,
+    right_inputs: &ManifestLeafInputList,
+    out: &AuditSummary,
+) bool {
+    const summary: AuditSummary = audit_summary_from_manifest_diff_impl(
+        arena,
+        policy,
+        left_inputs,
+        right_inputs,
+    ) catch {
+        *out = audit_empty_summary();
+        return false;
+    };
+    *out = summary;
+    return true;
+}
+
+fn audit_repo_event_append_impl(root: &RepoPath, event: &AuditLogEvent) !void {
+    const audit_path: RepoPath = repo_path_join_literal(root, AUDIT_LOG_REL) catch {
+        return error.AuditSupportFailure;
+    };
+    audit_log_file_append(repo_path_cstr(&audit_path) as &const byte, event) catch {
+        return error.AuditSupportFailure;
+    };
+}
+
+export fn audit_repo_event_append(root: &RepoPath, event: &AuditLogEvent) bool {
+    audit_repo_event_append_impl(root, event) catch {
+        return false;
+    };
+    return true;
+}
+
+export fn audit_cstr_byte_list(text: &const byte) ByteList {
+    return audit_literal_byte_list(text);
+}
+
+fn audit_commit_id_text_impl(has_commit: bool, commit_id: &CommitId, output: &[byte]) !ByteList {
+    if !has_commit {
+        return ByteList{ ptr: null, len: 0 as usize };
+    }
+    if output.len < HASH32_HEX_BYTES {
+        return error.AuditSupportFailure;
+    }
+    _ = commit_id_encode_hex(commit_id, output[0: HASH32_HEX_BYTES]) catch {
+        return error.AuditSupportFailure;
+    };
+    return ByteList{ ptr: output.ptr, len: HASH32_HEX_BYTES };
+}
+
+export fn audit_commit_id_text(has_commit: bool, commit_id: &CommitId, output: &[byte], out: &ByteList) bool {
+    const value: ByteList = audit_commit_id_text_impl(has_commit, commit_id, output) catch {
+        *out = ByteList{ ptr: null, len: 0 as usize };
+        return false;
+    };
+    *out = value;
+    return true;
+}

@@ -14,6 +14,12 @@ use libc.ENOENT;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
 use cli.EXIT_USAGE_ERROR;
+use commands.audit_support.AuditSummary;
+use commands.audit_support.audit_commit_id_text;
+use commands.audit_support.audit_cstr_byte_list;
+use commands.audit_support.audit_policy_profile_default;
+use commands.audit_support.audit_repo_event_append;
+use commands.audit_support.audit_summary_from_manifest_diff;
 use commands.checkout.checkout_apply_plan;
 use commands.checkout.checkout_current_local_changes;
 use commands.checkout.checkout_current_sparse_profile;
@@ -21,9 +27,12 @@ use commands.checkout.checkout_current_state;
 use commands.checkout.checkout_manifest_inputs_from_commit;
 use commands.checkout.checkout_state_has_base_commit;
 use commands.checkout.checkout_sync_virtual_state;
+use core.audit_log.AuditLogEvent;
+use core.audit_log.AuditLogEventKind;
 use core.codec.DecodedObject;
 use core.codec.codec_decode_object;
 use core.ids.CommitId;
+use core.ids.HASH32_HEX_BYTES;
 use core.ids.Hash32;
 use core.ids.ObjectId;
 use core.ids.PublishedViewId;
@@ -31,6 +40,7 @@ use core.ids.commit_id_compare;
 use core.ids.object_id_compare;
 use core.ids.object_id_from_hash;
 use core.ids.published_view_id_compare;
+use core.path_policy.PathPolicyProfile;
 use large.chunk_store.ChunkStore;
 use large.chunk_store.ChunkStoreBytes;
 use large.chunk_store.ChunkStorePutResult;
@@ -84,6 +94,7 @@ use workspace.stage.StageState;
 use workspace.stage.stage_snapshot_init;
 use workspace.stage.stage_state_with_entry_count;
 use workspace.stage.stage_zero_commit_id;
+use workspace.stage.stage_zero_policy_id;
 use workspace.stage_file.stage_file_read;
 use workspace.stage_file.stage_file_write;
 use workspace.state.LocalChangeList;
@@ -680,6 +691,7 @@ export fn run_fetch() i32 {
         fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
+    const audit_policy: PathPolicyProfile = audit_policy_profile_default(&arena, &root);
 
     const local_changes: LocalChangeList = workspace_reconcile_scan(
         &arena,
@@ -770,5 +782,53 @@ export fn run_fetch() i32 {
         fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
+    var audit_summary: AuditSummary = AuditSummary{
+        policy_id: stage_zero_policy_id(),
+        dedupe_scope: ByteList{ ptr: null, len: 0 as usize },
+        audit_enabled: false,
+        affected_path_count: 0u64,
+        affected_byte_count: 0u64,
+    };
+    if !audit_summary_from_manifest_diff(
+        &arena,
+        &audit_policy,
+        &current_materialized,
+        &target_materialized,
+        &audit_summary,
+    ) {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    var head_before_hex: [byte: HASH32_HEX_BYTES] = [];
+    var head_after_hex: [byte: HASH32_HEX_BYTES] = [];
+    var head_before_text: ByteList = ByteList{ ptr: null, len: 0 as usize };
+    var head_after_text: ByteList = ByteList{ ptr: null, len: 0 as usize };
+    if !audit_commit_id_text(local_has_head, &local_head, head_before_hex[0: HASH32_HEX_BYTES], &head_before_text) {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    if !audit_commit_id_text(true, &remote_head, head_after_hex[0: HASH32_HEX_BYTES], &head_after_text) {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    const audit_event: AuditLogEvent = AuditLogEvent{
+        kind: AuditLogEventKind.Fetch,
+        timestamp_ms: now_ms() catch {
+            fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        },
+        target: audit_cstr_byte_list(remote_uri as &const byte),
+        head_before: ByteList{ ptr: head_before_text.ptr, len: head_before_text.len },
+        head_after: ByteList{ ptr: head_after_text.ptr, len: head_after_text.len },
+        policy_id: audit_summary.policy_id,
+        dedupe_scope: ByteList{ ptr: audit_summary.dedupe_scope.ptr, len: audit_summary.dedupe_scope.len },
+        audit_enabled: audit_summary.audit_enabled,
+        affected_path_count: audit_summary.affected_path_count,
+        affected_byte_count: audit_summary.affected_byte_count,
+    };
+    if !audit_repo_event_append(&root, &audit_event) {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
     return EXIT_OK;
 }

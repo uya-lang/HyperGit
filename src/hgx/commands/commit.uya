@@ -18,7 +18,12 @@ use cli.EXIT_NOT_IMPLEMENTED;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
 use cli.EXIT_USAGE_ERROR;
+use commands.audit_support.AuditSummary;
+use commands.audit_support.audit_commit_id_text;
+use commands.audit_support.audit_policy_profile_default;
+use commands.audit_support.audit_repo_event_append;
 use core.ids.CommitId;
+use core.ids.HASH32_HEX_BYTES;
 use core.ids.Hash32;
 use core.ids.ManifestId;
 use core.ids.ObjectId;
@@ -29,6 +34,10 @@ use core.ids.manifest_id_from_object;
 use core.ids.object_id_compare;
 use core.ids.object_id_from_hash;
 use core.ids.policy_id_compare;
+use core.path_policy.PathPolicyDedupeScopeKind;
+use core.path_policy.PathPolicyMatch;
+use core.path_policy.PathPolicyProfile;
+use core.path_policy.path_policy_match;
 use index.commit_graph.CommitGraphEntryList;
 use index.commit_graph.CommitGraphPathList;
 use index.commit_graph.commit_graph_changed_path_bloom_build;
@@ -111,6 +120,8 @@ use workspace.stage_file.stage_file_lock_release;
 use workspace.stage_file.stage_file_read;
 use workspace.stage_file.stage_file_write;
 use workspace.stage_view.stage_view_manifest_inputs_from_snapshot;
+use core.audit_log.AuditLogEvent;
+use core.audit_log.AuditLogEventKind;
 
 const COMMIT_STAGE_ARENA_MIN_BYTES: usize = 33554432 as usize;
 const COMMIT_STAGE_ARENA_EXTRA_BYTES: usize = 1048576 as usize;
@@ -722,6 +733,149 @@ fn commit_manifest_entry_matches(left: &ManifestLeafInputEntry, right: &Manifest
     return left.kind == right.kind &&
         left.mode == right.mode &&
         object_id_compare(&left.object_id, &right.object_id) == 0;
+}
+
+struct CommitAuditSummaryBuilder {
+    initialized: bool,
+    uniform_policy: bool,
+    uniform_scope: bool,
+    uniform_audit: bool,
+    policy_id: PolicyId,
+    dedupe_scope: ByteList,
+    audit_enabled: bool,
+    affected_path_count: u64,
+    affected_byte_count: u64
+}
+
+fn commit_audit_literal(text: &const byte) ByteList {
+    return ByteList{ ptr: text, len: strlen(text) };
+}
+
+fn commit_audit_byte_list_eq(left: &ByteList, right: &ByteList) bool {
+    if left.len != right.len {
+        return false;
+    }
+    var i: usize = 0 as usize;
+    while i < left.len {
+        if left.ptr[i] != right.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn commit_audit_scope_text(matched: &PathPolicyMatch) ByteList {
+    if matched.dedupe_scope_kind == PathPolicyDedupeScopeKind.Repository {
+        return commit_audit_literal("repository");
+    }
+    return commit_audit_literal("global");
+}
+
+fn commit_audit_builder_init() CommitAuditSummaryBuilder {
+    return CommitAuditSummaryBuilder{
+        initialized: false,
+        uniform_policy: true,
+        uniform_scope: true,
+        uniform_audit: true,
+        policy_id: stage_zero_policy_id(),
+        dedupe_scope: commit_audit_literal("repository"),
+        audit_enabled: false,
+        affected_path_count: 0u64,
+        affected_byte_count: 0u64,
+    };
+}
+
+fn commit_audit_builder_add(
+    builder: &CommitAuditSummaryBuilder,
+    policy_id: &PolicyId,
+    dedupe_scope: &ByteList,
+    audit_enabled: bool,
+    logical_size: u64,
+) void {
+    if !builder.initialized {
+        builder.initialized = true;
+        builder.policy_id = policy_id[0];
+        builder.dedupe_scope = ByteList{ ptr: dedupe_scope.ptr, len: dedupe_scope.len };
+        builder.audit_enabled = audit_enabled;
+    } else {
+        if policy_id_compare(&builder.policy_id, policy_id) != 0 {
+            builder.uniform_policy = false;
+        }
+        if !commit_audit_byte_list_eq(&builder.dedupe_scope, dedupe_scope) {
+            builder.uniform_scope = false;
+        }
+        if builder.audit_enabled != audit_enabled {
+            builder.uniform_audit = false;
+        }
+    }
+    builder.affected_path_count = builder.affected_path_count + 1u64;
+    builder.affected_byte_count = builder.affected_byte_count + logical_size;
+}
+
+fn commit_audit_builder_finish(builder: &CommitAuditSummaryBuilder) AuditSummary {
+    if !builder.initialized {
+        return AuditSummary{
+            policy_id: stage_zero_policy_id(),
+            dedupe_scope: commit_audit_literal("repository"),
+            audit_enabled: false,
+            affected_path_count: 0u64,
+            affected_byte_count: 0u64,
+        };
+    }
+    var final_policy_id: PolicyId = builder.policy_id;
+    if !builder.uniform_policy {
+        final_policy_id = stage_zero_policy_id();
+    }
+    var final_scope: ByteList = builder.dedupe_scope;
+    if !builder.uniform_scope {
+        final_scope = commit_audit_literal("mixed");
+    }
+    return AuditSummary{
+        policy_id: final_policy_id,
+        dedupe_scope: final_scope,
+        audit_enabled: builder.uniform_audit && builder.audit_enabled,
+        affected_path_count: builder.affected_path_count,
+        affected_byte_count: builder.affected_byte_count,
+    };
+}
+
+fn commit_audit_summary_from_snapshot(
+    store: &LooseObjectStore,
+    policy: &PathPolicyProfile,
+    snapshot: &StageSnapshot,
+    manifest_inputs: &ManifestLeafInputList,
+) !AuditSummary {
+    var builder: CommitAuditSummaryBuilder = commit_audit_builder_init();
+    var i: usize = 0 as usize;
+    while i < snapshot.entries.len {
+        const entry: &StageEntry = &snapshot.entries.ptr[i];
+        const manifest_entry: &ManifestLeafInputEntry = commit_find_manifest_entry(manifest_inputs, &entry.path);
+        var policy_id: PolicyId = entry.policy_id;
+        if manifest_entry != null {
+            policy_id = manifest_entry.policy_id;
+        }
+        var logical_size: u64 = 0u64;
+        if stage_entry_has_staged_content(entry) {
+            logical_size = try commit_stage_entry_logical_size(store, &entry.staged_object);
+        } else if object_id_compare(&entry.base_object, &ObjectId{ hash: Hash32{ bytes: [] } }) != 0 {
+            logical_size = try commit_stage_entry_logical_size(store, &entry.base_object);
+        }
+        const matched: PathPolicyMatch = path_policy_match(policy, &entry.path);
+        var dedupe_scope: ByteList = commit_audit_literal("repository");
+        if matched.matched && policy_id_compare(&matched.policy_id, &policy_id) == 0 {
+            dedupe_scope = commit_audit_scope_text(&matched);
+        }
+        commit_audit_builder_add(
+            &builder,
+            &policy_id,
+            &dedupe_scope,
+            entry.audit_enabled,
+            logical_size,
+        );
+        i = i + 1 as usize;
+    }
+    return commit_audit_builder_finish(&builder);
 }
 
 fn commit_stage_entry_replay_is_safe(
@@ -1574,6 +1728,52 @@ export fn run_commit() i32 {
         return EXIT_RUNTIME_ERROR;
     };
     commit_profile_add_elapsed(&profile.stage_clear_elapsed_ms, stage_clear_started_ms);
+
+    const audit_policy: PathPolicyProfile = audit_policy_profile_default(&work_arena, &root);
+    var audit_summary: AuditSummary = AuditSummary{
+        policy_id: stage_zero_policy_id(),
+        dedupe_scope: ByteList{ ptr: null, len: 0 as usize },
+        audit_enabled: false,
+        affected_path_count: 0u64,
+        affected_byte_count: 0u64,
+    };
+    audit_summary = commit_audit_summary_from_snapshot(
+        &store,
+        &audit_policy,
+        &snapshot,
+        &manifest_inputs,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    var head_before_hex: [byte: HASH32_HEX_BYTES] = [];
+    var head_after_hex: [byte: HASH32_HEX_BYTES] = [];
+    var head_before_text: ByteList = ByteList{ ptr: null, len: 0 as usize };
+    var head_after_text: ByteList = ByteList{ ptr: null, len: 0 as usize };
+    if !audit_commit_id_text(has_head, &head_commit, head_before_hex[0: HASH32_HEX_BYTES], &head_before_text) {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    if !audit_commit_id_text(true, &commit_id, head_after_hex[0: HASH32_HEX_BYTES], &head_after_text) {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    const audit_event: AuditLogEvent = AuditLogEvent{
+        kind: AuditLogEventKind.Commit,
+        timestamp_ms: timestamp_ms as i64,
+        target: ByteList{ ptr: &config.default_branch[0], len: config.default_branch_len },
+        head_before: ByteList{ ptr: head_before_text.ptr, len: head_before_text.len },
+        head_after: ByteList{ ptr: head_after_text.ptr, len: head_after_text.len },
+        policy_id: audit_summary.policy_id,
+        dedupe_scope: ByteList{ ptr: audit_summary.dedupe_scope.ptr, len: audit_summary.dedupe_scope.len },
+        audit_enabled: audit_summary.audit_enabled,
+        affected_path_count: audit_summary.affected_path_count,
+        affected_byte_count: audit_summary.affected_byte_count,
+    };
+    if !audit_repo_event_append(&root, &audit_event) {
+        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
 
     commit_profile_print_summary(&profile, snapshot.entries.len, manifest_inputs.len);
     return EXIT_OK;

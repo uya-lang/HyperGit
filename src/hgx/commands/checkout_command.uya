@@ -1,0 +1,517 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.runtime.get_argc;
+use std.runtime.get_argv;
+use std.string.strcmp;
+use std.string.strlen;
+use std.time.now_ms;
+
+use libc.free;
+use libc.fprintf;
+use libc.malloc;
+use libc.stderr;
+use cli.EXIT_OK;
+use cli.EXIT_RUNTIME_ERROR;
+use cli.EXIT_USAGE_ERROR;
+use commands.audit_support.AuditSummary;
+use commands.audit_support.audit_commit_id_text;
+use commands.audit_support.audit_cstr_byte_list;
+use commands.audit_support.audit_policy_profile_default;
+use commands.audit_support.audit_repo_event_append;
+use commands.audit_support.audit_summary_from_manifest_diff;
+use commands.checkout.CHECKOUT_DIRTY_TEXT;
+use commands.checkout.CHECKOUT_FAILURE_TEXT;
+use commands.checkout.CHECKOUT_NO_COMMITS_TEXT;
+use commands.checkout.CHECKOUT_NOT_REPO_TEXT;
+use commands.checkout.CHECKOUT_PERMISSION_TEXT;
+use commands.checkout.CHECKOUT_USAGE_TEXT;
+use commands.checkout.checkout_apply_plan;
+use commands.checkout.checkout_current_local_changes;
+use commands.checkout.checkout_current_sparse_profile;
+use commands.checkout.checkout_current_state;
+use commands.checkout.checkout_load_stage_snapshot;
+use commands.checkout.checkout_manifest_inputs_from_commit;
+use commands.checkout.checkout_restore_plan_build;
+use commands.checkout.checkout_state_has_base_commit;
+use commands.checkout.checkout_sync_virtual_state;
+use core.audit_log.AuditLogEvent;
+use core.audit_log.AuditLogEventKind;
+use core.ids.CommitId;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.commit_id_decode_hex;
+use core.path_policy.PathPolicyProfile;
+use manifest.trie.ManifestLeafInputList;
+use object.types.ByteList;
+use store.head_ref.repo_head_ref_exists;
+use store.head_ref.repo_read_head_commit;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.RepoConfig;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_cstr;
+use store.repo_layout.repo_path_join_literal;
+use store.repo_layout.repo_read_config;
+use workspace.checkout_plan.CheckoutPlan;
+use workspace.local_view.workspace_local_view_filter_expected_inputs;
+use workspace.local_view.workspace_local_view_filter_target_inputs;
+use workspace.reconcile.workspace_reconcile_scan;
+use workspace.sparse_profile.SparseProfile;
+use workspace.stage.StageSnapshot;
+use workspace.stage.stage_zero_policy_id;
+use workspace.stage_view.stage_view_manifest_inputs_from_snapshot;
+use workspace.state.LocalChangeList;
+use workspace.state.WorkspaceState;
+
+fn checkout_command_same_arg(actual: &byte, expected: &const byte) bool {
+    if actual == null {
+        return false;
+    }
+    return strcmp(actual as &const byte, expected) == 0;
+}
+
+fn checkout_command_is_default_branch(config: &RepoConfig, spec: &byte) bool {
+    if spec == null {
+        return false;
+    }
+    const spec_len: usize = strlen(spec as &const byte);
+    if spec_len != config.default_branch_len {
+        return false;
+    }
+    var i: usize = 0 as usize;
+    while i < spec_len {
+        if spec[i] != config.default_branch[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn checkout_command_is_hex_commit_spec(spec: &byte) bool {
+    if spec == null {
+        return false;
+    }
+    const spec_len: usize = strlen(spec as &const byte);
+    if spec_len != HASH32_HEX_BYTES {
+        return false;
+    }
+    commit_id_decode_hex((spec as &byte)[0: HASH32_HEX_BYTES]) catch {
+        return false;
+    };
+    return true;
+}
+
+fn checkout_command_resolve_commit_spec(root: &RepoPath, config: &RepoConfig, spec: &byte) !CommitId {
+    if checkout_command_same_arg(spec, "HEAD") || checkout_command_is_default_branch(config, spec) {
+        const has_head: bool = repo_head_ref_exists(root, config) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                return error.CheckoutPermissionDenied;
+            }
+            return error.CheckoutFailure;
+        };
+        if !has_head {
+            return error.CheckoutNoCommits;
+        }
+        return repo_read_head_commit(root, config) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                return error.CheckoutPermissionDenied;
+            }
+            return error.CheckoutFailure;
+        };
+    }
+    if checkout_command_is_hex_commit_spec(spec) {
+        return try commit_id_decode_hex((spec as &byte)[0: HASH32_HEX_BYTES]);
+    }
+    return error.CheckoutFailure;
+}
+
+fn checkout_command_is_restore_workspace_request(argc: i32) bool {
+    if argc == 3 && checkout_command_same_arg(get_argv(2), ".") {
+        return true;
+    }
+    return argc == 4 &&
+        checkout_command_same_arg(get_argv(2), "--") &&
+        checkout_command_same_arg(get_argv(3), ".");
+}
+
+export fn run_checkout() i32 {
+    const argc: i32 = get_argc();
+    const restore_workspace: bool = checkout_command_is_restore_workspace_request(argc);
+    if !restore_workspace && argc != 3 {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_USAGE_TEXT);
+        return EXIT_USAGE_ERROR;
+    }
+
+    const root: RepoPath = repo_find_root_from_cwd() catch |err| {
+        if @error_id(err) == @error_id(error.RepoNotFound) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_NOT_REPO_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const config: RepoConfig = repo_read_config(&root) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const arena_storage: &byte = malloc(268435456 as usize) as &byte;
+    if arena_storage == null {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    defer {
+        free(arena_storage as &void);
+    }
+    var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
+    arena_init(&arena, arena_storage, 268435456 as usize);
+
+    const current_state: WorkspaceState = checkout_current_state(&arena, &root, &config) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_profile: SparseProfile = checkout_current_sparse_profile(&arena, &root) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const current_local_changes: LocalChangeList = checkout_current_local_changes(&arena, &root) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    var current_inputs: ManifestLeafInputList = ManifestLeafInputList{ ptr: null, len: 0 };
+    if checkout_state_has_base_commit(&current_state) {
+        current_inputs = checkout_manifest_inputs_from_commit(&arena, &store, &current_state.base_commit) catch |err| {
+            if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+    }
+    const current_materialized: ManifestLeafInputList = workspace_local_view_filter_expected_inputs(
+        &arena,
+        &current_inputs,
+        &current_local_changes,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const audit_policy: PathPolicyProfile = audit_policy_profile_default(&arena, &root);
+
+    if restore_workspace {
+        const stage_snapshot: StageSnapshot = checkout_load_stage_snapshot(&root, &arena) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const restore_target_inputs: ManifestLeafInputList = stage_view_manifest_inputs_from_snapshot(
+            &arena,
+            &store,
+            &stage_snapshot,
+            &current_state.base_commit,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const restore_target_materialized: ManifestLeafInputList = workspace_local_view_filter_expected_inputs(
+            &arena,
+            &restore_target_inputs,
+            &current_local_changes,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const restore_changes: LocalChangeList = workspace_reconcile_scan(
+            &arena,
+            repo_path_cstr(&root) as &const byte,
+            &restore_target_materialized,
+            current_state.watcher_seq,
+            current_state.watcher_seq + 1u64,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const restore_plan: CheckoutPlan = checkout_restore_plan_build(
+            &arena,
+            &restore_target_materialized,
+            &restore_changes,
+            &stage_snapshot.entries,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        checkout_apply_plan(&arena, &store, &root, &restore_plan) catch |err| {
+            if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+
+        const final_changes: LocalChangeList = workspace_reconcile_scan(
+            &arena,
+            repo_path_cstr(&root) as &const byte,
+            &current_materialized,
+            current_state.watcher_seq + 1u64,
+            current_state.watcher_seq + 2u64,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        checkout_sync_virtual_state(
+            &arena,
+            &root,
+            &current_state.base_commit,
+            &current_inputs,
+            &current_materialized,
+            &final_changes,
+            &current_state,
+            current_state.watcher_seq + 1u64,
+            current_state.watcher_seq + 2u64,
+        ) catch |err| {
+            if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        var audit_summary: AuditSummary = AuditSummary{
+            policy_id: stage_zero_policy_id(),
+            dedupe_scope: ByteList{ ptr: null, len: 0 as usize },
+            audit_enabled: false,
+            affected_path_count: 0u64,
+            affected_byte_count: 0u64,
+        };
+        if !audit_summary_from_manifest_diff(
+            &arena,
+            &audit_policy,
+            &current_materialized,
+            &restore_target_materialized,
+            &audit_summary,
+        ) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        const has_base_commit: bool = checkout_state_has_base_commit(&current_state);
+        const timestamp_ms: i64 = now_ms() catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        var head_before_hex: [byte: HASH32_HEX_BYTES] = [];
+        var head_after_hex: [byte: HASH32_HEX_BYTES] = [];
+        var head_before_text: ByteList = ByteList{ ptr: null, len: 0 as usize };
+        var head_after_text: ByteList = ByteList{ ptr: null, len: 0 as usize };
+        if !audit_commit_id_text(
+            has_base_commit,
+            &current_state.base_commit,
+            head_before_hex[0: HASH32_HEX_BYTES],
+            &head_before_text,
+        ) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if !audit_commit_id_text(
+            has_base_commit,
+            &current_state.base_commit,
+            head_after_hex[0: HASH32_HEX_BYTES],
+            &head_after_text,
+        ) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        const audit_event: AuditLogEvent = AuditLogEvent{
+            kind: AuditLogEventKind.Checkout,
+            timestamp_ms: timestamp_ms,
+            target: audit_cstr_byte_list("."),
+            head_before: ByteList{ ptr: head_before_text.ptr, len: head_before_text.len },
+            head_after: ByteList{ ptr: head_after_text.ptr, len: head_after_text.len },
+            policy_id: audit_summary.policy_id,
+            dedupe_scope: ByteList{ ptr: audit_summary.dedupe_scope.ptr, len: audit_summary.dedupe_scope.len },
+            audit_enabled: audit_summary.audit_enabled,
+            affected_path_count: audit_summary.affected_path_count,
+            affected_byte_count: audit_summary.affected_byte_count,
+        };
+        if !audit_repo_event_append(&root, &audit_event) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        return EXIT_OK;
+    }
+
+    const target_spec: &byte = get_argv(2);
+    const target_commit: CommitId = checkout_command_resolve_commit_spec(&root, &config, target_spec) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutNoCommits) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_NO_COMMITS_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const target_inputs: ManifestLeafInputList = checkout_manifest_inputs_from_commit(&arena, &store, &target_commit) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const target_materialized: ManifestLeafInputList = workspace_local_view_filter_target_inputs(
+        &arena,
+        &target_inputs,
+        &current_profile,
+        &current_local_changes,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const local_changes: LocalChangeList = workspace_reconcile_scan(
+        &arena,
+        repo_path_cstr(&root) as &const byte,
+        &current_materialized,
+        current_state.watcher_seq,
+        current_state.watcher_seq + 1u64,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const plan: CheckoutPlan = checkout_plan_build(&arena, &current_materialized, &target_materialized, &local_changes) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    if plan.blocked_paths.len > 0 {
+        checkout_sync_virtual_state(
+            &arena,
+            &root,
+            &current_state.base_commit,
+            &current_inputs,
+            &current_materialized,
+            &local_changes,
+            &current_state,
+            current_state.watcher_seq,
+            current_state.watcher_seq + 1u64,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        fprintf(stderr, "%s" as *byte, CHECKOUT_DIRTY_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+
+    checkout_apply_plan(&arena, &store, &root, &plan) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+
+    const final_changes: LocalChangeList = workspace_reconcile_scan(
+        &arena,
+        repo_path_cstr(&root) as &const byte,
+        &target_materialized,
+        current_state.watcher_seq + 1u64,
+        current_state.watcher_seq + 2u64,
+    ) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    checkout_sync_virtual_state(
+        &arena,
+        &root,
+        &target_commit,
+        &target_inputs,
+        &target_materialized,
+        &final_changes,
+        &current_state,
+        current_state.watcher_seq + 1u64,
+        current_state.watcher_seq + 2u64,
+    ) catch |err| {
+        if @error_id(err) == @error_id(error.CheckoutPermissionDenied) {
+            fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    var audit_summary: AuditSummary = AuditSummary{
+        policy_id: stage_zero_policy_id(),
+        dedupe_scope: ByteList{ ptr: null, len: 0 as usize },
+        audit_enabled: false,
+        affected_path_count: 0u64,
+        affected_byte_count: 0u64,
+    };
+    if !audit_summary_from_manifest_diff(
+        &arena,
+        &audit_policy,
+        &current_materialized,
+        &target_materialized,
+        &audit_summary,
+    ) {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    const timestamp_ms: i64 = now_ms() catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    var head_before_hex: [byte: HASH32_HEX_BYTES] = [];
+    var head_after_hex: [byte: HASH32_HEX_BYTES] = [];
+    var head_before_text: ByteList = ByteList{ ptr: null, len: 0 as usize };
+    var head_after_text: ByteList = ByteList{ ptr: null, len: 0 as usize };
+    if !audit_commit_id_text(
+        checkout_state_has_base_commit(&current_state),
+        &current_state.base_commit,
+        head_before_hex[0: HASH32_HEX_BYTES],
+        &head_before_text,
+    ) {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    if !audit_commit_id_text(
+        true,
+        &target_commit,
+        head_after_hex[0: HASH32_HEX_BYTES],
+        &head_after_text,
+    ) {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    const audit_event: AuditLogEvent = AuditLogEvent{
+        kind: AuditLogEventKind.Checkout,
+        timestamp_ms: timestamp_ms,
+        target: audit_cstr_byte_list(target_spec as &const byte),
+        head_before: ByteList{ ptr: head_before_text.ptr, len: head_before_text.len },
+        head_after: ByteList{ ptr: head_after_text.ptr, len: head_after_text.len },
+        policy_id: audit_summary.policy_id,
+        dedupe_scope: ByteList{ ptr: audit_summary.dedupe_scope.ptr, len: audit_summary.dedupe_scope.len },
+        audit_enabled: audit_summary.audit_enabled,
+        affected_path_count: audit_summary.affected_path_count,
+        affected_byte_count: audit_summary.affected_byte_count,
+    };
+    if !audit_repo_event_append(&root, &audit_event) {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    }
+    return EXIT_OK;
+}

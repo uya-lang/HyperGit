@@ -7,7 +7,7 @@ use cli.DispatchPlan;
 use cli.plan_from_first_arg;
 use commands.add.run_add;
 use commands.commit.run_commit;
-use commands.checkout.run_checkout;
+use commands.checkout_command.run_checkout;
 use commands.dehydrate.run_dehydrate;
 use commands.diff.run_diff;
 use commands.fetch.run_fetch;
