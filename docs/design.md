@@ -1189,7 +1189,7 @@ M8 并行化：
 
 M9 Git 互操作：
 
-- Git import/export proof of concept。
+- Git import/export 实验性支持子集。
 - Native object 和 Git object 的映射文档。
 
 ## 21. 关键风险

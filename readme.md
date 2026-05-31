@@ -19,7 +19,7 @@ HyperGit / 极仓是一个用纯 Uya 设计和实现的 Git-like 版本控制系
 
 - 进入 `v1.0.0`：`init`、`status`、`add`、`commit`、`log`、`diff`、`checkout`、`hydrate`、`dehydrate`、`sparse`、`doctor`、`fetch`、`push`。
 - `v1.0.0` 远端只承诺 `file://` remote；HTTP remote 仍是实验 / smoke 范围。
-- 明确延后到 `v1.1+`：`merge` CLI、`branch` CLI、`clone` CLI、HTTP remote 完整协议、Git 互操作正式支持矩阵。
+- 明确延后到 `v1.1+`：`merge` CLI、`branch` CLI、`clone` CLI、HTTP remote 完整协议、Git 互操作正式支持矩阵；仓库内当前只保留实验性的支持子集，见 `docs/git-interop.md`。
 - `policy_id` / `dedupe_scope` / `audit event` 目前仍是实验性默认元数据，不属于 `v1.0.0` 的发布承诺。
 
 当前发布版本：`v0.1.0`（2026-05-31），对应首个 native `hgx` MVP 里程碑。发布说明见 [v0.1.0 里程碑](docs/releases/v0.1.0.md)。

@@ -1,172 +1,89 @@
 # HyperGit Git 互操作补充设计
 
-状态：prototype 补充设计  
-范围：`docs/todo.md` 第 21 阶段
+状态：实验性的支持子集
+发布口径：不进入 `v1.0.0` 承诺矩阵
+实现入口：`src/hypergit/git/interop.uya`
 
-## 1. 目标
+## 1. 定位
 
-本阶段只做 Git 互操作 proof of concept，不追求：
+当前仓库里的 Git 互操作不再按 “prototype / proof of concept” 口径描述，而是收敛成一个明确、可测试、可拒绝越界输入的支持子集。
 
-- 覆盖 packed object、delta、tag、submodule、replace ref。
-- 保持与 Git 完全等价的性能。
-- 处理超大仓库上的全量导入优化。
+这个子集的目标是：
 
-本阶段要验证三件事：
+- 让小型 Git 仓库中的 loose `blob` / `tree` / `commit` 能稳定导入到 HyperGit。
+- 让由 small blob 组成的小型 HyperGit manifest 能稳定导出为 Git tree。
+- 对超出子集的输入给出显式失败，而不是模糊报错或静默降级。
 
-- HyperGit 能从一个小型 Git 仓库导入 blob/tree/commit。
-- HyperGit 能把一个小型 manifest 导回 Git tree。
-- native chunked blob 在导出到 Git 时有明确且稳定的降级规则。
+这个子集刻意不追求：
 
-## 2. 对象映射
+- packed object / delta / tag / replace ref 的完整兼容。
+- submodule 导入。
+- chunked blob 到 Git 的自动内容重组导出。
+- 与 Git 完全等价的对象 ID、性能或大仓库吞吐。
 
-| Git 对象 | HyperGit 原型 | 备注 |
+## 2. 支持矩阵
+
+| 方向 | 输入 | 当前状态 | 限制条件 | 越界后的失败行为 |
+| --- | --- | --- | --- | --- |
+| Git -> HyperGit | loose blob OID | 支持 | 只接受 40 字节十六进制 OID；对象必须是 loose `blob` | packed-only 对象报 `GitInteropUnsupportedPackedObject`；非 `blob` 报 `GitInteropUnsupportedGitObject`；缺失对象报 `GitInteropLooseObjectMissing` |
+| Git -> HyperGit | tree -> manifest | 支持 | 只接受展平后的 `blob` leaf；leaf mode 仅支持 `100644` / `100755` / `120000`；路径进入 `manifest_path_normalize` | submodule / 其他非 `blob` leaf / 非支持 mode 报 `GitInteropUnsupportedTreeEntry`；引用 packed-only blob 报 `GitInteropUnsupportedPackedObject` |
+| Git -> HyperGit | commit -> commit | 支持 | commit 对象必须是 loose `commit`；保留 tree、parents、author、committer、message、author timestamp；额外 headers 忽略 | packed-only commit/tree/blob 报 `GitInteropUnsupportedPackedObject`；非 `commit` 报 `GitInteropUnsupportedGitObject`；结构异常报 `GitInteropTreeParseFailed` |
+| HyperGit -> Git | manifest -> tree | 支持 | manifest entry kind 仅支持 `File` / `Executable` / `Symlink`；entry 对象必须是 `SmallBlobPayload` | `ChunkedBlobPayload` 或其他非 small blob 对象报 `GitInteropUnsupportedHyperObject` |
+
+## 3. 对象映射
+
+| 源对象 | 目标对象 | 当前映射 |
 | --- | --- | --- |
-| loose blob | `SmallBlobPayload` | 原型阶段只支持可完整读入内存的 blob |
-| tree | `ManifestLeafInputList` -> `ManifestId` | tree 递归展平为排序路径列表，再构建 manifest |
-| commit | `CommitPayload` | 只映射第一个 tree、parents、author/committer、message、timestamp |
+| Git loose `blob` | `SmallBlobPayload` | 读取 payload 后重新做 HyperGit canonical codec + domain hash，生成新的 `ObjectId` |
+| Git `tree` | `ManifestId` | 通过 `git ls-tree -rz -r` 展平 leaf，排序路径后构建 manifest root |
+| Git `commit` | `CommitPayload` | 映射 `tree` / `parents` / `author` / `committer` / `message` / author timestamp |
+| HyperGit manifest entry | Git tree leaf | `File -> 100644`，`Executable -> 100755`，`Symlink -> 120000` |
 
-原型阶段不做：
+补充说明：
 
-- annotated tag 导入。
-- Git mode `160000` submodule 导入。
-- packed object 导入。
+- HyperGit 不保留 Git SHA-1 作为权威对象 ID。
+- Git commit 的未知 headers 目前不保留，也不重新导出。
+- generation 由 HyperGit 侧按 parent generation 重新计算。
 
-## 3. 导入原型
+## 4. 当前限制
 
-### 3.1 loose blob
+- 只支持 loose object。实现会先检查 `.git/objects/aa/bbbbb...`，不会自动回退到 pack。
+- tree 导入只接受最终 leaf 为 `blob` 的路径；`160000` submodule、tag 指向、replace ref 都不在子集内。
+- export 只支持 small blob。HyperGit 原生 `ChunkedBlobPayload` 还没有接入 chunk store 重组导出路径。
+- 当前实现通过 `git cat-file`、`git ls-tree`、`git update-index`、`git write-tree` 驱动，不是面向超大仓库优化过的批量通路。
+- 该模块仍是仓库内实验能力，不暴露为 `v1.0.0` CLI 对外承诺。
 
-输入：
+## 5. 失败行为
 
-- Git 仓库根目录。
-- 40 字节十六进制 SHA-1。
+| 错误 | 触发条件 |
+| --- | --- |
+| `GitInteropInvalidOid` | 输入 OID 不是 40 字节十六进制 |
+| `GitInteropLooseObjectMissing` | Git 仓库内不存在该对象 |
+| `GitInteropUnsupportedPackedObject` | 对象存在，但只存在于 pack 中，不满足 loose-only 子集 |
+| `GitInteropUnsupportedGitObject` | 当前操作拿到的 Git 对象类型不对，例如用 `blob` API 读取 `commit` / `tag` |
+| `GitInteropUnsupportedTreeEntry` | tree 中出现 submodule、非 `blob` leaf 或非支持 mode |
+| `GitInteropUnsupportedHyperObject` | export 命中 `ChunkedBlobPayload` 或其他非 small blob 对象 |
+| `GitInteropTreeParseFailed` | commit / tree 元数据结构不符合当前解析假设 |
+| `GitInteropGitCommandFailed` | 依赖的 `git` 子命令执行失败 |
+| `GitInteropReadFailed` | 中间文件读写失败或对象 payload 无法完整读取 |
 
-原型读取路径：
+这些错误的要求是：
 
-- `.git/objects/aa/bbbbb...`
+- 超出支持子集时优先返回显式 `GitInteropUnsupported*` 错误。
+- 不把越界输入伪装成“空结果”或“尽量继续”。
+- 不静默把 chunked blob 当成 small blob 导出。
 
-读取步骤：
+## 6. 测试覆盖
 
-1. 定位 loose object 文件。
-2. 解压缩得到 `"<type> <size>\\0<payload>"`。
-3. 要求 `type == "blob"`。
-4. 取 payload，转成 HyperGit `SmallBlobPayload`。
-5. 用 HyperGit 的 canonical codec + domain hash 重新计算 `ObjectId` 并写入 HyperGit store。
+当前支持子集由 `src/hypergit/test_git_interop.uya` 锁定，至少覆盖：
 
-### 3.2 tree -> manifest
+- loose blob 读取与导入。
+- packed-only blob 显式拒绝。
+- tree -> manifest 正常导入。
+- submodule tree entry 显式拒绝。
+- commit 历史导入。
+- manifest -> Git tree 正常导出。
+- chunked blob export 显式拒绝。
+- 小仓库端到端 import。
 
-输入：
-
-- Git tree OID。
-
-原型行为：
-
-1. 递归展开 tree。
-2. 只接受 mode：
-   - `100644`
-   - `100755`
-   - `120000`
-   - `040000`
-3. 对 blob entry：
-   - 读取对应 Git blob。
-   - 导入为 HyperGit small blob。
-4. 对 tree entry：
-   - 递归展开并拼接路径。
-5. 所有路径进入 `manifest_path_normalize`。
-6. `policy_id` 使用统一 placeholder。
-7. 最终用 `manifest_root_build_and_store` 构建 `ManifestId`。
-
-### 3.3 commit -> HyperGit commit
-
-输入：
-
-- Git commit OID。
-
-原型映射：
-
-- `tree` -> `manifest_root`
-- `parent*` -> `parents`
-- `author` -> `author`
-- `committer` -> `committer`
-- commit message -> `message`
-- author timestamp seconds -> `timestamp_ms`
-
-原型约束：
-
-- 不保留 Git SHA-1 作为 HyperGit 权威 ID。
-- Git commit 的额外 headers 先忽略。
-- generation 按 parent generation 重新计算。
-
-## 4. 导出原型
-
-### 4.1 manifest -> Git tree
-
-输入：
-
-- HyperGit `ManifestId`
-
-原型行为：
-
-1. flatten manifest。
-2. 对每个 entry 读取 HyperGit blob 内容。
-3. 生成 Git blob。
-4. 按路径递归重建 Git tree。
-5. 输出 Git tree OID。
-
-原型约束：
-
-- `EntryKind.File` -> mode `100644`
-- `EntryKind.Executable` -> mode `100755`
-- `EntryKind.Symlink` -> mode `120000`
-
-### 4.2 HyperGit commit -> Git commit
-
-原型阶段只要求：
-
-- tree 正确。
-- parent 列表正确。
-- author/committer/message 可读。
-
-不要求：
-
-- 和原 Git commit SHA-1 完全一致。
-- 保留未知 headers。
-
-## 5. chunked blob Git 降级策略
-
-Git 原生没有 chunked blob 概念，原型阶段采用“内容优先”的降级规则：
-
-1. `ChunkedBlobPayload` 导出到 Git 时，先按 chunk 顺序重建完整字节流。
-2. Git 侧一律导出为普通 blob，不保留 chunk 边界。
-3. HyperGit 专属元数据不写入 Git tree mode，也不写入 Git blob header。
-4. 如需追踪降级来源，原型阶段只在补充文档中声明，不额外写 note/ref。
-
-这样做的取舍：
-
-- 优点：Git 仓库能直接读取，互操作最稳。
-- 缺点：丢失 chunk 边界、去重范围、storage tier、encryption profile 等 HyperGit 原生语义。
-
-后续增强方向：
-
-- Git note 记录 HyperGit 源对象 ID。
-- sidecar manifest 保存 chunk layout。
-- 针对大对象导出 LFS-compatible gateway。
-
-## 6. 测试策略
-
-原型阶段最小测试矩阵：
-
-- 小仓库 Git import：1 个 text blob、1 个 executable、1 层子目录、2 个 commit。
-- 导出后 Git 能读取：`git ls-tree`、`git cat-file -p`、`git checkout`。
-- chunked blob 降级：验证导出后 blob 内容与重组字节流一致。
-
-## 7. 非目标提醒
-
-如果后续发现实现依赖：
-
-- packed object
-- delta base 解析
-- reflog
-- note
-- filter driver
-
-应单独开新 TODO，不在本 prototype 阶段偷偷扩 scope。
+后续如果要扩这个子集，应新增测试后再放宽矩阵，不能只改文档口径。

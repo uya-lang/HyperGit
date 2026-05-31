@@ -24,6 +24,7 @@ use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
 use manifest.trie.manifest_leaf_input_list_from_slice;
 use object.commit_build.commit_object_build_and_store;
+use object.codec.decode_object_kind;
 use object.codec.decode_small_blob_object;
 use object.codec.small_blob_payload_to_canonical;
 use object.small_blob.small_blob_payload_from_bytes;
@@ -48,17 +49,20 @@ const GIT_INTEROP_TMPNAME_BYTES: usize = 64 as usize;
 error GitInteropAlloc;
 error GitInteropInvalidOid;
 error GitInteropLooseObjectMissing;
+error GitInteropUnsupportedPackedObject;
 error GitInteropGitCommandFailed;
-error GitInteropUnsupportedObjectType;
+error GitInteropUnsupportedGitObject;
+error GitInteropUnsupportedTreeEntry;
+error GitInteropUnsupportedHyperObject;
 error GitInteropReadFailed;
 error GitInteropTreeParseFailed;
 
-export struct GitLooseBlobPrototype {
+export struct GitLooseBlob {
     oid_hex: ByteList,
     content: ByteList
 }
 
-export struct GitTreeEntryPrototype {
+export struct GitTreeEntry {
     path: ByteList,
     kind: EntryKind,
     file_mode: u32,
@@ -67,33 +71,33 @@ export struct GitTreeEntryPrototype {
     logical_size: u64
 }
 
-export struct GitTreeEntryPrototypeList {
-    ptr: &GitTreeEntryPrototype,
+export struct GitTreeEntryList {
+    ptr: &GitTreeEntry,
     len: usize
 }
 
-export struct GitCommitParentListPrototype {
+export struct GitCommitParentList {
     ptr: &ByteList,
     len: usize
 }
 
-export struct GitCommitPrototype {
+export struct GitCommit {
     oid_hex: ByteList,
     tree_hex: ByteList,
-    parents: GitCommitParentListPrototype,
+    parents: GitCommitParentList,
     author: Identity,
     committer: Identity,
     message: ByteList,
     timestamp_ms: i64
 }
 
-export struct GitCommitImportPrototype {
+export struct GitCommitImport {
     commit_id: CommitId,
     manifest_root: ManifestId,
     generation: u64
 }
 
-export struct GitTreeExportPrototype {
+export struct GitTreeExport {
     tree_hex: ByteList,
     entry_count: usize
 }
@@ -168,6 +172,38 @@ fn git_interop_loose_object_path(git_dir: &[byte], oid_hex: &[byte]) !GitInterop
     try git_interop_path_append_bytes(&out, &"/"[0: 1]);
     try git_interop_path_append_bytes(&out, oid_hex[2: oid_hex.len - 2 as usize]);
     return out;
+}
+
+fn git_interop_object_exists(git_dir: &[byte], oid_hex: &[byte]) bool {
+    var cmd: GitInteropPath = git_interop_path_empty();
+    git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("git --git-dir='")) catch {
+        return false;
+    };
+    git_interop_path_append_bytes(&cmd, git_dir) catch {
+        return false;
+    };
+    git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("' cat-file -e '")) catch {
+        return false;
+    };
+    git_interop_path_append_bytes(&cmd, oid_hex) catch {
+        return false;
+    };
+    git_interop_path_append_bytes(&cmd, git_interop_literal_bytes("^{object}' >/dev/null 2>&1")) catch {
+        return false;
+    };
+    return system(git_interop_path_cstr(&cmd) as &const byte) == 0;
+}
+
+fn git_interop_require_loose_object(git_dir: &[byte], oid_hex: &[byte]) !void {
+    const loose_path: GitInteropPath = try git_interop_loose_object_path(git_dir, oid_hex);
+    var st: Stat = Stat{};
+    if stat(git_interop_path_cstr(&loose_path) as &const byte, &st) == 0 {
+        return;
+    }
+    if git_interop_object_exists(git_dir, oid_hex) {
+        return error.GitInteropUnsupportedPackedObject;
+    }
+    return error.GitInteropLooseObjectMissing;
 }
 
 fn git_interop_arena_bytes(arena: &Arena, len: usize) !&[byte] {
@@ -394,7 +430,7 @@ fn git_interop_mode_to_entry(mode: &[byte], kind: &EntryKind, file_mode: &u32) !
         *file_mode = 0o120000u32;
         return;
     }
-    return error.GitInteropUnsupportedObjectType;
+    return error.GitInteropUnsupportedTreeEntry;
 }
 
 fn git_interop_entry_kind_to_git_mode(kind: EntryKind) &const byte {
@@ -491,13 +527,8 @@ fn git_interop_empty_module_bitmap() ModuleBitmap {
 }
 
 
-export fn git_read_loose_blob_prototype(arena: &Arena, git_dir: &[byte], oid_hex: &[byte]) !GitLooseBlobPrototype {
-    const loose_path: GitInteropPath = try git_interop_loose_object_path(git_dir, oid_hex);
-    var st: Stat = Stat{};
-    if stat(git_interop_path_cstr(&loose_path) as &const byte, &st) != 0 {
-        return error.GitInteropLooseObjectMissing;
-    }
-
+export fn git_read_loose_blob(arena: &Arena, git_dir: &[byte], oid_hex: &[byte]) !GitLooseBlob {
+    try git_interop_require_loose_object(git_dir, oid_hex);
     const type_path: GitInteropPath = try git_interop_tmp_path();
     const data_path: GitInteropPath = try git_interop_tmp_path();
     defer {
@@ -511,12 +542,12 @@ export fn git_read_loose_blob_prototype(arena: &Arena, git_dir: &[byte], oid_hex
     const type_bytes: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&type_path) as &const byte);
     const blob_prefix: &[byte] = &"blob"[0: 4];
     if type_bytes.len < 4 as usize {
-        return error.GitInteropUnsupportedObjectType;
+        return error.GitInteropUnsupportedGitObject;
     }
     var i: usize = 0 as usize;
     while i < 4 as usize {
         if type_bytes.ptr[i] != blob_prefix.ptr[i] {
-            return error.GitInteropUnsupportedObjectType;
+            return error.GitInteropUnsupportedGitObject;
         }
         i = i + 1 as usize;
     }
@@ -528,20 +559,20 @@ export fn git_read_loose_blob_prototype(arena: &Arena, git_dir: &[byte], oid_hex
         i = i + 1 as usize;
     }
     const content: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&data_path) as &const byte);
-    return GitLooseBlobPrototype{
+    return GitLooseBlob{
         oid_hex: ByteList{ ptr: oid_copy.ptr, len: oid_copy.len },
         content: ByteList{ ptr: content.ptr, len: content.len },
     };
 }
 
-export fn git_import_loose_blob_as_small_blob_prototype(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], oid_hex: &[byte]) !ObjectId {
-    const blob: GitLooseBlobPrototype = try git_read_loose_blob_prototype(arena, git_dir, oid_hex);
+export fn git_import_loose_blob_as_small_blob(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], oid_hex: &[byte]) !ObjectId {
+    const blob: GitLooseBlob = try git_read_loose_blob(arena, git_dir, oid_hex);
     const payload: SmallBlobPayload = try small_blob_payload_from_bytes(arena, blob.content.ptr[0: blob.content.len]);
     const encoded: ByteList = try small_blob_payload_to_canonical(arena, &payload);
     return try store.put(ObjectKind.SmallBlob, encoded.ptr[0: encoded.len]);
 }
 
-export fn git_tree_to_manifest_entries_prototype(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], tree_hex: &[byte]) !GitTreeEntryPrototypeList {
+export fn git_tree_to_manifest_entries(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], tree_hex: &[byte]) !GitTreeEntryList {
     try git_interop_validate_oid_hex(tree_hex);
     const list_path: GitInteropPath = try git_interop_tmp_path();
     defer {
@@ -551,9 +582,9 @@ export fn git_tree_to_manifest_entries_prototype(arena: &Arena, store: &LooseObj
     const raw: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&list_path) as &const byte);
     const count: usize = git_interop_count_tree_entries(raw.ptr[0: raw.len]);
     if count == 0 as usize {
-        return GitTreeEntryPrototypeList{ ptr: null, len: 0 };
+        return GitTreeEntryList{ ptr: null, len: 0 };
     }
-    const entries: &GitTreeEntryPrototype = arena_alloc(arena, @size_of(GitTreeEntryPrototype) as usize * count) as &GitTreeEntryPrototype;
+    const entries: &GitTreeEntry = arena_alloc(arena, @size_of(GitTreeEntry) as usize * count) as &GitTreeEntry;
     if entries == null {
         return error.GitInteropAlloc;
     }
@@ -586,7 +617,7 @@ export fn git_tree_to_manifest_entries_prototype(arena: &Arena, store: &LooseObj
         }
         const type_name: &[byte] = entry.ptr[type_start: type_end - type_start];
         if !git_interop_slice_eq_literal(type_name, "blob") {
-            return error.GitInteropUnsupportedObjectType;
+            return error.GitInteropUnsupportedTreeEntry;
         }
         const oid_start: usize = type_end + 1 as usize;
         if oid_start + GIT_INTEROP_OID_HEX_BYTES >= entry.len {
@@ -598,25 +629,25 @@ export fn git_tree_to_manifest_entries_prototype(arena: &Arena, store: &LooseObj
             return error.GitInteropTreeParseFailed;
         }
         const normalized_path: ByteList = try manifest_path_normalize(arena, entry.ptr[path_start: entry.len - path_start]);
-        const blob: GitLooseBlobPrototype = try git_read_loose_blob_prototype(arena, git_dir, oid_hex);
+        const blob: GitLooseBlob = try git_read_loose_blob(arena, git_dir, oid_hex);
         var entry_kind: EntryKind = EntryKind.File;
         var file_mode: u32 = 0u32;
         try git_interop_mode_to_entry(mode, &entry_kind, &file_mode);
-        entries[out_index] = GitTreeEntryPrototype{
+        entries[out_index] = GitTreeEntry{
             path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
             kind: entry_kind,
             file_mode: file_mode,
             content_type: git_interop_tree_content_type(blob.content.ptr[0: blob.content.len]),
-            object_id: try git_import_loose_blob_as_small_blob_prototype(arena, store, git_dir, oid_hex),
+            object_id: try git_import_loose_blob_as_small_blob(arena, store, git_dir, oid_hex),
             logical_size: blob.content.len as u64,
         };
         out_index = out_index + 1 as usize;
     }
-    return GitTreeEntryPrototypeList{ ptr: entries, len: out_index };
+    return GitTreeEntryList{ ptr: entries, len: out_index };
 }
 
-export fn git_tree_to_manifest_prototype(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], tree_hex: &[byte]) !ManifestId {
-    const entries: GitTreeEntryPrototypeList = try git_tree_to_manifest_entries_prototype(arena, store, git_dir, tree_hex);
+export fn git_tree_to_manifest(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], tree_hex: &[byte]) !ManifestId {
+    const entries: GitTreeEntryList = try git_tree_to_manifest_entries(arena, store, git_dir, tree_hex);
     if entries.len == 0 as usize {
         const empty: ManifestLeafInputList = ManifestLeafInputList{ ptr: null, len: 0 };
         return try manifest_root_build_and_store(arena, store, empty);
@@ -642,13 +673,8 @@ export fn git_tree_to_manifest_prototype(arena: &Arena, store: &LooseObjectStore
     return try manifest_root_build_and_store(arena, store, manifest_leaf_input_list_from_slice(manifest_inputs[0: entries.len]));
 }
 
-export fn git_read_commit_prototype(arena: &Arena, git_dir: &[byte], commit_hex: &[byte]) !GitCommitPrototype {
-    const loose_path: GitInteropPath = try git_interop_loose_object_path(git_dir, commit_hex);
-    var st: Stat = Stat{};
-    if stat(git_interop_path_cstr(&loose_path) as &const byte, &st) != 0 {
-        return error.GitInteropLooseObjectMissing;
-    }
-
+export fn git_read_commit(arena: &Arena, git_dir: &[byte], commit_hex: &[byte]) !GitCommit {
+    try git_interop_require_loose_object(git_dir, commit_hex);
     const type_path: GitInteropPath = try git_interop_tmp_path();
     const data_path: GitInteropPath = try git_interop_tmp_path();
     defer {
@@ -661,7 +687,7 @@ export fn git_read_commit_prototype(arena: &Arena, git_dir: &[byte], commit_hex:
 
     const type_bytes: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&type_path) as &const byte);
     if type_bytes.len < 6 as usize || !git_interop_slice_eq_literal(type_bytes.ptr[0: 6], "commit") {
-        return error.GitInteropUnsupportedObjectType;
+        return error.GitInteropUnsupportedGitObject;
     }
 
     const raw: ByteList = try git_interop_read_file(arena, git_interop_path_cstr(&data_path) as &const byte);
@@ -723,10 +749,10 @@ export fn git_read_commit_prototype(arena: &Arena, git_dir: &[byte], commit_hex:
         return error.GitInteropTreeParseFailed;
     }
     const message: ByteList = try git_interop_copy_bytes(arena, raw.ptr[message_start: raw.len - message_start]);
-    return GitCommitPrototype{
+    return GitCommit{
         oid_hex: oid_copy,
         tree_hex: tree_hex,
-        parents: GitCommitParentListPrototype{ ptr: parents, len: parent_index },
+        parents: GitCommitParentList{ ptr: parents, len: parent_index },
         author: author,
         committer: committer,
         message: message,
@@ -734,8 +760,8 @@ export fn git_read_commit_prototype(arena: &Arena, git_dir: &[byte], commit_hex:
     };
 }
 
-export fn git_import_commit_prototype(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], commit_hex: &[byte]) !GitCommitImportPrototype {
-    const commit: GitCommitPrototype = try git_read_commit_prototype(arena, git_dir, commit_hex);
+export fn git_import_commit(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], commit_hex: &[byte]) !GitCommitImport {
+    const commit: GitCommit = try git_read_commit(arena, git_dir, commit_hex);
     var parent_ids: &CommitId = null;
     if commit.parents.len > 0 as usize {
         parent_ids = arena_alloc(arena, @size_of(CommitId) as usize * commit.parents.len) as &CommitId;
@@ -753,7 +779,7 @@ export fn git_import_commit_prototype(arena: &Arena, store: &LooseObjectStore, g
             return error.GitInteropTreeParseFailed;
         }
         while i < commit.parents.len {
-            const parent_import: GitCommitImportPrototype = try git_import_commit_prototype(arena, store, git_dir, git_parent_ptr[i].ptr[0: git_parent_ptr[i].len]);
+            const parent_import: GitCommitImport = try git_import_commit(arena, store, git_dir, git_parent_ptr[i].ptr[0: git_parent_ptr[i].len]);
             parent_id_ptr[i] = parent_import.commit_id;
             if parent_import.generation > max_parent_generation {
                 max_parent_generation = parent_import.generation;
@@ -762,7 +788,7 @@ export fn git_import_commit_prototype(arena: &Arena, store: &LooseObjectStore, g
         }
     }
 
-    const manifest_root: ManifestId = try git_tree_to_manifest_prototype(arena, store, git_dir, commit.tree_hex.ptr[0: commit.tree_hex.len]);
+    const manifest_root: ManifestId = try git_tree_to_manifest(arena, store, git_dir, commit.tree_hex.ptr[0: commit.tree_hex.len]);
     var parents: CommitIdList = CommitIdList{ ptr: null, len: 0 };
     if commit.parents.len > 0 as usize {
         const parent_id_ptr: &CommitId = parent_ids;
@@ -783,20 +809,25 @@ export fn git_import_commit_prototype(arena: &Arena, store: &LooseObjectStore, g
         generation: max_parent_generation + 1u64,
     };
     const commit_id: CommitId = try commit_object_build_and_store(arena, store, &payload);
-    return GitCommitImportPrototype{
+    return GitCommitImport{
         commit_id: commit_id,
         manifest_root: manifest_root,
         generation: payload.generation,
     };
 }
 
-export fn git_commit_to_hypergit_commit_prototype(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], commit_hex: &[byte]) !CommitId {
-    const imported: GitCommitImportPrototype = try git_import_commit_prototype(arena, store, git_dir, commit_hex);
+export fn git_commit_to_hypergit_commit(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], commit_hex: &[byte]) !CommitId {
+    const imported: GitCommitImport = try git_import_commit(arena, store, git_dir, commit_hex);
     return imported.commit_id;
 }
 
 fn git_interop_load_small_blob_payload(arena: &Arena, store: &LooseObjectStore, object_id: ObjectId) !SmallBlobPayload {
     const object_bytes: ObjectBytes = try store.get(object_id, arena);
+    var kind_offset: usize = 0 as usize;
+    const kind: ObjectKind = try decode_object_kind(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &kind_offset);
+    if kind != ObjectKind.SmallBlob {
+        return error.GitInteropUnsupportedHyperObject;
+    }
     var offset: usize = 0 as usize;
     const payload: SmallBlobPayload = try decode_small_blob_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
     if offset != object_bytes.bytes.len {
@@ -805,7 +836,7 @@ fn git_interop_load_small_blob_payload(arena: &Arena, store: &LooseObjectStore, 
     return payload;
 }
 
-export fn hypergit_manifest_to_git_tree_prototype(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], manifest_id: &ManifestId) !GitTreeExportPrototype {
+export fn hypergit_manifest_to_git_tree(arena: &Arena, store: &LooseObjectStore, git_dir: &[byte], manifest_id: &ManifestId) !GitTreeExport {
     const entries: ManifestLeafInputList = try manifest_load_flatten(arena, store, manifest_id);
     try git_interop_command_read_tree_empty(git_dir);
 
@@ -842,7 +873,7 @@ export fn hypergit_manifest_to_git_tree_prototype(arena: &Arena, store: &LooseOb
         return error.GitInteropTreeParseFailed;
     }
     const tree_hex: ByteList = try git_interop_copy_bytes(arena, tree_hex_slice);
-    return GitTreeExportPrototype{
+    return GitTreeExport{
         tree_hex: tree_hex,
         entry_count: entries.len,
     };
