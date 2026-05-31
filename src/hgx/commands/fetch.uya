@@ -7,7 +7,10 @@ use std.time.now_ms;
 use libc.free;
 use libc.fprintf;
 use libc.malloc;
+use libc.errno;
 use libc.stderr;
+use libc.unlink;
+use libc.ENOENT;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
 use cli.EXIT_USAGE_ERROR;
@@ -56,6 +59,7 @@ use store.head_ref.repo_read_head_commit;
 use store.head_ref.repo_write_head_commit;
 use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_object_path;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
@@ -92,6 +96,12 @@ error FetchRemoteEmpty;
 error FetchDiverged;
 error FetchStagedChanges;
 error FetchDirtyWorkspace;
+
+struct FetchLocalObjectLoadResult {
+    available: bool,
+    needs_replace: bool,
+    bytes: ObjectBytes
+}
 
 export const FETCH_USAGE_TEXT: &const byte = "error: fetch requires <file-remote>\n";
 export const FETCH_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
@@ -153,6 +163,59 @@ fn fetch_store_view(arena: &Arena, store: &LooseObjectStore, view: &PublishedVie
     return view_id;
 }
 
+fn fetch_try_load_local_object(
+    arena: &Arena,
+    local_store: &LooseObjectStore,
+    object_id: &ObjectId,
+) !FetchLocalObjectLoadResult {
+    const has_local: bool = local_store.has(object_id[0]) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.FetchFailure;
+    };
+    if !has_local {
+        return FetchLocalObjectLoadResult{
+            available: false,
+            needs_replace: false,
+            bytes: ObjectBytes{ bytes: ByteList{ ptr: null, len: 0 } },
+        };
+    }
+
+    const object_bytes: ObjectBytes = local_store.get(object_id[0], arena) catch |err| {
+        if @error_id(err) == @error_id(error.StorePermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        if @error_id(err) == @error_id(error.StoreNotFound) ||
+            @error_id(err) == @error_id(error.StoreOpenFailed) ||
+            @error_id(err) == @error_id(error.StoreReadFailed) ||
+            @error_id(err) == @error_id(error.StoreCorruptObject) ||
+            @error_id(err) == @error_id(error.StoreHashMismatch) {
+            return FetchLocalObjectLoadResult{
+                available: false,
+                needs_replace: true,
+                bytes: ObjectBytes{ bytes: ByteList{ ptr: null, len: 0 } },
+            };
+        }
+        return error.FetchFailure;
+    };
+    return FetchLocalObjectLoadResult{
+        available: true,
+        needs_replace: false,
+        bytes: object_bytes,
+    };
+}
+
+fn fetch_remove_local_object(local_store: &LooseObjectStore, object_id: &ObjectId) !void {
+    var path_buf: [byte: 4096] = [];
+    _ = loose_store_object_path(local_store, object_id, path_buf[0: 4096]) catch {
+        return error.FetchFailure;
+    };
+    if unlink(&path_buf[0] as &const byte) != 0 && errno != ENOENT {
+        return error.FetchFailure;
+    }
+}
+
 fn fetch_copy_chunk(
     arena: &Arena,
     remote_chunk_store: &ChunkStore,
@@ -196,22 +259,17 @@ export fn fetch_copy_object_graph(
     local_chunk_store: &ChunkStore,
     object_id: &ObjectId,
 ) !void {
-    const has_local: bool = local_store.has(object_id[0]) catch |err| {
-        if @error_id(err) == @error_id(error.StorePermissionDenied) {
-            return error.RepoPermissionDenied;
-        }
-        return error.FetchFailure;
-    };
-    if has_local {
-        return;
+    const local_result: FetchLocalObjectLoadResult = try fetch_try_load_local_object(arena, local_store, object_id);
+    var object_bytes: ObjectBytes = local_result.bytes;
+    if !local_result.available {
+        object_bytes = remote_store.get(object_id[0], arena) catch |err| {
+            if @error_id(err) == @error_id(error.StorePermissionDenied) {
+                return error.RepoPermissionDenied;
+            }
+            return error.FetchFailure;
+        };
     }
 
-    const object_bytes: ObjectBytes = remote_store.get(object_id[0], arena) catch |err| {
-        if @error_id(err) == @error_id(error.StorePermissionDenied) {
-            return error.RepoPermissionDenied;
-        }
-        return error.FetchFailure;
-    };
     var offset: usize = 0;
     const decoded: DecodedObject = codec_decode_object(object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset) catch {
         return error.FetchFailure;
@@ -222,14 +280,19 @@ export fn fetch_copy_object_graph(
     const kind: ObjectKind = object_kind_from_u16(decoded.envelope.kind) catch {
         return error.FetchFailure;
     };
-    const stored_id: ObjectId = local_store.put(kind, decoded.payload.ptr[0: decoded.payload.len]) catch |err| {
-        if @error_id(err) == @error_id(error.StorePermissionDenied) {
-            return error.RepoPermissionDenied;
+    if !local_result.available {
+        if local_result.needs_replace {
+            try fetch_remove_local_object(local_store, object_id);
         }
-        return error.FetchFailure;
-    };
-    if object_id_compare(&stored_id, object_id) != 0 {
-        return error.FetchFailure;
+        const stored_id: ObjectId = local_store.put(kind, decoded.payload.ptr[0: decoded.payload.len]) catch |err| {
+            if @error_id(err) == @error_id(error.StorePermissionDenied) {
+                return error.RepoPermissionDenied;
+            }
+            return error.FetchFailure;
+        };
+        if object_id_compare(&stored_id, object_id) != 0 {
+            return error.FetchFailure;
+        }
     }
 
     if kind == ObjectKind.Commit {

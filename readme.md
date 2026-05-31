@@ -13,7 +13,14 @@ HyperGit / 极仓是一个用纯 Uya 设计和实现的 Git-like 版本控制系
 
 ## 当前状态
 
-项目目前有一个可运行的 native `hgx` MVP，已覆盖本地仓库初始化、工作区扫描、stage、commit、log、diff、checkout、hydrate/dehydrate、sparse profile，以及 file remote push/fetch 的早期路径。
+项目目前有一个可运行的 native `hgx` MVP，已覆盖本地仓库初始化、工作区扫描、stage、commit、log、diff、checkout、hydrate/dehydrate、sparse profile，以及 file remote push/fetch 的主路径。
+
+`v1.0.0` 范围冻结如下：
+
+- 进入 `v1.0.0`：`init`、`status`、`add`、`commit`、`log`、`diff`、`checkout`、`hydrate`、`dehydrate`、`sparse`、`doctor`、`fetch`、`push`。
+- `v1.0.0` 远端只承诺 `file://` remote；HTTP remote 仍是实验 / smoke 范围。
+- 明确延后到 `v1.1+`：`merge` CLI、`branch` CLI、`clone` CLI、HTTP remote 完整协议、Git 互操作正式支持矩阵。
+- `policy_id` / `dedupe_scope` / `audit event` 目前仍是实验性占位元数据，不属于 `v1.0.0` 的发布承诺。
 
 当前发布版本：`v0.1.0`（2026-05-31），对应首个 native `hgx` MVP 里程碑。发布说明见 [v0.1.0 里程碑](docs/releases/v0.1.0.md)。
 
@@ -24,6 +31,7 @@ HyperGit / 极仓是一个用纯 Uya 设计和实现的 Git-like 版本控制系
 - [命名说明](docs/naming.md)
 - [基准记录](docs/benchmarks.md)
 - [v0.1.0 里程碑说明](docs/releases/v0.1.0.md)
+- [`v1.0.0` 范围冻结](docs/releases/v1.0.0-scope.md)
 
 ## 构建
 

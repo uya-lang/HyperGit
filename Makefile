@@ -1,9 +1,9 @@
-UYA ?= $(if $(wildcard $(HOME)/xyglasses/uya/bin/uya),$(HOME)/xyglasses/uya/bin/uya,$(HOME)/uya/uya/bin/uya)
+UYA ?= $(if $(wildcard $(HOME)/uya/uya/bin/uya),$(HOME)/uya/uya/bin/uya,$(HOME)/xyglasses/uya/bin/uya)
 SRC := src/hgx/main.uya
 BIN := bin/hgx
 C99 := build/hgx.c
 
-.PHONY: check build c99 test clean
+.PHONY: check build c99 test experimental-test clean
 
 check:
 	$(UYA) check $(SRC)
@@ -39,8 +39,6 @@ test:
 	$(UYA) test src/hypergit/test_protocol_push.uya
 	$(UYA) test src/hypergit/test_protocol_ref_cas.uya
 	$(UYA) test src/hypergit/test_protocol_published_view.uya
-	$(UYA) test src/hypergit/test_protocol_http_remote.uya
-	chmod +x tests/test_http_remote_smoke.sh
 	$(UYA) test src/hypergit/test_merge_planner.uya
 	$(UYA) test src/hypergit/test_merge_text_merge.uya
 	$(UYA) test src/hypergit/test_merge_result_manifest.uya
@@ -94,7 +92,9 @@ test:
 	./tests/test_add_stale_stage_lock.sh
 	./tests/test_add_symlink.sh
 	./tests/test_commit_first.sh
+	./tests/test_commit_staged_delete.sh
 	./tests/test_commit_large_staged.sh
+	./tests/test_commit_diverged_stage.sh
 	./tests/test_commit_second_parent.sh
 	./tests/test_log_first.sh
 	./tests/test_diff_add.sh
@@ -115,15 +115,22 @@ test:
 	./tests/test_hydrate_restore.sh
 	./tests/test_repo_init.sh
 	./tests/test_file_remote_clone.sh
+	./tests/test_file_remote_fetch_push_happy_path.sh
 	./tests/test_push_cas_failure.sh
+	./tests/test_fetch_corrupt_object_recovery.sh
 	./tests/test_fetch_sparse_profile.sh
-	./tests/test_http_remote_smoke.sh
+	./tests/test_doctor_diagnostics.sh
 	./tests/test_status_empty.sh
 	./tests/test_status_clean.sh
 	./tests/test_status_large_staged.sh
 	./tests/test_status_reserved_name_error.sh
 	./tests/test_status_split.sh
 	./tests/test_loose_store_concurrent.sh
+
+experimental-test:
+	$(UYA) test src/hypergit/test_protocol_http_remote.uya
+	chmod +x tests/test_http_remote_smoke.sh
+	./tests/test_http_remote_smoke.sh
 
 clean:
 	rm -f $(BIN) $(C99)

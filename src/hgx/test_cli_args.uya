@@ -8,7 +8,6 @@ use std.string.strcmp;
 
 use cli.DispatchAction;
 use cli.DispatchPlan;
-use cli.EXIT_NOT_IMPLEMENTED;
 use cli.EXIT_OK;
 use cli.EXIT_USAGE_ERROR;
 use cli.plan_from_first_arg;
@@ -32,10 +31,10 @@ fn test_version_flag() !void {
     try assert_eq_i32(plan.exit_code, EXIT_OK);
 }
 
-fn test_doctor_placeholder() !void {
+fn test_doctor_command() !void {
     const plan: DispatchPlan = plan_from_first_arg(2, "doctor");
     try expect(plan.action == DispatchAction.Doctor);
-    try assert_eq_i32(plan.exit_code, EXIT_NOT_IMPLEMENTED);
+    try assert_eq_i32(plan.exit_code, EXIT_OK);
 }
 
 fn test_status_command() !void {
@@ -122,7 +121,7 @@ export fn main() i32 {
     run_test("default help", test_default_help);
     run_test("help flag", test_help_flag);
     run_test("version flag", test_version_flag);
-    run_test("doctor placeholder", test_doctor_placeholder);
+    run_test("doctor command", test_doctor_command);
     run_test("status command", test_status_command);
     run_test("fetch command", test_fetch_command);
     run_test("push command", test_push_command);

@@ -1073,6 +1073,13 @@ hgx push <remote> <ref>
 hgx doctor
 ```
 
+`v1.0.0` 支持面冻结：
+
+- 进入 `v1.0.0`：`init`、`status`、`add`、`commit`、`log`、`diff`、`checkout`、`hydrate`、`dehydrate`、`sparse add/remove`、`doctor`、`fetch`、`push`。
+- 远端主路径：只承诺 `file://` remote 的 `fetch` / `push`。
+- 明确延后：`merge` CLI、`branch` CLI、`clone` CLI、HTTP remote 正式支持、Git 互操作正式兼容矩阵。
+- 实验特性：`policy_id` / `dedupe_scope` / `audit event` 目前只保留占位元数据，不作为 `v1.0.0` 发布级能力承诺。
+
 体验原则：
 
 - 常用命令与 Git 心智接近。

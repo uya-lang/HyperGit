@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate:
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve Uya Toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -x "$HOME/uya/uya/bin/uya" ]; then
+            echo "UYA=$HOME/uya/uya/bin/uya" >> "$GITHUB_ENV"
+          elif [ -x "$HOME/xyglasses/uya/bin/uya" ]; then
+            echo "UYA=$HOME/xyglasses/uya/bin/uya" >> "$GITHUB_ENV"
+          else
+            echo "missing Uya compiler on runner" >&2
+            exit 1
+          fi
+
+      - name: Show Toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$UYA" --version
+          make --version
+
+      - name: Run Test Suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          make test
+
+      - name: Native Build Smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          make build
+          test -x bin/hgx
+
+      - name: C99 Smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          make c99
+          test -s build/hgx.c
