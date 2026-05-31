@@ -421,7 +421,7 @@
 - [~] 更复杂的 audit / policy / dedupe / storage tier 体系。
 - [x] 定义可持久化的 path policy / dedupe scope / audit / cache TTL 配置格式，并实现 repo-local 读写与 matcher。
 - [x] 将 policy / dedupe / audit 规则接入 add / commit / manifest / chunked blob 构建路径，替换当前 experimental default 常量直写。
-- [ ] 为 chunk / object 存储实现 tier-aware 放置与查询策略，并补齐 `StorageTier` 的真实选择、回退和测试。
+- [x] 为 chunk / object 存储实现 tier-aware 放置与查询策略，并补齐 `StorageTier` 的真实选择、回退和测试。
 - [ ] 为 checkout / fetch / push / commit 生成可落盘 audit log，并补齐 doctor / CLI 可见性与回归测试。
 - [ ] FUSE / 平台 VFS / 内核级虚拟工作区。
 - [ ] 更激进的服务端索引、云端查询和分布式执行能力。
