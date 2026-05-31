@@ -9,7 +9,7 @@ use libc.stat;
 use core.ids.CommitId;
 use core.ids.ObjectId;
 use core.ids.commit_id_compare;
-use core.policy.placeholder_policy_id;
+use core.policy.experimental_policy_id;
 use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_path_compare;
 use manifest.trie.ManifestLeafInputEntry;
@@ -230,7 +230,7 @@ fn stage_view_manifest_input_from_stage_without_base(
         object_id: object_id,
         logical_size: try stage_view_entry_logical_size(arena, store, &object_id),
         content_type: ContentType.Unknown,
-        policy_id: placeholder_policy_id(),
+        policy_id: experimental_policy_id(),
     };
 }
 

@@ -7,38 +7,57 @@ use core.ids.policy_id_from_object;
 use object.types.DedupeScope;
 
 export enum AuditEventKind {
-    Placeholder,
+    ExperimentalDefault,
     Checkout,
     Commit,
     Fetch,
     Push
 }
 
-export struct AuditEventPlaceholder {
+export struct PolicyMetadataDefaults {
+    policy_id: PolicyId,
+    dedupe_scope: DedupeScope,
+    audit_enabled: bool,
+    experimental: bool
+}
+
+export struct ExperimentalAuditEvent {
     kind: AuditEventKind,
     policy_id: PolicyId,
     dedupe_scope: DedupeScope,
-    enabled: bool
+    enabled: bool,
+    experimental: bool
 }
 
-export fn placeholder_policy_id() PolicyId {
+export fn experimental_policy_id() PolicyId {
     return policy_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
 }
 
-export fn placeholder_dedupe_scope() DedupeScope {
+export fn experimental_dedupe_scope() DedupeScope {
     return DedupeScope.Repository;
 }
 
-export fn policy_id_is_placeholder(value: &PolicyId) bool {
-    const zero: PolicyId = placeholder_policy_id();
+export fn experimental_policy_defaults() PolicyMetadataDefaults {
+    return PolicyMetadataDefaults{
+        policy_id: experimental_policy_id(),
+        dedupe_scope: experimental_dedupe_scope(),
+        audit_enabled: false,
+        experimental: true,
+    };
+}
+
+export fn policy_id_is_experimental_default(value: &PolicyId) bool {
+    const zero: PolicyId = experimental_policy_id();
     return policy_id_compare(value, &zero) == 0;
 }
 
-export fn audit_event_placeholder(kind: AuditEventKind) AuditEventPlaceholder {
-    return AuditEventPlaceholder{
+export fn experimental_audit_event(kind: AuditEventKind) ExperimentalAuditEvent {
+    const defaults: PolicyMetadataDefaults = experimental_policy_defaults();
+    return ExperimentalAuditEvent{
         kind: kind,
-        policy_id: placeholder_policy_id(),
-        dedupe_scope: placeholder_dedupe_scope(),
-        enabled: false,
+        policy_id: defaults.policy_id,
+        dedupe_scope: defaults.dedupe_scope,
+        enabled: defaults.audit_enabled,
+        experimental: defaults.experimental,
     };
 }

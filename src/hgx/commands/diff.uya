@@ -25,7 +25,7 @@ use core.ids.commit_id_decode_hex;
 use core.ids.hash32_compare;
 use core.ids.object_id_from_hash;
 use core.parallel.parallel_default_requested_workers;
-use core.policy.placeholder_policy_id;
+use core.policy.experimental_policy_id;
 use large.config.large_file_uses_small_blob;
 use large.prepare.LargePreparedChunkedBlob;
 use large.prepare.large_prepare_recommended_arena_bytes;
@@ -653,7 +653,7 @@ fn diff_workspace_inputs(
             object_id: ObjectId{ hash: object_id.hash },
             logical_size: entry.logical_size,
             content_type: ContentType.Unknown,
-            policy_id: placeholder_policy_id(),
+            policy_id: experimental_policy_id(),
         };
         i = i + 1 as usize;
     }

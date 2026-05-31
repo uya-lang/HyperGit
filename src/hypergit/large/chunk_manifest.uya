@@ -4,8 +4,8 @@ use std.mem.arena.arena_alloc;
 use core.codec.codec_hash_payload;
 use core.ids.Hash32;
 use core.ids.PolicyId;
-use core.policy.placeholder_dedupe_scope;
-use core.policy.placeholder_policy_id;
+use core.policy.experimental_dedupe_scope;
+use core.policy.experimental_policy_id;
 use large.chunk_hash.ChunkHashes;
 use large.chunk_store.ChunkStorePutResult;
 use large.chunker.LargeChunk;
@@ -131,6 +131,6 @@ export fn chunked_blob_payload_repository_default(
         file_type,
         chunking_strategy,
         parts,
-        placeholder_policy_id(),
-        placeholder_dedupe_scope());
+        experimental_policy_id(),
+        experimental_dedupe_scope());
 }

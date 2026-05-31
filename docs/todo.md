@@ -410,7 +410,7 @@
 
 - [x] 如果 `merge` 进入 1.0 范围，补齐用户可见命令、冲突处理流程和 shell 测试，而不只停留在底层模块。
 - [x] 如果 `branch` / `clone` 进入 1.0 范围，补齐 CLI、仓库引用操作、远端初始化流程和文档。
-- [ ] 将 policy / dedupe scope / audit event 从占位实现升级为最小可用实现，或明确标记为实验特性并从 1.0 承诺中移出。
+- [x] 将 policy / dedupe scope / audit event 从占位实现升级为最小可用实现，或明确标记为实验特性并从 1.0 承诺中移出。
 - [ ] 将 HTTP remote 从当前 smoke 级验证提升为更完整的协议验证，覆盖鉴权失败、对象批量传输、fetch、push、尺寸限制和服务端错误路径。
 - [ ] 将 Git 互操作从 prototype 收敛为“支持子集”并写清兼容矩阵、限制条件和失败行为。
 - [ ] 基于 `docs/benchmarks.md` 当前结果继续优化明显热点，至少解释并处理“parallel diff 慢于 serial”和“segment pack lookup 偏慢”的现状。

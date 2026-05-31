@@ -27,7 +27,7 @@ use core.ids.hash32_compare;
 use core.ids.manifest_id_from_object;
 use core.ids.object_id_compare;
 use core.ids.object_id_from_hash;
-use core.policy.placeholder_policy_id;
+use core.policy.experimental_policy_id;
 use index.commit_graph.CommitGraphEntryList;
 use index.commit_graph.CommitGraphPathList;
 use index.commit_graph.commit_graph_changed_path_bloom_build;
@@ -640,7 +640,7 @@ fn commit_manifest_inputs_from_stage(
                 profile,
             ),
             content_type: ContentType.Unknown,
-            policy_id: placeholder_policy_id(),
+            policy_id: experimental_policy_id(),
         };
         out_index = out_index + 1 as usize;
         i = i + 1 as usize;

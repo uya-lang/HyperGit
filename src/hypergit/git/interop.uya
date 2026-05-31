@@ -15,7 +15,7 @@ use libc.tmpnam;
 use core.ids.CommitId;
 use core.ids.ObjectId;
 use core.ids.ManifestId;
-use core.policy.placeholder_policy_id;
+use core.policy.experimental_policy_id;
 use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_bytes_is_utf8;
 use manifest.path.manifest_path_normalize;
@@ -635,7 +635,7 @@ export fn git_tree_to_manifest_prototype(arena: &Arena, store: &LooseObjectStore
             object_id: entries.ptr[i].object_id,
             logical_size: entries.ptr[i].logical_size,
             content_type: entries.ptr[i].content_type,
-            policy_id: placeholder_policy_id(),
+            policy_id: experimental_policy_id(),
         };
         i = i + 1 as usize;
     }
