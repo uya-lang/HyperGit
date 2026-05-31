@@ -340,6 +340,20 @@ fn http_remote_literal_slice(text: &const byte) &[byte] {
     return (text as &byte)[0: http_remote_literal_len(text)];
 }
 
+fn http_remote_varuint_encoded_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1 as usize;
+    while temp >= 128u64 {
+        temp = temp >> 7;
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn http_remote_bytes_encoded_len(value: ByteList) usize {
+    return http_remote_varuint_encoded_len(value.len as u64) + value.len;
+}
+
 fn http_remote_append_bytes(buf: &[byte], offset: &usize, src: &[byte]) !void {
     if *offset + src.len > buf.len {
         return error.HttpRemoteAlloc;
@@ -483,8 +497,7 @@ fn http_remote_decode_content_type(input: &[byte], offset: &usize) !ContentType 
 }
 
 fn http_remote_entry_encoded_len(entry: &ManifestEntry) usize {
-    return 1 as usize +
-        entry.name.len +
+    return http_remote_bytes_encoded_len(entry.name) +
         2 as usize +
         4 as usize +
         HASH32_BYTES +
@@ -517,10 +530,8 @@ fn http_remote_decode_entry(arena: &Arena, input: &[byte], offset: &usize) !Mani
 }
 
 fn http_remote_child_encoded_len(child: &ManifestChild) usize {
-    return 1 as usize +
-        child.min_name.len +
-        1 as usize +
-        child.max_name.len +
+    return http_remote_bytes_encoded_len(child.min_name) +
+        http_remote_bytes_encoded_len(child.max_name) +
         HASH32_BYTES +
         HASH32_BYTES;
 }
@@ -544,7 +555,7 @@ fn http_remote_decode_child(arena: &Arena, input: &[byte], offset: &usize) !Mani
 }
 
 export fn http_remote_object_batch_request_encoded_len(request: &HttpRemoteObjectBatchRequest) usize {
-    return 1 as usize + request.object_ids.len * HASH32_BYTES;
+    return http_remote_varuint_encoded_len(request.object_ids.len as u64) + request.object_ids.len * HASH32_BYTES;
 }
 
 export fn encode_http_remote_object_batch_request(output: &[byte], offset: &usize, request: &HttpRemoteObjectBatchRequest) !void {
@@ -576,15 +587,14 @@ export fn decode_http_remote_object_batch_request(arena: &Arena, input: &[byte],
 }
 
 export fn http_remote_object_batch_response_encoded_len(response: &HttpRemoteObjectBatchResponse) usize {
-    var total: usize = 1 as usize;
+    var total: usize = http_remote_varuint_encoded_len(response.objects.len as u64);
     var i: usize = 0;
     while i < response.objects.len {
         total = total + HASH32_BYTES + 1 as usize;
         if response.objects.ptr[i].present {
             total = total +
                 2 as usize +
-                1 as usize +
-                response.objects.ptr[i].object_bytes.len;
+                http_remote_bytes_encoded_len(response.objects.ptr[i].object_bytes);
         }
         i = i + 1 as usize;
     }
@@ -638,10 +648,10 @@ export fn decode_http_remote_object_batch_response(arena: &Arena, input: &[byte]
 }
 
 export fn http_remote_manifest_query_request_encoded_len(request: &HttpRemoteManifestQueryRequest) usize {
-    var total: usize = HASH32_BYTES + 1 as usize;
+    var total: usize = HASH32_BYTES + http_remote_varuint_encoded_len(request.pathspecs.len as u64);
     var i: usize = 0;
     while i < request.pathspecs.len {
-        total = total + 1 as usize + request.pathspecs.ptr[i].len;
+        total = total + http_remote_bytes_encoded_len(request.pathspecs.ptr[i]);
         i = i + 1 as usize;
     }
     return total;
@@ -681,11 +691,10 @@ export fn decode_http_remote_manifest_query_request(arena: &Arena, input: &[byte
 
 export fn http_remote_manifest_query_response_encoded_len(response: &HttpRemoteManifestQueryResponse) usize {
     var total: usize = HASH32_BYTES +
-        1 as usize +
-        response.prefix.len +
+        http_remote_bytes_encoded_len(response.prefix) +
         2 as usize +
-        1 as usize +
-        1 as usize;
+        http_remote_varuint_encoded_len(response.entries.len as u64) +
+        http_remote_varuint_encoded_len(response.children.len as u64);
     var i: usize = 0;
     while i < response.entries.len {
         total = total + http_remote_entry_encoded_len(&response.entries.ptr[i]);
@@ -1122,10 +1131,14 @@ fn http_remote_auth_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future
 }
 
 fn http_remote_capabilities_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future<!i32> {
-    if http_remote_runtime_auth_required(runtime) {
-        return ctx.bytes(Status.OK, http_remote_literal_slice(HTTP_REMOTE_JSON_CONTENT_TYPE), http_remote_literal_slice("{\"service\":\"hypergit-http-remote\",\"default_branch\":\"main\",\"auth_required\":true}\n"));
-    }
-    return ctx.bytes(Status.OK, http_remote_literal_slice(HTTP_REMOTE_JSON_CONTENT_TYPE), http_remote_literal_slice("{\"service\":\"hypergit-http-remote\",\"default_branch\":\"main\",\"auth_required\":false}\n"));
+    const body: ByteList = http_remote_capabilities_json(&ctx.request_arena.arena, runtime) catch {
+        return ctx.string(Status.InternalServerError, "internal server error\n");
+    };
+    return ctx.bytes(
+        Status.OK,
+        http_remote_literal_slice(HTTP_REMOTE_JSON_CONTENT_TYPE),
+        body.ptr[0: body.len],
+    );
 }
 
 fn http_remote_object_batch_future(runtime: &HttpRemoteRuntime, ctx: &GinContext) Future<!i32> {

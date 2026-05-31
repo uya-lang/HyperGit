@@ -131,8 +131,9 @@ test:
 
 experimental-test:
 	$(UYA) test src/hypergit/test_protocol_http_remote.uya
-	chmod +x tests/test_http_remote_smoke.sh
+	chmod +x tests/test_http_remote_smoke.sh tests/test_http_remote_protocol.sh
 	./tests/test_http_remote_smoke.sh
+	./tests/test_http_remote_protocol.sh
 
 clean:
 	rm -f $(BIN) $(C99)
