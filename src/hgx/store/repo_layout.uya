@@ -30,6 +30,7 @@ const STAT_S_IFDIR: u32 = 16384u32;
 
 export const HGIT_DIR_NAME: &const byte = ".hgit";
 export const HGIT_CONFIG_REL: &const byte = ".hgit/config.json";
+export const HGIT_POLICY_REL: &const byte = ".hgit/policy.json";
 export const HGIT_REFS_REL: &const byte = ".hgit/refs";
 export const HGIT_REFS_HEADS_REL: &const byte = ".hgit/refs/heads";
 export const HGIT_OBJECTS_REL: &const byte = ".hgit/objects";

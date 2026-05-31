@@ -1,0 +1,676 @@
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fread;
+use std.io.file.fwrite;
+use std.json.encoder.json_expect_i64;
+use std.json.encoder.json_expect_str;
+use std.json.encoder.json_object_find_index;
+use std.json.parser.parse;
+use std.json.value.JsonArray;
+use std.json.value.JsonObject;
+use std.json.value.JsonStrView;
+use std.json.value.JsonValue;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+use std.string.strlen;
+
+use libc.Stat;
+use libc.free;
+use libc.malloc;
+use libc.rename;
+use libc.stat;
+use core.ids.Hash32;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.HASH32_HEX_BYTES;
+use core.ids.hash_domain_payload;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_decode_hex;
+use core.ids.policy_id_encode_hex;
+use core.ids.policy_id_from_object;
+use manifest.path.manifest_path_normalize;
+use manifest.query.manifest_pathspec_matches_path;
+use object.types.ByteList;
+
+export const PATH_POLICY_VERSION: i64 = 1i64;
+const PATH_POLICY_BYTES_MAX: usize = 65536 as usize;
+const PATH_POLICY_PATH_MAX: usize = 4096 as usize;
+
+error PathPolicyAlloc;
+error PathPolicyInvalid;
+error PathPolicyNotFound;
+error PathPolicyOpenFailed;
+error PathPolicyReadFailed;
+error PathPolicyWriteFailed;
+error PathPolicyTooLarge;
+error PathPolicyPathTooLong;
+
+export enum PathPolicyDedupeScopeKind {
+    Repository,
+    Global,
+    Tenant,
+    Organization
+}
+
+export struct PathPolicyRule {
+    pathspec: ByteList,
+    policy_id: PolicyId,
+    dedupe_scope_kind: PathPolicyDedupeScopeKind,
+    dedupe_scope_value: ByteList,
+    audit_enabled: bool,
+    cache_ttl_secs: u64
+}
+
+export struct PathPolicyRuleList {
+    ptr: &PathPolicyRule,
+    len: usize
+}
+
+export struct PathPolicyProfile {
+    rules: PathPolicyRuleList,
+    profile_id: Hash32
+}
+
+export struct PathPolicyMatch {
+    matched: bool,
+    rule_index: usize,
+    policy_id: PolicyId,
+    dedupe_scope_kind: PathPolicyDedupeScopeKind,
+    dedupe_scope_value: ByteList,
+    audit_enabled: bool,
+    cache_ttl_secs: u64
+}
+
+struct PathPolicyPath {
+    bytes: [byte: PATH_POLICY_PATH_MAX] = [],
+    len: usize = 0
+}
+
+fn path_policy_zero_policy_id() PolicyId {
+    return policy_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
+}
+
+fn path_policy_path_from_cstr(text: &const byte) !PathPolicyPath {
+    if text == null {
+        return error.PathPolicyPathTooLong;
+    }
+    const len: usize = strlen(text);
+    if len >= PATH_POLICY_PATH_MAX {
+        return error.PathPolicyPathTooLong;
+    }
+    var out: PathPolicyPath = PathPolicyPath{ bytes: [], len: len };
+    var i: usize = 0 as usize;
+    while i < len {
+        out.bytes[i] = text[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[len] = 0 as byte;
+    return out;
+}
+
+fn path_policy_temp_path(path: &PathPolicyPath) !PathPolicyPath {
+    const suffix: &const byte = ".tmp";
+    const suffix_len: usize = 4 as usize;
+    if path.len + suffix_len >= PATH_POLICY_PATH_MAX {
+        return error.PathPolicyPathTooLong;
+    }
+
+    var out: PathPolicyPath = *path;
+    var i: usize = 0 as usize;
+    while i < suffix_len {
+        out.bytes[path.len + i] = suffix[i];
+        i = i + 1 as usize;
+    }
+    out.len = path.len + suffix_len;
+    out.bytes[out.len] = 0 as byte;
+    return out;
+}
+
+fn path_policy_arena_bytes(arena: &Arena, len: usize) !&[byte] {
+    var want: usize = len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want);
+    if raw == null {
+        return error.PathPolicyAlloc;
+    }
+    return raw[0: len];
+}
+
+fn path_policy_json_string_len(value: &ByteList) usize {
+    var total: usize = 2 as usize;
+    var i: usize = 0 as usize;
+    while i < value.len {
+        const ch: byte = value.ptr[i];
+        if ch == '"' as byte || ch == '\\' as byte {
+            total = total + 2 as usize;
+        } else {
+            total = total + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn path_policy_write_literal(output: &[byte], offset: &usize, text: &const byte) !void {
+    const len: usize = strlen(text);
+    if *offset + len > output.len {
+        return error.PathPolicyWriteFailed;
+    }
+    var i: usize = 0 as usize;
+    while i < len {
+        output.ptr[*offset + i] = text[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + len;
+}
+
+fn path_policy_write_json_string(output: &[byte], offset: &usize, value: &ByteList) !void {
+    if *offset + path_policy_json_string_len(value) > output.len {
+        return error.PathPolicyWriteFailed;
+    }
+    output.ptr[*offset] = '"' as byte;
+    *offset = *offset + 1 as usize;
+
+    var i: usize = 0 as usize;
+    while i < value.len {
+        const ch: byte = value.ptr[i];
+        if ch == '"' as byte || ch == '\\' as byte {
+            output.ptr[*offset] = '\\' as byte;
+            *offset = *offset + 1 as usize;
+        }
+        output.ptr[*offset] = ch;
+        *offset = *offset + 1 as usize;
+        i = i + 1 as usize;
+    }
+
+    output.ptr[*offset] = '"' as byte;
+    *offset = *offset + 1 as usize;
+}
+
+fn path_policy_dedupe_scope_text_len(rule: &PathPolicyRule) usize {
+    if rule.dedupe_scope_kind == PathPolicyDedupeScopeKind.Repository {
+        return strlen("repository");
+    }
+    if rule.dedupe_scope_kind == PathPolicyDedupeScopeKind.Global {
+        return strlen("global");
+    }
+    if rule.dedupe_scope_kind == PathPolicyDedupeScopeKind.Tenant {
+        return strlen("tenant:") + rule.dedupe_scope_value.len;
+    }
+    return strlen("org:") + rule.dedupe_scope_value.len;
+}
+
+fn path_policy_write_dedupe_scope_text(output: &[byte], offset: &usize, rule: &PathPolicyRule) !void {
+    if rule.dedupe_scope_kind == PathPolicyDedupeScopeKind.Repository {
+        return path_policy_write_literal(output, offset, "repository");
+    }
+    if rule.dedupe_scope_kind == PathPolicyDedupeScopeKind.Global {
+        return path_policy_write_literal(output, offset, "global");
+    }
+    if rule.dedupe_scope_kind == PathPolicyDedupeScopeKind.Tenant {
+        try path_policy_write_literal(output, offset, "tenant:");
+    } else {
+        try path_policy_write_literal(output, offset, "org:");
+    }
+    if *offset + rule.dedupe_scope_value.len > output.len {
+        return error.PathPolicyWriteFailed;
+    }
+    var i: usize = 0 as usize;
+    while i < rule.dedupe_scope_value.len {
+        output.ptr[*offset + i] = rule.dedupe_scope_value.ptr[i];
+        i = i + 1 as usize;
+    }
+    *offset = *offset + rule.dedupe_scope_value.len;
+}
+
+fn path_policy_audit_text(rule: &PathPolicyRule) &const byte {
+    if rule.audit_enabled {
+        return "enabled" as &const byte;
+    }
+    return "disabled" as &const byte;
+}
+
+fn path_policy_u64_text_len(value: u64) usize {
+    var temp: u64 = value;
+    var count: usize = 1 as usize;
+    while temp >= 10u64 {
+        temp = temp / 10u64;
+        count = count + 1 as usize;
+    }
+    return count;
+}
+
+fn path_policy_write_u64_text(output: &[byte], offset: &usize, value: u64) !void {
+    const count: usize = path_policy_u64_text_len(value);
+    if *offset + count > output.len {
+        return error.PathPolicyWriteFailed;
+    }
+    var temp: u64 = value;
+    var i: usize = 0 as usize;
+    while i < count {
+        output.ptr[*offset + count - 1 as usize - i] = ('0' as byte) + (temp % 10u64) as byte;
+        temp = temp / 10u64;
+        i = i + 1 as usize;
+    }
+    *offset = *offset + count;
+}
+
+fn path_policy_json_len(profile: &PathPolicyProfile) usize {
+    var total: usize = strlen("{\"version\":1,\"rules\":[") + strlen("]}\n");
+    var i: usize = 0 as usize;
+    while i < profile.rules.len {
+        if i > 0 as usize {
+            total = total + 1 as usize;
+        }
+        total = total +
+            strlen("{\"pathspec\":") +
+            path_policy_json_string_len(&profile.rules.ptr[i].pathspec) +
+            strlen(",\"policy_id\":\"") +
+            HASH32_HEX_BYTES +
+            strlen("\",\"dedupe_scope\":\"") +
+            path_policy_dedupe_scope_text_len(&profile.rules.ptr[i]) +
+            strlen("\",\"audit\":\"") +
+            strlen(path_policy_audit_text(&profile.rules.ptr[i])) +
+            strlen("\",\"cache_ttl_secs\":") +
+            path_policy_u64_text_len(profile.rules.ptr[i].cache_ttl_secs) +
+            1 as usize;
+        i = i + 1 as usize;
+    }
+    return total;
+}
+
+fn path_policy_write_json(output: &[byte], profile: &PathPolicyProfile) !usize {
+    var offset: usize = 0 as usize;
+    try path_policy_write_literal(output, &offset, "{\"version\":1,\"rules\":[");
+
+    var policy_hex: [byte: HASH32_HEX_BYTES] = [];
+    var i: usize = 0 as usize;
+    while i < profile.rules.len {
+        const rule: &PathPolicyRule = &profile.rules.ptr[i];
+        if i > 0 as usize {
+            try path_policy_write_literal(output, &offset, ",");
+        }
+        try path_policy_write_literal(output, &offset, "{\"pathspec\":");
+        try path_policy_write_json_string(output, &offset, &rule.pathspec);
+        try path_policy_write_literal(output, &offset, ",\"policy_id\":\"");
+        _ = try policy_id_encode_hex(&rule.policy_id, policy_hex[0: HASH32_HEX_BYTES]);
+        if offset + HASH32_HEX_BYTES > output.len {
+            return error.PathPolicyWriteFailed;
+        }
+        var hex_index: usize = 0 as usize;
+        while hex_index < HASH32_HEX_BYTES {
+            output.ptr[offset + hex_index] = policy_hex[hex_index];
+            hex_index = hex_index + 1 as usize;
+        }
+        offset = offset + HASH32_HEX_BYTES;
+        try path_policy_write_literal(output, &offset, "\",\"dedupe_scope\":\"");
+        try path_policy_write_dedupe_scope_text(output, &offset, rule);
+        try path_policy_write_literal(output, &offset, "\",\"audit\":\"");
+        try path_policy_write_literal(output, &offset, path_policy_audit_text(rule));
+        try path_policy_write_literal(output, &offset, "\",\"cache_ttl_secs\":");
+        try path_policy_write_u64_text(output, &offset, rule.cache_ttl_secs);
+        try path_policy_write_literal(output, &offset, "}");
+        i = i + 1 as usize;
+    }
+
+    try path_policy_write_literal(output, &offset, "]}\n");
+    return offset;
+}
+
+fn path_policy_copy_json_str(arena: &Arena, value: JsonStrView) !ByteList {
+    const out: &[byte] = try path_policy_arena_bytes(arena, value.len);
+    var i: usize = 0 as usize;
+    while i < value.len {
+        out.ptr[i] = value.ptr[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out.ptr, len: out.len };
+}
+
+fn path_policy_parse_dedupe_scope(arena: &Arena, value: &JsonStrView, kind: &PathPolicyDedupeScopeKind, scope_value: &ByteList) !void {
+    if value.len == strlen("repository") {
+        const text: &[byte] = "repository"[0: strlen("repository")];
+        var i: usize = 0 as usize;
+        while i < text.len {
+            if value.ptr[i] != text.ptr[i] {
+                break;
+            }
+            i = i + 1 as usize;
+        }
+        if i == text.len {
+            *kind = PathPolicyDedupeScopeKind.Repository;
+            *scope_value = ByteList{ ptr: null, len: 0 as usize };
+            return;
+        }
+    }
+    if value.len == strlen("global") {
+        const text: &[byte] = "global"[0: strlen("global")];
+        var i: usize = 0 as usize;
+        while i < text.len {
+            if value.ptr[i] != text.ptr[i] {
+                break;
+            }
+            i = i + 1 as usize;
+        }
+        if i == text.len {
+            *kind = PathPolicyDedupeScopeKind.Global;
+            *scope_value = ByteList{ ptr: null, len: 0 as usize };
+            return;
+        }
+    }
+
+    const tenant_prefix: &[byte] = "tenant:"[0: strlen("tenant:")];
+    if value.len > tenant_prefix.len {
+        var tenant_match: bool = true;
+        var i: usize = 0 as usize;
+        while i < tenant_prefix.len {
+            if value.ptr[i] != tenant_prefix.ptr[i] {
+                tenant_match = false;
+                break;
+            }
+            i = i + 1 as usize;
+        }
+        if tenant_match {
+            *kind = PathPolicyDedupeScopeKind.Tenant;
+            *scope_value = try path_policy_copy_json_str(arena, JsonStrView{
+                ptr: &value.ptr[tenant_prefix.len],
+                len: value.len - tenant_prefix.len,
+            });
+            return;
+        }
+    }
+
+    const org_prefix: &[byte] = "org:"[0: strlen("org:")];
+    if value.len > org_prefix.len {
+        var org_match: bool = true;
+        var i: usize = 0 as usize;
+        while i < org_prefix.len {
+            if value.ptr[i] != org_prefix.ptr[i] {
+                org_match = false;
+                break;
+            }
+            i = i + 1 as usize;
+        }
+        if org_match {
+            *kind = PathPolicyDedupeScopeKind.Organization;
+            *scope_value = try path_policy_copy_json_str(arena, JsonStrView{
+                ptr: &value.ptr[org_prefix.len],
+                len: value.len - org_prefix.len,
+            });
+            return;
+        }
+    }
+
+    return error.PathPolicyInvalid;
+}
+
+fn path_policy_parse_audit(value: JsonStrView) !bool {
+    if value.len == strlen("enabled") {
+        const text: &[byte] = "enabled"[0: strlen("enabled")];
+        var i: usize = 0 as usize;
+        while i < text.len {
+            if value.ptr[i] != text.ptr[i] {
+                break;
+            }
+            i = i + 1 as usize;
+        }
+        if i == text.len {
+            return true;
+        }
+    }
+    if value.len == strlen("disabled") {
+        const text: &[byte] = "disabled"[0: strlen("disabled")];
+        var i: usize = 0 as usize;
+        while i < text.len {
+            if value.ptr[i] != text.ptr[i] {
+                break;
+            }
+            i = i + 1 as usize;
+        }
+        if i == text.len {
+            return false;
+        }
+    }
+    return error.PathPolicyInvalid;
+}
+
+export fn path_policy_rule_list_from_slice(slice: &[PathPolicyRule]) PathPolicyRuleList {
+    return PathPolicyRuleList{ ptr: slice.ptr, len: slice.len };
+}
+
+export fn path_policy_profile_from_rules(arena: &Arena, rules: PathPolicyRuleList) !PathPolicyProfile {
+    const raw_rules: &PathPolicyRule = arena_alloc(arena, @size_of(PathPolicyRule) as usize * rules.len) as &PathPolicyRule;
+    if rules.len > 0 as usize && raw_rules == null {
+        return error.PathPolicyAlloc;
+    }
+    var i: usize = 0 as usize;
+    while i < rules.len {
+        raw_rules[i] = PathPolicyRule{
+            pathspec: ByteList{ ptr: rules.ptr[i].pathspec.ptr, len: rules.ptr[i].pathspec.len },
+            policy_id: rules.ptr[i].policy_id,
+            dedupe_scope_kind: rules.ptr[i].dedupe_scope_kind,
+            dedupe_scope_value: ByteList{ ptr: rules.ptr[i].dedupe_scope_value.ptr, len: rules.ptr[i].dedupe_scope_value.len },
+            audit_enabled: rules.ptr[i].audit_enabled,
+            cache_ttl_secs: rules.ptr[i].cache_ttl_secs,
+        };
+        i = i + 1 as usize;
+    }
+    var profile: PathPolicyProfile = PathPolicyProfile{
+        rules: PathPolicyRuleList{ ptr: raw_rules, len: rules.len },
+        profile_id: Hash32{ bytes: [] },
+    };
+    const total_len: usize = path_policy_json_len(&profile);
+    const payload: &[byte] = try path_policy_arena_bytes(arena, total_len);
+    const written: usize = try path_policy_write_json(payload, &profile);
+    profile.profile_id = try hash_domain_payload(arena, "path-policy", payload.ptr[0: written]);
+    return profile;
+}
+
+export fn path_policy_default(arena: &Arena) !PathPolicyProfile {
+    return path_policy_profile_from_rules(arena, PathPolicyRuleList{ ptr: null, len: 0 as usize });
+}
+
+export fn path_policy_match(profile: &PathPolicyProfile, path: &ByteList) PathPolicyMatch {
+    var result: PathPolicyMatch = PathPolicyMatch{
+        matched: false,
+        rule_index: 0 as usize,
+        policy_id: path_policy_zero_policy_id(),
+        dedupe_scope_kind: PathPolicyDedupeScopeKind.Repository,
+        dedupe_scope_value: ByteList{ ptr: null, len: 0 as usize },
+        audit_enabled: false,
+        cache_ttl_secs: 0u64,
+    };
+    var i: usize = 0 as usize;
+    while i < profile.rules.len {
+        const rule: &PathPolicyRule = &profile.rules.ptr[i];
+        if manifest_pathspec_matches_path(&rule.pathspec, path) {
+            result = PathPolicyMatch{
+                matched: true,
+                rule_index: i,
+                policy_id: rule.policy_id,
+                dedupe_scope_kind: rule.dedupe_scope_kind,
+                dedupe_scope_value: ByteList{ ptr: rule.dedupe_scope_value.ptr, len: rule.dedupe_scope_value.len },
+                audit_enabled: rule.audit_enabled,
+                cache_ttl_secs: rule.cache_ttl_secs,
+            };
+        }
+        i = i + 1 as usize;
+    }
+    return result;
+}
+
+export fn path_policy_file_read(arena: &Arena, path: &const byte) !PathPolicyProfile {
+    if path == null {
+        return error.PathPolicyNotFound;
+    }
+    const stream: &FILE = fopen(path, "r");
+    if stream == null {
+        return error.PathPolicyNotFound;
+    }
+    defer {
+        _ = fclose(stream);
+    }
+
+    var st: Stat = Stat{};
+    if stat(path, &st) != 0 {
+        return error.PathPolicyReadFailed;
+    }
+    const size: usize = st.st_size as usize;
+    if size == 0 as usize {
+        return error.PathPolicyInvalid;
+    }
+    if size > PATH_POLICY_BYTES_MAX {
+        return error.PathPolicyTooLarge;
+    }
+
+    const input: &[byte] = try path_policy_arena_bytes(arena, size);
+    const read_count: usize = fread(input.ptr, 1 as usize, size, stream);
+    if read_count != size {
+        return error.PathPolicyReadFailed;
+    }
+
+    const value: JsonValue = parse(arena, input.ptr, size) catch {
+        return error.PathPolicyInvalid;
+    };
+    var object: JsonObject = JsonObject{ pairs: null, len: 0 };
+    match value {
+        .obj(o) => { object = o; },
+        else => { return error.PathPolicyInvalid; },
+    }
+
+    const version_index: usize = json_object_find_index(&object, "version", 7 as usize) catch {
+        return error.PathPolicyInvalid;
+    };
+    const rules_index: usize = json_object_find_index(&object, "rules", 5 as usize) catch {
+        return error.PathPolicyInvalid;
+    };
+    const version: i64 = json_expect_i64(&object.pairs[version_index].value) catch {
+        return error.PathPolicyInvalid;
+    };
+    if version != PATH_POLICY_VERSION {
+        return error.PathPolicyInvalid;
+    }
+
+    var rules_array: JsonArray = JsonArray{ items: null, len: 0 };
+    match object.pairs[rules_index].value {
+        .arr(items) => { rules_array = items; },
+        else => { return error.PathPolicyInvalid; },
+    }
+    if rules_array.len == 0 as usize {
+        return path_policy_default(arena);
+    }
+
+    const raw_rules: &PathPolicyRule = arena_alloc(arena, @size_of(PathPolicyRule) as usize * rules_array.len) as &PathPolicyRule;
+    if raw_rules == null {
+        return error.PathPolicyAlloc;
+    }
+
+    var i: usize = 0 as usize;
+    while i < rules_array.len {
+        var rule_object: JsonObject = JsonObject{ pairs: null, len: 0 };
+        match rules_array.items[i] {
+            .obj(o) => { rule_object = o; },
+            else => { return error.PathPolicyInvalid; },
+        }
+
+        const pathspec_index: usize = json_object_find_index(&rule_object, "pathspec", 8 as usize) catch {
+            return error.PathPolicyInvalid;
+        };
+        const policy_index: usize = json_object_find_index(&rule_object, "policy_id", 9 as usize) catch {
+            return error.PathPolicyInvalid;
+        };
+        const scope_index: usize = json_object_find_index(&rule_object, "dedupe_scope", 12 as usize) catch {
+            return error.PathPolicyInvalid;
+        };
+        const audit_index: usize = json_object_find_index(&rule_object, "audit", 5 as usize) catch {
+            return error.PathPolicyInvalid;
+        };
+        const ttl_index: usize = json_object_find_index(&rule_object, "cache_ttl_secs", 14 as usize) catch {
+            return error.PathPolicyInvalid;
+        };
+
+        const raw_pathspec: JsonStrView = json_expect_str(&rule_object.pairs[pathspec_index].value) catch {
+            return error.PathPolicyInvalid;
+        };
+        const raw_policy: JsonStrView = json_expect_str(&rule_object.pairs[policy_index].value) catch {
+            return error.PathPolicyInvalid;
+        };
+        const raw_scope: JsonStrView = json_expect_str(&rule_object.pairs[scope_index].value) catch {
+            return error.PathPolicyInvalid;
+        };
+        const raw_audit: JsonStrView = json_expect_str(&rule_object.pairs[audit_index].value) catch {
+            return error.PathPolicyInvalid;
+        };
+        const raw_ttl: i64 = json_expect_i64(&rule_object.pairs[ttl_index].value) catch {
+            return error.PathPolicyInvalid;
+        };
+        if raw_ttl < 0i64 {
+            return error.PathPolicyInvalid;
+        }
+
+        var scope_kind: PathPolicyDedupeScopeKind = PathPolicyDedupeScopeKind.Repository;
+        var scope_value: ByteList = ByteList{ ptr: null, len: 0 as usize };
+        try path_policy_parse_dedupe_scope(arena, &raw_scope, &scope_kind, &scope_value);
+
+        const normalized_pathspec: ByteList = try manifest_path_normalize(arena, raw_pathspec.ptr[0: raw_pathspec.len]);
+        raw_rules[i] = PathPolicyRule{
+            pathspec: ByteList{ ptr: normalized_pathspec.ptr, len: normalized_pathspec.len },
+            policy_id: try policy_id_decode_hex(raw_policy.ptr[0: raw_policy.len]),
+            dedupe_scope_kind: scope_kind,
+            dedupe_scope_value: ByteList{ ptr: scope_value.ptr, len: scope_value.len },
+            audit_enabled: try path_policy_parse_audit(raw_audit),
+            cache_ttl_secs: raw_ttl as u64,
+        };
+        i = i + 1 as usize;
+    }
+
+    return try path_policy_profile_from_rules(arena, PathPolicyRuleList{ ptr: raw_rules, len: rules_array.len });
+}
+
+export fn path_policy_file_default(arena: &Arena, path: &const byte) !PathPolicyProfile {
+    return path_policy_file_read(arena, path) catch |err| {
+        if @error_id(err) == @error_id(error.PathPolicyNotFound) {
+            return path_policy_default(arena);
+        }
+        return err;
+    };
+}
+
+export fn path_policy_file_write(path: &const byte, profile: &PathPolicyProfile) !void {
+    const final_path: PathPolicyPath = try path_policy_path_from_cstr(path);
+    const temp_path: PathPolicyPath = try path_policy_temp_path(&final_path);
+    const total_len: usize = path_policy_json_len(profile);
+    if total_len > PATH_POLICY_BYTES_MAX {
+        return error.PathPolicyTooLarge;
+    }
+
+    const stream: &FILE = fopen(&temp_path.bytes[0] as &const byte, "w");
+    if stream == null {
+        return error.PathPolicyOpenFailed;
+    }
+
+    const payload: &byte = malloc(total_len) as &byte;
+    if payload == null {
+        _ = fclose(stream);
+        return error.PathPolicyAlloc;
+    }
+    defer {
+        free(payload as &void);
+    }
+
+    const output: &[byte] = payload[0: total_len];
+    const written: usize = try path_policy_write_json(output, profile);
+    if fwrite(output.ptr as &const byte, 1 as usize, written, stream) != written {
+        _ = fclose(stream);
+        return error.PathPolicyWriteFailed;
+    }
+    if fclose(stream) != 0 {
+        return error.PathPolicyWriteFailed;
+    }
+    if rename(&temp_path.bytes[0] as &const byte, &final_path.bytes[0] as &const byte) != 0 {
+        return error.PathPolicyWriteFailed;
+    }
+}

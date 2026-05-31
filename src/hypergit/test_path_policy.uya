@@ -1,0 +1,185 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+use std.io.file.FILE;
+use std.io.file.fclose;
+use std.io.file.fopen;
+use std.io.file.fwrite;
+
+use libc.system;
+use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_compare;
+use core.ids.policy_id_from_object;
+use core.path_policy.PathPolicyDedupeScopeKind;
+use core.path_policy.PathPolicyMatch;
+use core.path_policy.PathPolicyProfile;
+use core.path_policy.PathPolicyRule;
+use core.path_policy.path_policy_file_default;
+use core.path_policy.path_policy_file_read;
+use core.path_policy.path_policy_file_write;
+use core.path_policy.path_policy_match;
+use core.path_policy.path_policy_profile_from_rules;
+use core.path_policy.path_policy_rule_list_from_slice;
+use manifest.path.manifest_path_normalize;
+use object.types.ByteList;
+use core.ids.Hash32;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    const object_id: ObjectId = object_id_from_hash(make_hash(seed));
+    return policy_id_from_object(object_id);
+}
+
+fn expect_byte_slice_eq(actual: &ByteList, expected: &[byte]) !void {
+    try expect(actual.len == expected.len);
+    var i: usize = 0 as usize;
+    while i < actual.len {
+        try expect(actual.ptr[i] == expected.ptr[i]);
+        i = i + 1 as usize;
+    }
+}
+
+fn write_text_file(path: &const byte, text: &const byte) !void {
+    const stream: &FILE = fopen(path, "w");
+    try expect(stream != null);
+    defer {
+        _ = fclose(stream);
+    }
+    const bytes: &[byte] = literal_bytes(text);
+    try expect(fwrite(bytes.ptr as &const byte, 1 as usize, bytes.len, stream) == bytes.len);
+}
+
+fn test_path_policy_file_default_is_empty() !void {
+    try expect(system("rm -rf build/path-policy-default && mkdir -p build/path-policy-default/repo/.hgit") == 0);
+
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    const profile: PathPolicyProfile = try path_policy_file_default(&arena, "build/path-policy-default/repo/.hgit/policy.json");
+    try expect(profile.rules.len == 0 as usize);
+
+    const path: ByteList = try manifest_path_normalize(&arena, literal_bytes("src/main.uya"));
+    const matched: PathPolicyMatch = path_policy_match(&profile, &path);
+    try expect(!matched.matched);
+}
+
+fn test_path_policy_file_roundtrip_and_matcher() !void {
+    try expect(system("rm -rf build/path-policy-roundtrip && mkdir -p build/path-policy-roundtrip/repo/.hgit") == 0);
+
+    var arena_buf: [byte: 65536] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 65536 as usize);
+
+    var rules: [PathPolicyRule: 3] = [PathPolicyRule{
+        pathspec: try manifest_path_normalize(&arena, literal_bytes("src")),
+        policy_id: make_policy_id(11 as byte),
+        dedupe_scope_kind: PathPolicyDedupeScopeKind.Repository,
+        dedupe_scope_value: ByteList{ ptr: null, len: 0 as usize },
+        audit_enabled: false,
+        cache_ttl_secs: 600u64,
+    }, PathPolicyRule{
+        pathspec: try manifest_path_normalize(&arena, literal_bytes("src/vendor")),
+        policy_id: make_policy_id(12 as byte),
+        dedupe_scope_kind: PathPolicyDedupeScopeKind.Tenant,
+        dedupe_scope_value: try manifest_path_normalize(&arena, literal_bytes("data-platform")),
+        audit_enabled: true,
+        cache_ttl_secs: 86400u64,
+    }, PathPolicyRule{
+        pathspec: try manifest_path_normalize(&arena, literal_bytes("docs")),
+        policy_id: make_policy_id(13 as byte),
+        dedupe_scope_kind: PathPolicyDedupeScopeKind.Organization,
+        dedupe_scope_value: try manifest_path_normalize(&arena, literal_bytes("docs-team")),
+        audit_enabled: true,
+        cache_ttl_secs: 3600u64,
+    }];
+
+    const profile: PathPolicyProfile = try path_policy_profile_from_rules(&arena, path_policy_rule_list_from_slice(rules[0: 3]));
+    try path_policy_file_write("build/path-policy-roundtrip/repo/.hgit/policy.json", &profile);
+
+    var read_arena_buf: [byte: 65536] = [];
+    var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };
+    arena_init(&read_arena, &read_arena_buf[0], 65536 as usize);
+
+    const loaded: PathPolicyProfile = try path_policy_file_read(&read_arena, "build/path-policy-roundtrip/repo/.hgit/policy.json");
+    try expect(loaded.rules.len == 3 as usize);
+    try expect(policy_id_compare(&loaded.rules.ptr[1].policy_id, &rules[1].policy_id) == 0);
+    try expect(loaded.rules.ptr[1].dedupe_scope_kind == PathPolicyDedupeScopeKind.Tenant);
+    try expect_byte_slice_eq(&loaded.rules.ptr[1].dedupe_scope_value, literal_bytes("data-platform"));
+    try expect(loaded.rules.ptr[1].audit_enabled);
+    try expect(loaded.rules.ptr[1].cache_ttl_secs == 86400u64);
+
+    const vendor_path: ByteList = try manifest_path_normalize(&read_arena, literal_bytes("src/vendor/lib.uya"));
+    const vendor_match: PathPolicyMatch = path_policy_match(&loaded, &vendor_path);
+    try expect(vendor_match.matched);
+    try expect(vendor_match.rule_index == 1 as usize);
+    try expect(vendor_match.dedupe_scope_kind == PathPolicyDedupeScopeKind.Tenant);
+    try expect(vendor_match.audit_enabled);
+    try expect(vendor_match.cache_ttl_secs == 86400u64);
+
+    const src_path: ByteList = try manifest_path_normalize(&read_arena, literal_bytes("src/main.uya"));
+    const src_match: PathPolicyMatch = path_policy_match(&loaded, &src_path);
+    try expect(src_match.matched);
+    try expect(src_match.rule_index == 0 as usize);
+    try expect(src_match.dedupe_scope_kind == PathPolicyDedupeScopeKind.Repository);
+    try expect(!src_match.audit_enabled);
+    try expect(src_match.cache_ttl_secs == 600u64);
+
+    const docs_path: ByteList = try manifest_path_normalize(&read_arena, literal_bytes("docs/readme.md"));
+    const docs_match: PathPolicyMatch = path_policy_match(&loaded, &docs_path);
+    try expect(docs_match.matched);
+    try expect(docs_match.rule_index == 2 as usize);
+    try expect(docs_match.dedupe_scope_kind == PathPolicyDedupeScopeKind.Organization);
+    try expect_byte_slice_eq(&docs_match.dedupe_scope_value, literal_bytes("docs-team"));
+
+    const miss_path: ByteList = try manifest_path_normalize(&read_arena, literal_bytes("tests/test_main.uya"));
+    const miss_match: PathPolicyMatch = path_policy_match(&loaded, &miss_path);
+    try expect(!miss_match.matched);
+}
+
+fn test_path_policy_file_rejects_invalid_scope_and_ttl() !void {
+    try expect(system("rm -rf build/path-policy-invalid && mkdir -p build/path-policy-invalid/repo/.hgit") == 0);
+    try write_text_file(
+        "build/path-policy-invalid/repo/.hgit/policy.json",
+        "{\"version\":1,\"rules\":[{\"pathspec\":\"src\",\"policy_id\":\"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\",\"dedupe_scope\":\"tenant:\",\"audit\":\"enabled\",\"cache_ttl_secs\":-1}]}\n",
+    );
+
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    const profile: PathPolicyProfile = path_policy_file_read(&arena, "build/path-policy-invalid/repo/.hgit/policy.json") catch |err| {
+        try expect(@error_id(err) == @error_id(error.PathPolicyInvalid));
+        return;
+    };
+    _ = profile;
+    return error.AssertionFailed;
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Path Policy Tests");
+    run_test("path policy file default is empty", test_path_policy_file_default_is_empty);
+    run_test("path policy file roundtrip and matcher", test_path_policy_file_roundtrip_and_matcher);
+    run_test("path policy file rejects invalid scope and ttl", test_path_policy_file_rejects_invalid_scope_and_ttl);
+    return test_suite_end();
+}

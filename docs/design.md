@@ -140,6 +140,7 @@ src/
       ids.uya                # Hash / ObjectId / CommitId / ManifestId
       codec.uya              # canonical binary codec
       policy.uya             # experimental policy metadata defaults
+      path_policy.uya        # repo-local path policy config + matcher
     crypto/
       blake3.uya
     object/
@@ -221,6 +222,7 @@ HyperGit 本地元数据目录使用 `.hgit/`，避免与 `.git/` 混淆：
 ```text
 .hgit/
   config.json
+  policy.json
   refs/
     heads/main
     remotes/origin/main
@@ -1044,6 +1046,31 @@ Org scope    -> 明确授权的组织级共享对象池
     audit: enabled
     local-cache-ttl: 24h
 ```
+
+repo-local 持久化格式当前收敛为 `JSON v1`：
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {
+      "pathspec": "src/vendor",
+      "policy_id": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+      "dedupe_scope": "tenant:data-platform",
+      "audit": "enabled",
+      "cache_ttl_secs": 86400
+    }
+  ]
+}
+```
+
+当前 matcher 规则：
+
+- pathspec 在读入时先做仓库相对路径规范化。
+- 规则按文件中出现顺序保留，匹配时使用 “最后一个命中的规则覆盖前面的规则”。
+- `dedupe_scope` 文本当前支持 `repository`、`global`、`tenant:<name>`、`org:<name>`。
+- `audit` 文本当前支持 `enabled` / `disabled`。
+- `cache_ttl_secs` 使用非负整数秒，后续接入实际缓存/执行路径时不再重新解释自由格式字符串。
 
 本地安全：
 
