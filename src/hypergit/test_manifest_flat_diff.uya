@@ -12,11 +12,14 @@ use core.ids.ObjectId;
 use core.ids.PolicyId;
 use core.ids.object_id_from_hash;
 use core.ids.policy_id_from_object;
+use manifest.flat_diff.ManifestFlatDiffExecutionKind;
+use manifest.flat_diff.ManifestFlatDiffExecutionPlan;
 use manifest.flat_diff.ManifestFlatDiffEntry;
 use manifest.flat_diff.ManifestFlatDiffEntryKind;
 use manifest.flat_diff.ManifestFlatDiffEntryList;
 use manifest.flat_diff.manifest_flat_diff;
 use manifest.flat_diff.manifest_flat_diff_parallel;
+use manifest.flat_diff.manifest_flat_diff_parallel_plan;
 use manifest.path.manifest_path_normalize;
 use manifest.query.ManifestPathspecList;
 use manifest.query.manifest_pathspec_list_from_slice;
@@ -208,10 +211,47 @@ fn test_manifest_flat_diff_parallel_single_worker_matches_serial() !void {
     try expect_flat_diff_lists_equal(&single_worker, &serial);
 }
 
+fn test_manifest_flat_diff_parallel_plan_prunes_to_matching_top_level_shard() !void {
+    var arena_buf: [byte: 32768] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 32768 as usize);
+
+    const left_docs: ManifestLeafInputEntry = try make_input(&arena, "docs/readme.md", 60 as byte);
+    const left_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 61 as byte);
+    const left_src_b: ManifestLeafInputEntry = try make_input(&arena, "src/b.uya", 62 as byte);
+    const left_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 63 as byte);
+    var left_entries: [ManifestLeafInputEntry: 4] = [left_docs, left_src_a, left_src_b, left_tests];
+
+    const right_docs: ManifestLeafInputEntry = try make_input(&arena, "docs/readme.md", 60 as byte);
+    const right_src_a: ManifestLeafInputEntry = try make_input(&arena, "src/a.uya", 71 as byte);
+    const right_src_c: ManifestLeafInputEntry = try make_input(&arena, "src/c.uya", 72 as byte);
+    const right_tests: ManifestLeafInputEntry = try make_input(&arena, "tests/a.uya", 73 as byte);
+    var right_entries: [ManifestLeafInputEntry: 4] = [right_docs, right_src_a, right_src_c, right_tests];
+
+    const left_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(left_entries[0: 4]);
+    const right_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(right_entries[0: 4]);
+    const src_spec: ByteList = try normalize_literal(&arena, "src");
+    var specs: [ByteList: 1] = [src_spec];
+
+    const plan: ManifestFlatDiffExecutionPlan = try manifest_flat_diff_parallel_plan(
+        &arena,
+        &left_list,
+        &right_list,
+        manifest_pathspec_list_from_slice(specs[0: 1]),
+        3,
+    );
+
+    try expect(plan.kind == ManifestFlatDiffExecutionKind.Serial);
+    try expect(plan.matched_shards == 1 as usize);
+    try expect(plan.candidate_entries == 4 as usize);
+    try expect(plan.parallel_workers == 0 as usize);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Manifest Flat Diff Tests");
     run_test("manifest flat diff parallel matches serial across root shards", test_manifest_flat_diff_parallel_matches_serial_across_root_shards);
     run_test("manifest flat diff parallel respects pathspec filter", test_manifest_flat_diff_parallel_respects_pathspec_filter);
     run_test("manifest flat diff parallel single worker matches serial", test_manifest_flat_diff_parallel_single_worker_matches_serial);
+    run_test("manifest flat diff parallel plan prunes to matching top level shard", test_manifest_flat_diff_parallel_plan_prunes_to_matching_top_level_shard);
     return test_suite_end();
 }

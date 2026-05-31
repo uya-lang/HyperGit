@@ -773,56 +773,13 @@ export fn segment_pack_read_pack_only(path: &const byte, arena: &Arena) !Segment
     return try segment_pack_read_internal(path, arena, false);
 }
 
-export fn segment_pack_index_lookup(path: &const byte, id: ObjectId, arena: &Arena) !SegmentPackIndexEntry {
-    const raw_bytes: ByteList = try segment_pack_read_file_bytes(path, arena);
-    const file_size: usize = raw_bytes.len;
-    if file_size < PACK_INDEX_HEADER_BYTES + PACK_INDEX_FOOTER_BYTES {
-        return error.SegmentPackInvalid;
-    }
-
-    var offset: usize = 0 as usize;
-    const input: &[byte] = raw_bytes.ptr[0: file_size];
-    const header: SegmentPackIndexHeader = try segment_pack_read_index_header(input, &offset);
-    if offset != PACK_INDEX_HEADER_BYTES {
-        return error.SegmentPackInvalid;
-    }
-    if header.entries_offset != PACK_INDEX_HEADER_BYTES as u64 || header.bloom_offset > file_size as u64 {
-        return error.SegmentPackInvalid;
-    }
-    if header.bloom_offset + PACK_INDEX_FOOTER_BYTES as u64 != file_size as u64 {
-        return error.SegmentPackInvalid;
-    }
-    if header.entry_count as u64 * PACK_INDEX_ENTRY_BYTES as u64 != header.bloom_offset - header.entries_offset {
-        return error.SegmentPackInvalid;
-    }
-
-    var footer_offset: usize = header.bloom_offset as usize;
-    const footer: SegmentPackIndexFooter = try segment_pack_read_index_footer(input, &footer_offset);
-    if footer_offset != file_size {
-        return error.SegmentPackInvalid;
-    }
-    if footer.footer_crc32 != crc32_compute(input.ptr[header.bloom_offset as usize: PACK_INDEX_FOOTER_BYTES - 4 as usize]) {
-        return error.SegmentPackInvalid;
-    }
-    const entries_hash: Hash32 = codec_hash_payload(input.ptr[header.entries_offset as usize: header.bloom_offset as usize - header.entries_offset as usize]);
-    if hash32_compare(&entries_hash, &footer.entries_hash) != 0 {
-        return error.SegmentPackInvalid;
-    }
-    const pack_path: ByteList = try segment_pack_sidecar_path(path, 'i' as byte, 'p' as byte, arena);
-    const pack_bytes: ByteList = try segment_pack_read_file_bytes(pack_path.ptr as &const byte, arena);
-    const pack_hash: Hash32 = try segment_pack_hash_footer_cross_ref(
-        pack_bytes.ptr[0: pack_bytes.len],
-        pack_bytes.len - SEGMENT_PACK_FOOTER_BYTES + SEGMENT_PACK_FOOTER_INDEX_HASH_OFFSET,
-    );
-    if hash32_compare(&pack_hash, &footer.pack_hash) != 0 {
-        return error.SegmentPackInvalid;
-    }
-
+export fn segment_pack_index_lookup_snapshot(snapshot: &SegmentPackIndexSnapshot, id: ObjectId) !SegmentPackIndexEntry {
+    const input: &[byte] = snapshot.raw_bytes.ptr[0: snapshot.raw_bytes.len];
     var low: usize = 0 as usize;
-    var high: usize = header.entry_count as usize;
+    var high: usize = snapshot.header.entry_count as usize;
     while low < high {
         const mid: usize = low + ((high - low) / 2 as usize);
-        const entry_offset: usize = header.entries_offset as usize + (mid * PACK_INDEX_ENTRY_BYTES);
+        const entry_offset: usize = snapshot.header.entries_offset as usize + (mid * PACK_INDEX_ENTRY_BYTES);
         const entry: SegmentPackIndexEntry = try segment_pack_decode_index_entry(input, entry_offset);
         const cmp: i32 = object_id_compare(&id, &entry.object_id);
         if cmp == 0 {
@@ -836,6 +793,11 @@ export fn segment_pack_index_lookup(path: &const byte, id: ObjectId, arena: &Are
     }
 
     return error.SegmentPackObjectNotFound;
+}
+
+export fn segment_pack_index_lookup(path: &const byte, id: ObjectId, arena: &Arena) !SegmentPackIndexEntry {
+    const snapshot: SegmentPackIndexSnapshot = try segment_pack_index_read(path, arena);
+    return try segment_pack_index_lookup_snapshot(&snapshot, id);
 }
 
 export fn segment_pack_index_read(path: &const byte, arena: &Arena) !SegmentPackIndexSnapshot {

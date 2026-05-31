@@ -50,6 +50,7 @@ use store.segment_pack.SegmentPackIndexEntry;
 use store.segment_pack.SegmentPackIndexSnapshot;
 use store.segment_pack.segment_pack_index_read;
 use store.segment_pack.segment_pack_index_lookup;
+use store.segment_pack.segment_pack_index_lookup_snapshot;
 use store.segment_pack.segment_pack_read;
 use store.segment_pack.segment_pack_write;
 use store.segment_pack.loose_pack_compact;
@@ -348,6 +349,14 @@ fn test_segment_pack_writer_roundtrip_layout() !void {
     try expect(hash32_compare(&index_snapshot.footer.pack_hash, &expected_pack_hash) == 0);
     try expect(hash32_compare(&index_snapshot.footer.entries_hash, &expected_entries_hash) == 0);
     try expect(index_snapshot.footer.footer_crc32 == crc32_compute(index_bytes.ptr[result.index_footer_offset as usize: PACK_INDEX_FOOTER_BYTES - 4 as usize]));
+
+    const snapshot_entry: SegmentPackIndexEntry = try segment_pack_index_lookup_snapshot(
+        &index_snapshot,
+        ObjectId{ hash: expected_entries[0].object_id.hash },
+    );
+    try expect(object_id_compare(&snapshot_entry.object_id, &expected_entries[0].object_id) == 0);
+    try expect(snapshot_entry.record_offset == expected_entries[0].record_offset);
+    try expect(snapshot_entry.record_bytes == expected_entries[0].record_bytes);
 
     var read_arena_buf: [byte: 32768] = [];
     var read_arena: Arena = Arena{ buffer: &read_arena_buf[0], size: 0, used: 0 };

@@ -17,9 +17,12 @@ use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
 use store.object_store.ObjectBytes;
 use store.segment_pack.SegmentPackIndexEntry;
+use store.segment_pack.SegmentPackIndexSnapshot;
 use store.segment_pack.SegmentPackWriteInput;
 use store.segment_pack.SegmentPackWriteResult;
+use store.segment_pack.segment_pack_index_read;
 use store.segment_pack.segment_pack_index_lookup;
+use store.segment_pack.segment_pack_index_lookup_snapshot;
 use store.segment_pack.segment_pack_write;
 
 export const BENCH_SEGMENT_PACK_LOOKUP_USAGE_TEXT: &const byte =
@@ -34,6 +37,12 @@ error BenchSegmentLookupUnexpectedResult;
 
 struct BenchSegmentLookupMeasure {
     avg_ms: u64,
+    sink: u64
+}
+
+struct BenchSegmentSnapshotMeasure {
+    read_avg_ms: u64,
+    lookup_avg_ms: u64,
     sink: u64
 }
 
@@ -178,6 +187,67 @@ fn bench_measure_lookup(index_path: &const byte, ids: &ObjectId, object_count: u
     return BenchSegmentLookupMeasure{ avg_ms: total_ms / BENCH_ITERATIONS as u64, sink: sink };
 }
 
+fn bench_measure_snapshot_lookup(index_path: &const byte, ids: &ObjectId, object_count: usize, lookup_count: usize) !BenchSegmentSnapshotMeasure {
+    const scratch_storage: &byte = malloc(BENCH_LOOKUP_ARENA_BYTES) as &byte;
+    if scratch_storage == null {
+        return error.BenchSegmentLookupAlloc;
+    }
+    defer {
+        free(scratch_storage as &void);
+    }
+
+    var total_read_ms: u64 = 0u64;
+    var total_lookup_ms: u64 = 0u64;
+    var sink: u64 = 0u64;
+    var iter: usize = 0 as usize;
+    while iter < BENCH_ITERATIONS {
+        var lookup_arena: Arena = Arena{ buffer: scratch_storage, size: 0, used: 0 };
+        arena_init(&lookup_arena, scratch_storage, BENCH_LOOKUP_ARENA_BYTES);
+
+        const read_started_ms: u64 = now_ms() catch {
+            return error.BenchSegmentLookupParse;
+        };
+        const snapshot: SegmentPackIndexSnapshot = segment_pack_index_read(index_path, &lookup_arena) catch {
+            return error.BenchSegmentLookupUnexpectedResult;
+        };
+        const read_finished_ms: u64 = now_ms() catch {
+            return error.BenchSegmentLookupParse;
+        };
+        total_read_ms = total_read_ms + (read_finished_ms - read_started_ms);
+
+        sink = 0u64;
+        const lookup_started_ms: u64 = now_ms() catch {
+            return error.BenchSegmentLookupParse;
+        };
+        var i: usize = 0 as usize;
+        while i < lookup_count {
+            const object_index: usize = (i * 7919 as usize + 11 as usize) % object_count;
+            const entry: SegmentPackIndexEntry = segment_pack_index_lookup_snapshot(
+                &snapshot,
+                ObjectId{ hash: ids[object_index].hash },
+            ) catch {
+                return error.BenchSegmentLookupUnexpectedResult;
+            };
+            if object_id_compare(&entry.object_id, &ids[object_index]) != 0 {
+                return error.BenchSegmentLookupUnexpectedResult;
+            }
+            sink = sink + entry.record_offset + entry.record_bytes as u64 + entry.logical_size;
+            i = i + 1 as usize;
+        }
+        const lookup_finished_ms: u64 = now_ms() catch {
+            return error.BenchSegmentLookupParse;
+        };
+        total_lookup_ms = total_lookup_ms + (lookup_finished_ms - lookup_started_ms);
+        iter = iter + 1 as usize;
+    }
+
+    return BenchSegmentSnapshotMeasure{
+        read_avg_ms: total_read_ms / BENCH_ITERATIONS as u64,
+        lookup_avg_ms: total_lookup_ms / BENCH_ITERATIONS as u64,
+        sink: sink,
+    };
+}
+
 export fn main() i32 {
     const argc: i32 = get_argc();
     if argc != 7 {
@@ -270,11 +340,21 @@ export fn main() i32 {
         fprintf(stderr, "lookup_error=%u\n" as *byte, @error_id(err));
         return 1;
     };
+    const snapshot_measure: BenchSegmentSnapshotMeasure = bench_measure_snapshot_lookup(
+        index_path,
+        ids,
+        object_count,
+        lookup_count,
+    ) catch |err| {
+        fprintf(stderr, "snapshot_lookup_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
 
     const lookup_us_per_op: u64 = (lookup_measure.avg_ms * 1000u64) / lookup_count as u64;
+    const snapshot_lookup_us_per_op: u64 = (snapshot_measure.lookup_avg_ms * 1000u64) / lookup_count as u64;
     fprintf(
         stderr,
-        "objects=%llu lookups=%llu payload_bytes=%llu prepare_ms=%llu pack_bytes=%llu index_bytes=%llu lookup_avg_ms=%llu lookup_us_per_op=%llu sink=%llu\n" as *byte,
+        "objects=%llu lookups=%llu payload_bytes=%llu prepare_ms=%llu pack_bytes=%llu index_bytes=%llu validated_lookup_avg_ms=%llu validated_lookup_us_per_op=%llu snapshot_read_avg_ms=%llu snapshot_lookup_avg_ms=%llu snapshot_lookup_us_per_op=%llu sink=%llu snapshot_sink=%llu\n" as *byte,
         object_count as u64,
         lookup_count as u64,
         payload_bytes as u64,
@@ -283,7 +363,11 @@ export fn main() i32 {
         index_bytes,
         lookup_measure.avg_ms,
         lookup_us_per_op,
+        snapshot_measure.read_avg_ms,
+        snapshot_measure.lookup_avg_ms,
+        snapshot_lookup_us_per_op,
         lookup_measure.sink,
+        snapshot_measure.sink,
     );
     return 0;
 }

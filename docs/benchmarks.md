@@ -272,6 +272,86 @@ Takeaways:
 - The randomish payload produced 7 content-defined chunks, so this run covers
   multi-chunk hashing and manifest reference construction as well as scanning.
 
+## 2026-05-31 Manifest Diff Scheduling
+
+This rerun revisits the 100k-entry flat diff hotspot after teaching
+`manifest_flat_diff_parallel` to make an explicit execution plan:
+
+- small full-tree diffs now short-circuit to the plain serial merge instead of
+  paying the old parallel count/setup overhead;
+- pathspec diffs first prune to matching top-level shards, then only walk those
+  shards serially when parallelism would not amortize its own setup.
+
+Command:
+
+```bash
+bash bench/bench_manifest_diff.sh 100000 100 4
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+
+Results:
+
+| entries | change_stride | workers | changed | serial_avg_ms | parallel_avg_ms | parallel_mode | parallel_shards | pathspec_avg_ms | pathspec_mode | pathspec_shards | pathspec_changed |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | ---: | ---: |
+| 100000 | 100 | 4 | 1000 | 55 | 56 | `serial` | 20 | 30 | `serial` | 1 | 50 |
+
+Takeaways:
+
+- The earlier `parallel diff slower than serial` result came from using the
+  parallel helper even when the workload was too small to amortize its
+  two-pass design and thread-pool setup.
+- For this 100k-entry sample, the helper now deliberately chooses `serial`, so
+  the "parallel" code path lands within noise of the direct serial baseline
+  instead of regressing from `55ms` to `137ms` as it did on `2026-05-30`.
+- Pathspec diff now prunes to the single matching top-level shard before diff
+  emission, which cuts this sample from `85ms` to `30ms`.
+
+## 2026-05-31 Segment Pack Lookup Snapshot
+
+This rerun keeps the old validated one-shot lookup measurement, but also
+measures the new reusable snapshot path:
+
+- `validated_lookup_*`: repeated `segment_pack_index_lookup`, which still reads
+  and validates the index sidecar and pack cross-reference every call;
+- `snapshot_*`: one validated `segment_pack_index_read`, followed by repeated
+  `segment_pack_index_lookup_snapshot` binary searches against that in-memory
+  snapshot.
+
+Command:
+
+```bash
+bash bench/bench_segment_pack_lookup.sh 2000 2000 128
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+
+Results:
+
+| objects | lookups | payload_bytes | prepare_ms | pack_bytes | index_bytes | validated_lookup_avg_ms | validated_lookup_us_per_op | snapshot_read_avg_ms | snapshot_lookup_avg_ms | snapshot_lookup_us_per_op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2000 | 2000 | 128 | 215 | 452112 | 128120 | 3518 | 1759 | 2 | 14 | 7 |
+
+Takeaways:
+
+- The original `segment pack lookup` result was slow because it measured the
+  fully validated path, not a hot reusable index probe. That explains the
+  ~`1.76ms/op` figure.
+- The codebase now exposes `segment_pack_index_lookup_snapshot`, so callers can
+  amortize validation: on this host, one validated snapshot read costs about
+  `2ms`, and steady-state lookup drops to about `7us/op`.
+- Integrity semantics stay explicit: the one-shot lookup still validates on
+  every call, while repeated lookup workloads now have a real fast path that
+  reuses an already verified snapshot instead of re-reading both sidecars.
+
 ## 2026-05-30 Hydrate
 
 This run measures restoring materialized files from the object store after a

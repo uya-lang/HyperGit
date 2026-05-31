@@ -14,9 +14,12 @@ use core.ids.ObjectId;
 use core.ids.PolicyId;
 use core.ids.object_id_from_hash;
 use core.ids.policy_id_from_object;
+use manifest.flat_diff.ManifestFlatDiffExecutionKind;
+use manifest.flat_diff.ManifestFlatDiffExecutionPlan;
 use manifest.flat_diff.ManifestFlatDiffEntryList;
 use manifest.flat_diff.manifest_flat_diff;
 use manifest.flat_diff.manifest_flat_diff_parallel;
+use manifest.flat_diff.manifest_flat_diff_parallel_plan;
 use manifest.query.ManifestPathspecList;
 use manifest.query.manifest_pathspec_list_from_slice;
 use manifest.trie.ManifestLeafInputEntry;
@@ -32,6 +35,7 @@ export const BENCH_MANIFEST_DIFF_USAGE_TEXT: &const byte =
 const BENCH_GROUP_COUNT: usize = 20 as usize;
 const BENCH_ITERATIONS: usize = 3 as usize;
 const BENCH_DIFF_ARENA_BYTES: usize = 67108864 as usize;
+const BENCH_PLAN_ARENA_OVERHEAD_BYTES: usize = 1048576 as usize;
 
 error BenchDiffAlloc;
 error BenchDiffParse;
@@ -293,6 +297,13 @@ fn bench_measure_parallel(
     return BenchDiffMeasure{ avg_ms: total_ms / BENCH_ITERATIONS as u64, changes: changes };
 }
 
+fn bench_plan_label(plan: &ManifestFlatDiffExecutionPlan) &const byte {
+    if plan.kind == ManifestFlatDiffExecutionKind.Parallel {
+        return "parallel" as &const byte;
+    }
+    return "serial" as &const byte;
+}
+
 export fn main() i32 {
     const argc: i32 = get_argc();
     if argc != 4 {
@@ -371,6 +382,37 @@ export fn main() i32 {
 
     const expected_all: usize = bench_count_all_changes(total_entries, change_stride);
     const expected_group: usize = bench_count_group_changes(total_entries, change_stride, target_group);
+    const plan_bytes: usize = total_entries * 128 as usize + BENCH_PLAN_ARENA_OVERHEAD_BYTES;
+    const plan_storage: &byte = malloc(plan_bytes) as &byte;
+    if plan_storage == null {
+        return 1;
+    }
+    defer {
+        free(plan_storage as &void);
+    }
+    var plan_arena: Arena = Arena{ buffer: plan_storage, size: 0, used: 0 };
+    arena_init(&plan_arena, plan_storage, plan_bytes);
+    const full_plan: ManifestFlatDiffExecutionPlan = manifest_flat_diff_parallel_plan(
+        &plan_arena,
+        &left,
+        &right,
+        manifest_pathspec_list_from_slice(no_specs[0: 0]),
+        workers,
+    ) catch |err| {
+        fprintf(stderr, "full_plan_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
+    arena_init(&plan_arena, plan_storage, plan_bytes);
+    const pathspec_plan: ManifestFlatDiffExecutionPlan = manifest_flat_diff_parallel_plan(
+        &plan_arena,
+        &left,
+        &right,
+        manifest_pathspec_list_from_slice(specs[0: 1]),
+        workers,
+    ) catch |err| {
+        fprintf(stderr, "pathspec_plan_error=%u\n" as *byte, @error_id(err));
+        return 1;
+    };
 
     const serial_measure: BenchDiffMeasure = bench_measure_serial(
         &left,
@@ -404,14 +446,18 @@ export fn main() i32 {
 
     fprintf(
         stderr,
-        "entries=%llu change_stride=%llu workers=%d changed=%llu serial_avg_ms=%llu parallel_avg_ms=%llu pathspec_avg_ms=%llu pathspec_changed=%llu\n" as *byte,
+        "entries=%llu change_stride=%llu workers=%d changed=%llu serial_avg_ms=%llu parallel_avg_ms=%llu parallel_mode=%s parallel_shards=%llu pathspec_avg_ms=%llu pathspec_mode=%s pathspec_shards=%llu pathspec_changed=%llu\n" as *byte,
         total_entries as u64,
         change_stride as u64,
         workers,
         serial_measure.changes as u64,
         serial_measure.avg_ms,
         parallel_measure.avg_ms,
+        bench_plan_label(&full_plan) as *byte,
+        full_plan.matched_shards as u64,
         pathspec_measure.avg_ms,
+        bench_plan_label(&pathspec_plan) as *byte,
+        pathspec_plan.matched_shards as u64,
         pathspec_measure.changes as u64,
     );
     return 0;
