@@ -1,0 +1,226 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use manifest.path.manifest_path_compare;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use core.ids.ObjectId;
+use object.types.ByteList;
+use core.ids.PolicyId;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
+
+error VfsAlloc;
+
+export enum VfsProviderKind {
+    UserSpace,
+    FuseLinux,
+    PlatformNative
+}
+
+export enum VfsPlaceholderState {
+    VirtualOnly,
+    Materialized,
+    DirtyMaterialized
+}
+
+export struct VfsPlaceholderEntry {
+    path: ByteList,
+    object_id: ObjectId,
+    logical_size: u64,
+    policy_id: PolicyId,
+    state: VfsPlaceholderState
+}
+
+export struct VfsPlaceholderEntryList {
+    ptr: &VfsPlaceholderEntry,
+    len: usize
+}
+
+export fn vfs_placeholder_entry_list_from_slice(slice: &[VfsPlaceholderEntry]) VfsPlaceholderEntryList {
+    return VfsPlaceholderEntryList{ ptr: slice.ptr, len: slice.len };
+}
+
+export enum VfsMaterializationRequestKind {
+    Materialize,
+    Dehydrate
+}
+
+export struct VfsMaterializationRequest {
+    kind: VfsMaterializationRequestKind,
+    path: ByteList,
+    object_id: ObjectId,
+    logical_size: u64,
+    policy_id: PolicyId
+}
+
+export struct VfsMaterializationRequestList {
+    ptr: &VfsMaterializationRequest,
+    len: usize
+}
+
+export fn vfs_materialization_request_list_from_slice(slice: &[VfsMaterializationRequest]) VfsMaterializationRequestList {
+    return VfsMaterializationRequestList{ ptr: slice.ptr, len: slice.len };
+}
+
+fn vfs_find_local_change(changes: &LocalChangeList, path: &ByteList) &LocalChange {
+    var low: usize = 0 as usize;
+    var high: usize = changes.len;
+    while low < high {
+        const mid: usize = low + ((high - low) / 2 as usize);
+        const cmp: i32 = manifest_path_compare(&changes.ptr[mid].path, path);
+        if cmp < 0 {
+            low = mid + 1 as usize;
+        } else {
+            high = mid;
+        }
+    }
+    if low < changes.len && manifest_path_compare(&changes.ptr[low].path, path) == 0 {
+        return &changes.ptr[low];
+    }
+    return null as &LocalChange;
+}
+
+fn vfs_find_manifest_input(inputs: &ManifestLeafInputList, path: &ByteList) &ManifestLeafInputEntry {
+    var low: usize = 0 as usize;
+    var high: usize = inputs.len;
+    while low < high {
+        const mid: usize = low + ((high - low) / 2 as usize);
+        const cmp: i32 = manifest_path_compare(&inputs.ptr[mid].path, path);
+        if cmp < 0 {
+            low = mid + 1 as usize;
+        } else {
+            high = mid;
+        }
+    }
+    if low < inputs.len && manifest_path_compare(&inputs.ptr[low].path, path) == 0 {
+        return &inputs.ptr[low];
+    }
+    return null as &ManifestLeafInputEntry;
+}
+
+fn vfs_placeholder_state_for_path(materialized: bool, change: &LocalChange) VfsPlaceholderState {
+    if !materialized {
+        return VfsPlaceholderState.VirtualOnly;
+    }
+    if change == null || change.status == ChangeStatus.Materialized {
+        return VfsPlaceholderState.Materialized;
+    }
+    return VfsPlaceholderState.DirtyMaterialized;
+}
+
+export fn vfs_plan_placeholders(
+    arena: &Arena,
+    full_inputs: &ManifestLeafInputList,
+    materialized_inputs: &ManifestLeafInputList,
+    local_changes: &LocalChangeList,
+) !VfsPlaceholderEntryList {
+    if full_inputs.len == 0 as usize {
+        return VfsPlaceholderEntryList{ ptr: null, len: 0 as usize };
+    }
+    const raw_entries: &VfsPlaceholderEntry = arena_alloc(
+        arena,
+        @size_of(VfsPlaceholderEntry) as usize * full_inputs.len,
+    ) as &VfsPlaceholderEntry;
+    if raw_entries == null {
+        return error.VfsAlloc;
+    }
+
+    var i: usize = 0 as usize;
+    while i < full_inputs.len {
+        const input: &ManifestLeafInputEntry = &full_inputs.ptr[i];
+        const materialized_entry: &ManifestLeafInputEntry = vfs_find_manifest_input(materialized_inputs, &input.path);
+        const change: &LocalChange = vfs_find_local_change(local_changes, &input.path);
+        raw_entries[i] = VfsPlaceholderEntry{
+            path: ByteList{ ptr: input.path.ptr, len: input.path.len },
+            object_id: input.object_id,
+            logical_size: input.logical_size,
+            policy_id: input.policy_id,
+            state: vfs_placeholder_state_for_path(materialized_entry != null, change),
+        };
+        i = i + 1 as usize;
+    }
+    return VfsPlaceholderEntryList{ ptr: raw_entries, len: full_inputs.len };
+}
+
+export fn vfs_plan_materialization_requests(
+    arena: &Arena,
+    current_materialized: &ManifestLeafInputList,
+    target_materialized: &ManifestLeafInputList,
+) !VfsMaterializationRequestList {
+    const max_len: usize = current_materialized.len + target_materialized.len;
+    if max_len == 0 as usize {
+        return VfsMaterializationRequestList{ ptr: null, len: 0 as usize };
+    }
+    const raw_requests: &VfsMaterializationRequest = arena_alloc(
+        arena,
+        @size_of(VfsMaterializationRequest) as usize * max_len,
+    ) as &VfsMaterializationRequest;
+    if raw_requests == null {
+        return error.VfsAlloc;
+    }
+
+    var current_index: usize = 0 as usize;
+    var target_index: usize = 0 as usize;
+    var out_index: usize = 0 as usize;
+    while current_index < current_materialized.len && target_index < target_materialized.len {
+        const current_entry: &ManifestLeafInputEntry = &current_materialized.ptr[current_index];
+        const target_entry: &ManifestLeafInputEntry = &target_materialized.ptr[target_index];
+        const cmp: i32 = manifest_path_compare(&current_entry.path, &target_entry.path);
+        if cmp < 0 {
+            raw_requests[out_index] = VfsMaterializationRequest{
+                kind: VfsMaterializationRequestKind.Dehydrate,
+                path: ByteList{ ptr: current_entry.path.ptr, len: current_entry.path.len },
+                object_id: current_entry.object_id,
+                logical_size: current_entry.logical_size,
+                policy_id: current_entry.policy_id,
+            };
+            out_index = out_index + 1 as usize;
+            current_index = current_index + 1 as usize;
+            continue;
+        }
+        if cmp > 0 {
+            raw_requests[out_index] = VfsMaterializationRequest{
+                kind: VfsMaterializationRequestKind.Materialize,
+                path: ByteList{ ptr: target_entry.path.ptr, len: target_entry.path.len },
+                object_id: target_entry.object_id,
+                logical_size: target_entry.logical_size,
+                policy_id: target_entry.policy_id,
+            };
+            out_index = out_index + 1 as usize;
+            target_index = target_index + 1 as usize;
+            continue;
+        }
+        current_index = current_index + 1 as usize;
+        target_index = target_index + 1 as usize;
+    }
+
+    while current_index < current_materialized.len {
+        const current_entry: &ManifestLeafInputEntry = &current_materialized.ptr[current_index];
+        raw_requests[out_index] = VfsMaterializationRequest{
+            kind: VfsMaterializationRequestKind.Dehydrate,
+            path: ByteList{ ptr: current_entry.path.ptr, len: current_entry.path.len },
+            object_id: current_entry.object_id,
+            logical_size: current_entry.logical_size,
+            policy_id: current_entry.policy_id,
+        };
+        out_index = out_index + 1 as usize;
+        current_index = current_index + 1 as usize;
+    }
+
+    while target_index < target_materialized.len {
+        const target_entry: &ManifestLeafInputEntry = &target_materialized.ptr[target_index];
+        raw_requests[out_index] = VfsMaterializationRequest{
+            kind: VfsMaterializationRequestKind.Materialize,
+            path: ByteList{ ptr: target_entry.path.ptr, len: target_entry.path.len },
+            object_id: target_entry.object_id,
+            logical_size: target_entry.logical_size,
+            policy_id: target_entry.policy_id,
+        };
+        out_index = out_index + 1 as usize;
+        target_index = target_index + 1 as usize;
+    }
+
+    return VfsMaterializationRequestList{ ptr: raw_requests, len: out_index };
+}

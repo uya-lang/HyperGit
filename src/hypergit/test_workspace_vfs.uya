@@ -1,0 +1,176 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use core.ids.Hash32;
+use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use manifest.trie.ManifestLeafInputEntry;
+use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ByteList;
+use object.types.ContentType;
+use object.types.EntryKind;
+use workspace.state.ChangeStatus;
+use workspace.state.LocalChange;
+use workspace.state.LocalChangeList;
+use workspace.state.local_change_list_from_slice;
+use workspace.vfs.VfsMaterializationRequestKind;
+use workspace.vfs.VfsMaterializationRequestList;
+use workspace.vfs.VfsPlaceholderEntryList;
+use workspace.vfs.VfsPlaceholderState;
+use workspace.vfs.vfs_plan_materialization_requests;
+use workspace.vfs.vfs_plan_placeholders;
+
+fn make_hash(seed: byte) Hash32 {
+    var hash: Hash32 = Hash32{ bytes: [] };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        hash.bytes[i] = seed + i as byte;
+        i = i + 1 as usize;
+    }
+    return hash;
+}
+
+fn test_vfs_plan_placeholders_tracks_virtual_materialized_and_dirty() !void {
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    var alpha_path: [byte: 9] = ['a' as byte, 'l' as byte, 'p' as byte, 'h' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var beta_path: [byte: 8] = ['b' as byte, 'e' as byte, 't' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var gamma_path: [byte: 9] = ['g' as byte, 'a' as byte, 'm' as byte, 'm' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+
+    var full_inputs: [ManifestLeafInputEntry: 3] = [
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: alpha_path[0: 9].ptr, len: 9 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: object_id_from_hash(make_hash(1 as byte)),
+            logical_size: 5u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(2 as byte))),
+        },
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: beta_path[0: 8].ptr, len: 8 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: object_id_from_hash(make_hash(3 as byte)),
+            logical_size: 4u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(4 as byte))),
+        },
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: gamma_path[0: 9].ptr, len: 9 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: object_id_from_hash(make_hash(5 as byte)),
+            logical_size: 5u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(6 as byte))),
+        },
+    ];
+    var materialized_inputs: [ManifestLeafInputEntry: 2] = [full_inputs[0], full_inputs[1]];
+    var local_changes: [LocalChange: 2] = [
+        LocalChange{
+            path: ByteList{ ptr: alpha_path[0: 9].ptr, len: 9 as usize },
+            base_object: full_inputs[0].object_id,
+            working_hash: make_hash(7 as byte),
+            status: ChangeStatus.Materialized,
+            last_seen_inode: 0u64,
+            last_seen_mtime_ns: 0i64,
+            last_seen_logical_size: 5u64,
+            watcher_seq: 0u64,
+            reconcile_epoch: 0u64,
+        },
+        LocalChange{
+            path: ByteList{ ptr: beta_path[0: 8].ptr, len: 8 as usize },
+            base_object: full_inputs[1].object_id,
+            working_hash: make_hash(8 as byte),
+            status: ChangeStatus.Modified,
+            last_seen_inode: 0u64,
+            last_seen_mtime_ns: 0i64,
+            last_seen_logical_size: 4u64,
+            watcher_seq: 0u64,
+            reconcile_epoch: 0u64,
+        },
+    ];
+
+    const full_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(full_inputs[0: 3]);
+    const materialized_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(materialized_inputs[0: 2]);
+    const change_list: LocalChangeList = local_change_list_from_slice(local_changes[0: 2]);
+    const placeholders: VfsPlaceholderEntryList = try vfs_plan_placeholders(
+        &arena,
+        &full_list,
+        &materialized_list,
+        &change_list,
+    );
+    try expect(placeholders.len == 3 as usize);
+    try expect(placeholders.ptr[0].state == VfsPlaceholderState.Materialized);
+    try expect(placeholders.ptr[1].state == VfsPlaceholderState.DirtyMaterialized);
+    try expect(placeholders.ptr[2].state == VfsPlaceholderState.VirtualOnly);
+}
+
+fn test_vfs_plan_materialization_requests_tracks_materialize_and_dehydrate() !void {
+    var arena_buf: [byte: 16384] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 16384 as usize);
+
+    var alpha_path: [byte: 9] = ['a' as byte, 'l' as byte, 'p' as byte, 'h' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var beta_path: [byte: 8] = ['b' as byte, 'e' as byte, 't' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+    var gamma_path: [byte: 9] = ['g' as byte, 'a' as byte, 'm' as byte, 'm' as byte, 'a' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte];
+
+    var current_materialized: [ManifestLeafInputEntry: 2] = [
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: alpha_path[0: 9].ptr, len: 9 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: object_id_from_hash(make_hash(10 as byte)),
+            logical_size: 5u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(11 as byte))),
+        },
+        ManifestLeafInputEntry{
+            path: ByteList{ ptr: beta_path[0: 8].ptr, len: 8 as usize },
+            kind: EntryKind.File,
+            mode: 33188u32,
+            object_id: object_id_from_hash(make_hash(12 as byte)),
+            logical_size: 4u64,
+            content_type: ContentType.Unknown,
+            policy_id: policy_id_from_object(object_id_from_hash(make_hash(13 as byte))),
+        },
+    ];
+    var target_materialized: [ManifestLeafInputEntry: 2] = [current_materialized[0], ManifestLeafInputEntry{
+        path: ByteList{ ptr: gamma_path[0: 9].ptr, len: 9 as usize },
+        kind: EntryKind.File,
+        mode: 33188u32,
+        object_id: object_id_from_hash(make_hash(14 as byte)),
+        logical_size: 5u64,
+        content_type: ContentType.Unknown,
+        policy_id: policy_id_from_object(object_id_from_hash(make_hash(15 as byte))),
+    }];
+
+    const current_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(current_materialized[0: 2]);
+    const target_list: ManifestLeafInputList = manifest_leaf_input_list_from_slice(target_materialized[0: 2]);
+    const requests: VfsMaterializationRequestList = try vfs_plan_materialization_requests(
+        &arena,
+        &current_list,
+        &target_list,
+    );
+    try expect(requests.len == 2 as usize);
+    try expect(requests.ptr[0].kind == VfsMaterializationRequestKind.Dehydrate);
+    try expect(requests.ptr[0].path.ptr[0] == 'b' as byte);
+    try expect(requests.ptr[1].kind == VfsMaterializationRequestKind.Materialize);
+    try expect(requests.ptr[1].path.ptr[0] == 'g' as byte);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Workspace VFS Tests");
+    run_test("vfs plan placeholders tracks virtual materialized and dirty", test_vfs_plan_placeholders_tracks_virtual_materialized_and_dirty);
+    run_test("vfs plan materialization requests tracks materialize and dehydrate", test_vfs_plan_materialization_requests_tracks_materialize_and_dehydrate);
+    return test_suite_end();
+}
