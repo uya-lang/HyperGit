@@ -13,6 +13,9 @@ use core.ids.Hash32;
 use core.ids.ObjectId;
 use core.ids.BlobId;
 use core.ids.object_id_compare;
+use core.ids.PolicyId;
+use core.ids.policy_id_compare;
+use core.ids.policy_id_decode_hex;
 use manifest.load.manifest_load_flatten;
 use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
@@ -67,6 +70,10 @@ fn expected_small_blob_object_id(arena: &Arena, text: &const byte) !ObjectId {
     return blob_id.id;
 }
 
+fn expected_policy_id(hex: &const byte) !PolicyId {
+    return try policy_id_decode_hex(literal_bytes(hex));
+}
+
 fn test_partial_stage_commit_keeps_unstaged_paths_from_base() !void {
     try expect(system("rm -rf build/commit-partial-stage && mkdir -p build/commit-partial-stage/repo build/commit-partial-stage/bin") == 0);
     try expect(system("$HOME/uya/uya/bin/uya build src/hgx/main.uya -o build/commit-partial-stage/bin/hgx >/dev/null 2>&1") == 0);
@@ -113,8 +120,55 @@ fn test_partial_stage_commit_keeps_unstaged_paths_from_base() !void {
     try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
 }
 
+fn test_partial_stage_commit_refreshes_policy_for_restaged_paths() !void {
+    try expect(system("rm -rf build/commit-policy-stage && mkdir -p build/commit-policy-stage/repo build/commit-policy-stage/bin") == 0);
+    try expect(system("$HOME/uya/uya/bin/uya build src/hgx/main.uya -o build/commit-policy-stage/bin/hgx >/dev/null 2>&1") == 0);
+    try expect(system("cd build/commit-policy-stage/repo && ../bin/hgx init >/dev/null 2>&1 && cat > .hgit/policy.json <<'EOF'\n{\"version\":1,\"rules\":[{\"pathspec\":\"src\",\"policy_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"dedupe_scope\":\"repository\",\"audit\":\"enabled\",\"cache_ttl_secs\":60},{\"pathspec\":\"docs\",\"policy_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"dedupe_scope\":\"repository\",\"audit\":\"disabled\",\"cache_ttl_secs\":60}]}\nEOF\nmkdir -p src docs && printf one >src/main.uya && printf readme >docs/readme.md && ../bin/hgx add src docs >/dev/null 2>&1 && HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' ../bin/hgx commit -m first >/dev/null 2>&1 && cat > .hgit/policy.json <<'EOF'\n{\"version\":1,\"rules\":[{\"pathspec\":\"src\",\"policy_id\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"dedupe_scope\":\"repository\",\"audit\":\"enabled\",\"cache_ttl_secs\":60},{\"pathspec\":\"docs\",\"policy_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"dedupe_scope\":\"repository\",\"audit\":\"disabled\",\"cache_ttl_secs\":60}]}\nEOF\nprintf two >src/main.uya && printf updated-readme >docs/readme.md && ../bin/hgx add src >/dev/null 2>&1 && HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' ../bin/hgx commit -m second >/dev/null 2>&1") == 0);
+
+    const original_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("build/commit-policy-stage/repo") == 0);
+
+    const root: RepoPath = try repo_find_root_from_cwd();
+    const config: RepoConfig = try repo_read_config(&root);
+    const head_commit: CommitId = try repo_read_head_commit(&root, &config);
+    const store: LooseObjectStore = try loose_store_open(".hgit/objects/loose");
+
+    var arena_buf: [byte: 33554432] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 33554432 as usize);
+
+    const object_bytes: ObjectBytes = try store.get(head_commit.id, &arena);
+    var offset: usize = 0 as usize;
+    const payload: CommitPayload = try decode_commit_object(&arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    const manifest_entries: ManifestLeafInputList = try manifest_load_flatten(&arena, &store, &payload.manifest_root);
+    try expect(manifest_entries.len == 2 as usize);
+
+    const src_policy: PolicyId = try expected_policy_id("3333333333333333333333333333333333333333333333333333333333333333");
+    const docs_policy: PolicyId = try expected_policy_id("2222222222222222222222222222222222222222222222222222222222222222");
+
+    var saw_main: bool = false;
+    var saw_docs: bool = false;
+    var i: usize = 0 as usize;
+    while i < manifest_entries.len {
+        const entry: &ManifestLeafInputEntry = &manifest_entries.ptr[i];
+        if byte_list_equal(&entry.path, literal_bytes("src/main.uya")) {
+            saw_main = true;
+            try expect(policy_id_compare(&entry.policy_id, &src_policy) == 0);
+        } else if byte_list_equal(&entry.path, literal_bytes("docs/readme.md")) {
+            saw_docs = true;
+            try expect(policy_id_compare(&entry.policy_id, &docs_policy) == 0);
+        }
+        i = i + 1 as usize;
+    }
+    try expect(saw_main);
+    try expect(saw_docs);
+
+    try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Partial Stage Commit Tests");
     run_test("partial stage commit keeps unstaged paths from base", test_partial_stage_commit_keeps_unstaged_paths_from_base);
+    run_test("partial stage commit refreshes policy for restaged paths", test_partial_stage_commit_refreshes_policy_for_restaged_paths);
     return test_suite_end();
 }

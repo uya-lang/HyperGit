@@ -44,8 +44,10 @@ use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.HASH32_BYTES;
 use core.ids.ObjectId;
+use core.ids.PolicyId;
 use core.ids.commit_id_from_object;
 use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
 use object.types.ByteList;
 use workspace.stage.StageEntry;
 use workspace.stage.StageEntryKind;
@@ -56,9 +58,10 @@ use workspace.stage.stage_empty_snapshot;
 use workspace.stage.stage_entry_list_from_slice;
 use workspace.stage.stage_snapshot_init;
 use workspace.stage.stage_state_with_entry_count;
+use workspace.stage.stage_zero_policy_id;
 
 export const STAGE_FILE_MAGIC: u32 = 0x31475348u32;
-export const STAGE_FILE_VERSION: u16 = 1u16;
+export const STAGE_FILE_VERSION: u16 = 2u16;
 const STAGE_FILE_FLAGS: u16 = 0u16;
 const STAGE_FILE_HEADER_BYTES: usize = 56 as usize;
 const STAGE_FILE_LOCK_PID_MAX_BYTES: usize = 32 as usize;
@@ -151,6 +154,20 @@ fn stage_file_decode_object_id(input: &[byte], offset: &usize) !ObjectId {
     return object_id_from_hash(try stage_file_decode_hash32(input, offset));
 }
 
+fn stage_file_encode_policy_id(output: &[byte], offset: &usize, value: &PolicyId) !void {
+    return stage_file_encode_object_id(output, offset, &value.id);
+}
+
+fn stage_file_decode_policy_id(input: &[byte], offset: &usize) !PolicyId {
+    return policy_id_from_object(try stage_file_decode_object_id(input, offset));
+}
+
+fn stage_file_clone_policy_id(value: &PolicyId) PolicyId {
+    return PolicyId{
+        id: ObjectId{ hash: value.id.hash },
+    };
+}
+
 fn stage_file_encode_commit_id(output: &[byte], offset: &usize, value: &CommitId) !void {
     return stage_file_encode_object_id(output, offset, &value.id);
 }
@@ -166,7 +183,9 @@ fn stage_entry_encoded_len(entry: &StageEntry) usize {
         HASH32_BYTES +
         1 as usize +
         HASH32_BYTES +
-        4 as usize;
+        4 as usize +
+        HASH32_BYTES +
+        1 as usize;
 }
 
 fn stage_snapshot_encoded_len(snapshot: &StageSnapshot) !usize {
@@ -436,6 +455,12 @@ export fn stage_file_write(path: &const byte, snapshot: &StageSnapshot) !void {
         }
         try stage_file_encode_object_id(output, &offset, &entry.staged_object);
         try codec_encode_u32(output, &offset, entry.file_mode);
+        try stage_file_encode_policy_id(output, &offset, &entry.policy_id);
+        if entry.audit_enabled {
+            try codec_encode_u8(output, &offset, 1 as byte);
+        } else {
+            try codec_encode_u8(output, &offset, 0 as byte);
+        }
         i = i + 1 as usize;
     }
 
@@ -485,7 +510,8 @@ export fn stage_file_read(path: &const byte, arena: &Arena) !StageSnapshot {
     if try codec_decode_u32(input, &offset) != STAGE_FILE_MAGIC {
         return error.StageFileInvalid;
     }
-    if try codec_decode_u16(input, &offset) != STAGE_FILE_VERSION {
+    const version: u16 = try codec_decode_u16(input, &offset);
+    if version != 1 as u16 && version != STAGE_FILE_VERSION {
         return error.StageFileInvalid;
     }
     if try codec_decode_u16(input, &offset) != STAGE_FILE_FLAGS {
@@ -515,6 +541,12 @@ export fn stage_file_read(path: &const byte, arena: &Arena) !StageSnapshot {
         const has_staged_object: bool = (try codec_decode_u8(input, &offset)) != 0 as byte;
         const staged_object: ObjectId = try stage_file_decode_object_id(input, &offset);
         const file_mode: u32 = try codec_decode_u32(input, &offset);
+        var policy_id: PolicyId = stage_zero_policy_id();
+        var audit_enabled: bool = false;
+        if version >= 2 as u16 {
+            policy_id = try stage_file_decode_policy_id(input, &offset);
+            audit_enabled = (try codec_decode_u8(input, &offset)) != 0 as byte;
+        }
         if raw_entries == null {
             return error.StageFileInvalid;
         }
@@ -525,6 +557,8 @@ export fn stage_file_read(path: &const byte, arena: &Arena) !StageSnapshot {
             has_staged_object: has_staged_object,
             staged_object: ObjectId{ hash: staged_object.hash },
             file_mode: file_mode,
+            policy_id: stage_file_clone_policy_id(&policy_id),
+            audit_enabled: audit_enabled,
         };
         i = i + 1 as usize;
     }

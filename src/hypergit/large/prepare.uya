@@ -15,11 +15,15 @@ use libc.malloc;
 use core.parallel.parallel_default_requested_workers;
 use core.parallel.parallel_worker_count;
 use core.ids.ObjectId;
+use core.ids.PolicyId;
+use core.policy.experimental_dedupe_scope;
+use core.policy.experimental_policy_id;
 use large.chunk_hash.ChunkHashes;
 use large.chunk_hash.chunk_hash_plain;
 use large.chunk_manifest.ChunkedBlobPart;
 use large.chunk_manifest.ChunkedBlobPartList;
 use large.chunk_manifest.chunked_blob_part_list_from_slice;
+use large.chunk_manifest.chunked_blob_payload_from_parts;
 use large.chunk_manifest.chunked_blob_payload_repository_default;
 use large.chunker.CDC_CHUNK_BYTES_MIN;
 use large.chunker.LargeChunk;
@@ -29,6 +33,7 @@ use large.chunker.fixed_chunk_count;
 use object.hash.hash_chunked_blob_payload;
 use object.types.ChunkedBlobPayload;
 use object.types.ChunkingStrategy;
+use object.types.DedupeScope;
 use object.types.FileType;
 use object.types.StorageTier;
 
@@ -220,6 +225,8 @@ export fn prepare_chunked_blob_repository_with_workers(
     logical_bytes: &[byte],
     file_type: FileType,
     worker_count: i32,
+    encryption_profile: PolicyId,
+    dedupe_scope: DedupeScope,
 ) !LargePreparedChunkedBlob {
     _ = worker_count;
     const chunks: LargeChunkList = try cdc_chunk_bytes_default(arena, logical_bytes);
@@ -232,12 +239,15 @@ export fn prepare_chunked_blob_repository_with_workers(
     }
 
     const parts: ChunkedBlobPartList = chunked_blob_part_list_from_slice(raw_parts);
-    const payload: ChunkedBlobPayload = try chunked_blob_payload_repository_default(
+    const payload: ChunkedBlobPayload = try chunked_blob_payload_from_parts(
         arena,
         logical_bytes,
         file_type,
         ChunkingStrategy.ContentDefined,
-        parts);
+        parts,
+        encryption_profile,
+        dedupe_scope,
+    );
     return LargePreparedChunkedBlob{
         payload: payload,
         parts: parts,
@@ -250,27 +260,14 @@ export fn prepare_chunked_blob_repository_default(
     logical_bytes: &[byte],
     file_type: FileType,
 ) !LargePreparedChunkedBlob {
-    const chunks: LargeChunkList = try cdc_chunk_bytes_default(arena, logical_bytes);
-    const raw_parts: &[ChunkedBlobPart] = try large_prepare_alloc_parts(arena, chunks.len);
-
-    var i: usize = 0 as usize;
-    while i < chunks.len {
-        raw_parts.ptr[i] = try large_prepare_part_from_chunk(arena, &chunks.ptr[i]);
-        i = i + 1 as usize;
-    }
-
-    const parts: ChunkedBlobPartList = chunked_blob_part_list_from_slice(raw_parts);
-    const payload: ChunkedBlobPayload = try chunked_blob_payload_repository_default(
+    return try prepare_chunked_blob_repository_with_workers(
         arena,
         logical_bytes,
         file_type,
-        ChunkingStrategy.ContentDefined,
-        parts);
-    return LargePreparedChunkedBlob{
-        payload: payload,
-        parts: parts,
-        chunks: chunks,
-    };
+        1,
+        experimental_policy_id(),
+        experimental_dedupe_scope(),
+    );
 }
 
 export fn prepare_chunked_blob_repository_parallel_default(
@@ -283,6 +280,25 @@ export fn prepare_chunked_blob_repository_parallel_default(
         logical_bytes,
         file_type,
         large_prepare_default_requested_workers(),
+        experimental_policy_id(),
+        experimental_dedupe_scope(),
+    );
+}
+
+export fn prepare_chunked_blob_repository_parallel_with_metadata(
+    arena: &Arena,
+    logical_bytes: &[byte],
+    file_type: FileType,
+    encryption_profile: PolicyId,
+    dedupe_scope: DedupeScope,
+) !LargePreparedChunkedBlob {
+    return try prepare_chunked_blob_repository_with_workers(
+        arena,
+        logical_bytes,
+        file_type,
+        large_prepare_default_requested_workers(),
+        encryption_profile,
+        dedupe_scope,
     );
 }
 
@@ -292,7 +308,14 @@ export fn prepare_chunked_blob_object_id_with_workers(
     file_type: FileType,
     worker_count: i32,
 ) !ObjectId {
-    const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_with_workers(arena, logical_bytes, file_type, worker_count);
+    const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_with_workers(
+        arena,
+        logical_bytes,
+        file_type,
+        worker_count,
+        experimental_policy_id(),
+        experimental_dedupe_scope(),
+    );
     return (try hash_chunked_blob_payload(arena, &prepared.payload)).id;
 }
 
@@ -316,4 +339,21 @@ export fn prepare_chunked_blob_object_id_parallel_default(
         file_type,
         large_prepare_default_requested_workers(),
     );
+}
+
+export fn prepare_chunked_blob_object_id_parallel_with_metadata(
+    arena: &Arena,
+    logical_bytes: &[byte],
+    file_type: FileType,
+    encryption_profile: PolicyId,
+    dedupe_scope: DedupeScope,
+) !ObjectId {
+    const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_parallel_with_metadata(
+        arena,
+        logical_bytes,
+        file_type,
+        encryption_profile,
+        dedupe_scope,
+    );
+    return (try hash_chunked_blob_payload(arena, &prepared.payload)).id;
 }

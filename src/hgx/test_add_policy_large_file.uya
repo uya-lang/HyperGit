@@ -1,0 +1,79 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.chdir;
+use libc.free;
+use libc.malloc;
+use libc.system;
+use core.ids.PolicyId;
+use core.ids.policy_id_compare;
+use core.ids.policy_id_decode_hex;
+use object.codec.decode_chunked_blob_object;
+use object.types.ChunkedBlobPayload;
+use object.types.DedupeScope;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.repo_layout.RepoPath;
+use store.repo_layout.repo_current_dir;
+use store.repo_layout.repo_find_root_from_cwd;
+use store.repo_layout.repo_path_cstr;
+use workspace.stage.StageSnapshot;
+use workspace.stage_file.stage_file_read;
+
+fn literal_bytes(text: &const byte) &[byte] {
+    return (text as &byte)[0: strlen(text)];
+}
+
+fn expected_policy_id(hex: &const byte) !PolicyId {
+    return try policy_id_decode_hex(literal_bytes(hex));
+}
+
+fn test_add_large_file_applies_policy_to_stage_and_chunked_blob() !void {
+    try expect(system("rm -rf build/add-large-policy && mkdir -p build/add-large-policy/repo build/add-large-policy/bin") == 0);
+    try expect(system("$HOME/uya/uya/bin/uya build src/hgx/main.uya -o build/add-large-policy/bin/hgx >/dev/null 2>&1") == 0);
+    try expect(system("cd build/add-large-policy/repo && ../bin/hgx init >/dev/null 2>&1 && cat > .hgit/policy.json <<'EOF'\n{\"version\":1,\"rules\":[{\"pathspec\":\"big.bin\",\"policy_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"dedupe_scope\":\"global\",\"audit\":\"enabled\",\"cache_ttl_secs\":120}]}\nEOF\npython3 -c \"from pathlib import Path; p=Path('big.bin'); chunk=b'abcd1234'*131072; f=p.open('wb'); [f.write(chunk) for _ in range(9)]; f.close()\" && ../bin/hgx add big.bin >/dev/null 2>&1") == 0);
+
+    const original_cwd: RepoPath = try repo_current_dir();
+    try expect(chdir("build/add-large-policy/repo") == 0);
+
+    const arena_bytes: usize = 67108864 as usize;
+    const arena_buf: &byte = malloc(arena_bytes) as &byte;
+    try expect(arena_buf != null);
+    defer {
+        free(arena_buf as &void);
+    }
+    var arena: Arena = Arena{ buffer: arena_buf, size: 0, used: 0 };
+    arena_init(&arena, arena_buf, arena_bytes);
+
+    const snapshot: StageSnapshot = try stage_file_read(".hgit/workspace/stage.hgi", &arena);
+    try expect(snapshot.entries.len == 1 as usize);
+    try expect(snapshot.entries.ptr[0].audit_enabled);
+
+    const policy_id: PolicyId = try expected_policy_id("4444444444444444444444444444444444444444444444444444444444444444");
+    try expect(policy_id_compare(&snapshot.entries.ptr[0].policy_id, &policy_id) == 0);
+
+    const root: RepoPath = try repo_find_root_from_cwd();
+    _ = root;
+    const store: LooseObjectStore = try loose_store_open(".hgit/objects/loose");
+    const object_bytes: ObjectBytes = try store.get(snapshot.entries.ptr[0].staged_object, &arena);
+    var offset: usize = 0 as usize;
+    const payload: ChunkedBlobPayload = try decode_chunked_blob_object(&arena, object_bytes.bytes.ptr[0: object_bytes.bytes.len], &offset);
+    try expect(offset == object_bytes.bytes.len);
+    try expect(policy_id_compare(&payload.encryption_profile, &policy_id) == 0);
+    try expect(payload.dedupe_scope == DedupeScope.Global);
+
+    try expect(chdir(repo_path_cstr(&original_cwd) as &const byte) == 0);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Add Policy Large File Tests");
+    run_test("add large file applies policy to stage and chunked blob", test_add_large_file_applies_policy_to_stage_and_chunked_blob);
+    return test_suite_end();
+}

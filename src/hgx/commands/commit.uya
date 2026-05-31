@@ -22,12 +22,13 @@ use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.ManifestId;
 use core.ids.ObjectId;
+use core.ids.PolicyId;
 use core.ids.commit_id_compare;
 use core.ids.hash32_compare;
 use core.ids.manifest_id_from_object;
 use core.ids.object_id_compare;
 use core.ids.object_id_from_hash;
-use core.policy.experimental_policy_id;
+use core.ids.policy_id_compare;
 use index.commit_graph.CommitGraphEntryList;
 use index.commit_graph.CommitGraphPathList;
 use index.commit_graph.commit_graph_changed_path_bloom_build;
@@ -103,6 +104,7 @@ use workspace.stage.stage_entry_has_staged_content;
 use workspace.stage.stage_snapshot_init;
 use workspace.stage.stage_state_with_entry_count;
 use workspace.stage.stage_zero_commit_id;
+use workspace.stage.stage_zero_policy_id;
 use workspace.stage_file.StageFileLock;
 use workspace.stage_file.stage_file_lock_acquire;
 use workspace.stage_file.stage_file_lock_release;
@@ -368,6 +370,12 @@ fn commit_clone_byte_list(value: &ByteList) ByteList {
     return ByteList{ ptr: value.ptr, len: value.len };
 }
 
+fn commit_clone_policy_id(value: &PolicyId) PolicyId {
+    return PolicyId{
+        id: ObjectId{ hash: value.id.hash },
+    };
+}
+
 fn commit_byte_list_equal(left: &ByteList, right: &ByteList) bool {
     if left.len != right.len {
         return false;
@@ -627,6 +635,10 @@ fn commit_manifest_inputs_from_stage(
             return error.CommitUnsupportedStageEntry;
         }
 
+        var policy_id: PolicyId = entry.policy_id;
+        if policy_id_compare(&policy_id, &stage_zero_policy_id()) == 0 {
+            policy_id = stage_zero_policy_id();
+        }
         raw_inputs[out_index] = ManifestLeafInputEntry{
             path: commit_clone_byte_list(&entry.path),
             kind: commit_stage_entry_kind(entry),
@@ -640,7 +652,7 @@ fn commit_manifest_inputs_from_stage(
                 profile,
             ),
             content_type: ContentType.Unknown,
-            policy_id: experimental_policy_id(),
+            policy_id: commit_clone_policy_id(&policy_id),
         };
         out_index = out_index + 1 as usize;
         i = i + 1 as usize;

@@ -240,15 +240,6 @@ fn status_load_workspace_files(root: &RepoPath, arena: &Arena) !WorkspaceFileLis
         if @error_id(err) == @error_id(error.WorkspaceScanPermissionDenied) {
             return error.RepoPermissionDenied;
         }
-        if @error_id(err) == @error_id(error.ManifestReservedName) {
-            return error.StatusReservedName;
-        }
-        if status_manifest_path_error_is_invalid(@error_id(err)) {
-            return error.StatusInvalidPath;
-        }
-        if @error_id(err) == @error_id(error.WorkspaceScanUnsupportedFileType) {
-            return error.StatusUnsupportedWorkspaceEntry;
-        }
         return error.StatusWorkspaceScanFailed;
     };
 }
@@ -343,7 +334,18 @@ fn status_worktree_object_id(
         }
     }
 
-    return add_worktree_object_id(root, worktree_entry);
+    return add_worktree_object_id(root, worktree_entry) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        if @error_id(err) == @error_id(error.AddPolicyInvalid) {
+            return error.StatusWorkspaceReadFailed;
+        }
+        if @error_id(err) == @error_id(error.AddAlloc) {
+            return error.StatusAlloc;
+        }
+        return error.StatusWorkspaceReadFailed;
+    };
 }
 
 fn status_print_change_line(kind: StatusChangeKind, path: &ByteList) !void {
@@ -470,18 +472,6 @@ export fn run_status() i32 {
     const worktree: WorkspaceFileList = status_load_workspace_files(&root, &arena) catch |err| {
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
             fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
-            return EXIT_RUNTIME_ERROR;
-        }
-        if @error_id(err) == @error_id(error.StatusReservedName) {
-            fprintf(stderr, "%s" as *byte, STATUS_RESERVED_NAME_TEXT);
-            return EXIT_RUNTIME_ERROR;
-        }
-        if @error_id(err) == @error_id(error.StatusInvalidPath) {
-            fprintf(stderr, "%s" as *byte, STATUS_INVALID_PATH_TEXT);
-            return EXIT_RUNTIME_ERROR;
-        }
-        if @error_id(err) == @error_id(error.StatusUnsupportedWorkspaceEntry) {
-            fprintf(stderr, "%s" as *byte, STATUS_UNSUPPORTED_WORKSPACE_ENTRY_TEXT);
             return EXIT_RUNTIME_ERROR;
         }
         fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);

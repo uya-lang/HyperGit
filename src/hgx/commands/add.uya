@@ -53,10 +53,17 @@ use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.HASH32_BYTES;
 use core.ids.ObjectId;
+use core.ids.PolicyId;
 use core.ids.commit_id_compare;
 use core.ids.hash32_compare;
 use core.ids.object_id_compare;
 use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
+use core.path_policy.PathPolicyDedupeScopeKind;
+use core.path_policy.PathPolicyMatch;
+use core.path_policy.PathPolicyProfile;
+use core.path_policy.path_policy_file_default;
+use core.path_policy.path_policy_match;
 use core.parallel.parallel_default_requested_workers;
 use core.parallel.parallel_worker_count;
 use large.config.large_file_uses_small_blob;
@@ -67,8 +74,8 @@ use large.chunk_store.chunk_store_put;
 use large.chunker.LargeChunk;
 use large.prepare.LargePreparedChunkedBlob;
 use large.prepare.large_prepare_recommended_arena_bytes;
-use large.prepare.prepare_chunked_blob_object_id_parallel_default;
-use large.prepare.prepare_chunked_blob_repository_parallel_default;
+use large.prepare.prepare_chunked_blob_object_id_parallel_with_metadata;
+use large.prepare.prepare_chunked_blob_repository_parallel_with_metadata;
 use manifest.load.manifest_load_flatten_pathspecs;
 use manifest.path.manifest_path_compare;
 use manifest.path.manifest_path_normalize;
@@ -86,6 +93,7 @@ use object.hash.hash_object_payload_bytes;
 use object.small_blob.small_blob_content_hash;
 use object.types.ByteList;
 use object.types.CommitPayload;
+use object.types.DedupeScope;
 use object.types.FileType;
 use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
@@ -95,6 +103,7 @@ use store.loose_store.loose_store_put_known_id;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_POLICY_REL;
 use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
 use store.repo_layout.RepoPath;
@@ -175,6 +184,7 @@ error AddInvalidPath;
 error AddReservedName;
 error AddUnsupportedWorkspaceEntry;
 error AddFastPathUnavailable;
+error AddPolicyInvalid;
 
 export const ADD_USAGE_TEXT: &const byte = "error: add requires at least one pathspec\n";
 export const ADD_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
@@ -185,6 +195,7 @@ export const ADD_INVALID_PATH_TEXT: &const byte = "error: path is not supported 
 export const ADD_RESERVED_NAME_TEXT: &const byte = "error: path uses Windows-incompatible names and cannot be staged\n";
 export const ADD_STAGE_LOCK_TEXT: &const byte = "error: staging area is locked by another HyperGit process\n";
 export const ADD_UNSUPPORTED_WORKSPACE_ENTRY_TEXT: &const byte = "error: workspace contains unsupported file types\n";
+export const ADD_POLICY_INVALID_TEXT: &const byte = "error: repository policy configuration is invalid\n";
 export const ADD_SKIP_PERMISSION_TEXT: &const byte = "warning: skipped unreadable path: %s\n";
 export const ADD_SKIP_UNPROCESSABLE_TEXT: &const byte = "warning: skipped unprocessable path: %s\n";
 export const ADD_FAILURE_TEXT: &const byte = "error: failed to stage files\n";
@@ -207,7 +218,9 @@ struct AddOwnedBytes {
 struct AddPrepareSmallBlobTask {
     root_fs_path: &AddFsPath,
     file_entry: &WorkspaceFileEntry,
-    base_entry_index: isize
+    base_entry_index: isize,
+    policy_id: PolicyId,
+    audit_enabled: bool
 }
 
 struct AddStoreObjectTask {
@@ -217,7 +230,10 @@ struct AddStoreObjectTask {
     measure_object_timing: bool,
     measure_prepare_timing: bool,
     store: &LooseObjectStore,
-    chunk_store: &ChunkStore
+    chunk_store: &ChunkStore,
+    policy_id: PolicyId,
+    audit_enabled: bool,
+    dedupe_scope: DedupeScope
 }
 
 struct AddPreparedSmallBlobResult {
@@ -262,7 +278,15 @@ struct AddFileProcessResult {
     status: usize,
     object_id: ObjectId,
     hash_elapsed_ms: u64,
-    store_elapsed_ms: u64
+    store_elapsed_ms: u64,
+    policy_id: PolicyId,
+    audit_enabled: bool
+}
+
+struct AddAppliedPolicy {
+    policy_id: PolicyId,
+    audit_enabled: bool,
+    dedupe_scope: DedupeScope
 }
 
 export struct AddStageResult {
@@ -1016,7 +1040,12 @@ fn add_store_object_worker_main(arg: &void) &void {
     return null;
 }
 
-fn add_hash_worktree_object_id(file_entry: &WorkspaceFileEntry, content: &[byte]) !ObjectId {
+fn add_hash_worktree_object_id_with_policy(
+    file_entry: &WorkspaceFileEntry,
+    content: &[byte],
+    policy_id: &PolicyId,
+    dedupe_scope: DedupeScope,
+) !ObjectId {
     if file_entry.kind != WorkspaceFileKind.Symlink && !large_file_uses_small_blob(file_entry.logical_size) {
         const scratch_len: usize = try large_prepare_recommended_arena_bytes(file_entry.logical_size);
         const scratch: &byte = malloc(scratch_len) as &byte;
@@ -1028,7 +1057,18 @@ fn add_hash_worktree_object_id(file_entry: &WorkspaceFileEntry, content: &[byte]
         }
         var arena: Arena = Arena{ buffer: scratch, size: 0, used: 0 };
         arena_init(&arena, scratch, scratch_len);
-        return try prepare_chunked_blob_object_id_parallel_default(&arena, content, FileType.Binary);
+        return prepare_chunked_blob_object_id_parallel_with_metadata(
+            &arena,
+            content,
+            FileType.Binary,
+            policy_id[0],
+            dedupe_scope,
+        ) catch |err| {
+            if @error_id(err) == @error_id(error.LargePrepareAlloc) {
+                return error.AddAlloc;
+            }
+            return error.AddReadFailed;
+        };
     }
     return try add_hash_small_blob_bytes(content);
 }
@@ -1038,6 +1078,8 @@ fn add_store_worktree_object(
     chunk_store: &ChunkStore,
     file_entry: &WorkspaceFileEntry,
     content: &[byte],
+    policy_id: &PolicyId,
+    dedupe_scope: DedupeScope,
     measure_timing: bool,
 ) !AddStoredObjectResult {
     if file_entry.kind == WorkspaceFileKind.Symlink || large_file_uses_small_blob(file_entry.logical_size) {
@@ -1059,7 +1101,13 @@ fn add_store_worktree_object(
     arena_init(&large_arena, scratch, scratch_len);
 
     const hash_started_ms: u64 = add_maybe_now_ms(measure_timing);
-    const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_parallel_default(&large_arena, content, FileType.Binary);
+    const prepared: LargePreparedChunkedBlob = try prepare_chunked_blob_repository_parallel_with_metadata(
+        &large_arena,
+        content,
+        FileType.Binary,
+        policy_id[0],
+        dedupe_scope,
+    );
     const encoded_payload: ByteList = try chunked_blob_payload_to_canonical(&large_arena, &prepared.payload);
     const object_id: ObjectId = try add_hash_object_payload(ObjectKind.ChunkedBlob, encoded_payload.ptr[0: encoded_payload.len]);
     const hash_elapsed_ms: u64 = add_elapsed_ms_since(hash_started_ms);
@@ -1229,6 +1277,8 @@ fn add_store_object_task_run(task_ptr: usize) usize {
         task.chunk_store,
         task.file_entry,
         add_owned_bytes_slice(&file_bytes),
+        &task.policy_id,
+        task.dedupe_scope,
         task.measure_object_timing,
     ) catch |err| {
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
@@ -1421,17 +1471,59 @@ fn add_process_completed_object_task(
         &stored.object_id,
         stored.hash_elapsed_ms,
         stored.store_elapsed_ms,
+        &task.policy_id,
+        task.audit_enabled,
     );
     add_progress_mark_file(progress, file_entry);
 }
 
 export fn add_worktree_object_id(root: &RepoPath, file_entry: &WorkspaceFileEntry) !ObjectId {
+    const policy_path: RepoPath = try repo_path_join_literal(root, HGIT_POLICY_REL);
+    const policy_arena_storage: &byte = malloc(ADD_PATHSPEC_ARENA_BYTES) as &byte;
+    if policy_arena_storage == null {
+        return error.AddAlloc;
+    }
+    defer {
+        free(policy_arena_storage as &void);
+    }
+    var policy_arena: Arena = Arena{ buffer: policy_arena_storage, size: 0, used: 0 };
+    arena_init(&policy_arena, policy_arena_storage, ADD_PATHSPEC_ARENA_BYTES);
+    const path_policy: PathPolicyProfile = path_policy_file_default(&policy_arena, repo_path_cstr(&policy_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.PathPolicyInvalid) ||
+            @error_id(err) == @error_id(error.PathPolicyTooLarge) {
+            return error.AddPolicyInvalid;
+        }
+        if @error_id(err) == @error_id(error.PathPolicyOpenFailed) ||
+            @error_id(err) == @error_id(error.PathPolicyReadFailed) {
+            return error.AddReadFailed;
+        }
+        return err;
+    };
+    const applied_policy: AddAppliedPolicy = add_applied_policy_for_path(&path_policy, &file_entry.path);
     const root_fs_path: AddFsPath = try add_fs_path_from_repo_path(root);
-    const file_bytes: AddOwnedBytes = try add_read_workspace_entry_bytes(&root_fs_path, file_entry);
+    const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(&root_fs_path, file_entry) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        if @error_id(err) == @error_id(error.AddAlloc) {
+            return error.AddAlloc;
+        }
+        return error.AddReadFailed;
+    };
     defer {
         add_owned_bytes_free(&file_bytes);
     }
-    return try add_hash_worktree_object_id(file_entry, add_owned_bytes_slice(&file_bytes));
+    return add_hash_worktree_object_id_with_policy(
+        file_entry,
+        add_owned_bytes_slice(&file_bytes),
+        &applied_policy.policy_id,
+        applied_policy.dedupe_scope,
+    ) catch |err| {
+        if @error_id(err) == @error_id(error.AddAlloc) {
+            return error.AddAlloc;
+        }
+        return error.AddReadFailed;
+    };
 }
 
 fn add_count_matches(files: &WorkspaceFileList, pathspecs: &ManifestPathspecList) usize {
@@ -1454,6 +1546,8 @@ fn add_stage_entry_clone(entry: &StageEntry) StageEntry {
         has_staged_object: entry.has_staged_object,
         staged_object: entry.staged_object,
         file_mode: entry.file_mode,
+        policy_id: entry.policy_id,
+        audit_enabled: entry.audit_enabled,
     };
 }
 
@@ -1469,6 +1563,45 @@ fn add_local_change_clone(change: &LocalChange) LocalChange {
         watcher_seq: change.watcher_seq,
         reconcile_epoch: change.reconcile_epoch,
     };
+}
+
+fn add_zero_policy_id() PolicyId {
+    return policy_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
+}
+
+fn add_clone_policy_id(value: &PolicyId) PolicyId {
+    return PolicyId{
+        id: ObjectId{ hash: add_hash32_clone(&value.id.hash) },
+    };
+}
+
+fn add_path_policy_kind_to_chunk_dedupe_scope(kind: PathPolicyDedupeScopeKind) DedupeScope {
+    if kind == PathPolicyDedupeScopeKind.Repository {
+        return DedupeScope.Repository;
+    }
+    return DedupeScope.Global;
+}
+
+fn add_applied_policy_default() AddAppliedPolicy {
+    return AddAppliedPolicy{
+        policy_id: add_zero_policy_id(),
+        audit_enabled: false,
+        dedupe_scope: DedupeScope.Repository,
+    };
+}
+
+fn add_applied_policy_for_path(
+    profile: &PathPolicyProfile,
+    path: &ByteList,
+) AddAppliedPolicy {
+    var applied: AddAppliedPolicy = add_applied_policy_default();
+    const matched: PathPolicyMatch = path_policy_match(profile, path);
+    if matched.matched {
+        applied.policy_id = matched.policy_id;
+        applied.audit_enabled = matched.audit_enabled;
+        applied.dedupe_scope = add_path_policy_kind_to_chunk_dedupe_scope(matched.dedupe_scope_kind);
+    }
+    return applied;
 }
 
 fn add_cached_object_miss() AddCachedObjectResult {
@@ -1493,15 +1626,25 @@ fn add_file_process_result_pending() AddFileProcessResult {
         object_id: add_zero_object_id(),
         hash_elapsed_ms: 0u64,
         store_elapsed_ms: 0u64,
+        policy_id: add_zero_policy_id(),
+        audit_enabled: false,
     };
 }
 
-fn add_file_process_result_stored(object_id: &ObjectId, hash_elapsed_ms: u64, store_elapsed_ms: u64) AddFileProcessResult {
+fn add_file_process_result_stored(
+    object_id: &ObjectId,
+    hash_elapsed_ms: u64,
+    store_elapsed_ms: u64,
+    policy_id: &PolicyId,
+    audit_enabled: bool,
+) AddFileProcessResult {
     return AddFileProcessResult{
         status: ADD_FILE_PROCESS_STORED,
         object_id: ObjectId{ hash: object_id.hash },
         hash_elapsed_ms: hash_elapsed_ms,
         store_elapsed_ms: store_elapsed_ms,
+        policy_id: policy_id[0],
+        audit_enabled: audit_enabled,
     };
 }
 
@@ -1511,6 +1654,8 @@ fn add_file_process_result_skipped(status: usize) AddFileProcessResult {
         object_id: add_zero_object_id(),
         hash_elapsed_ms: 0u64,
         store_elapsed_ms: 0u64,
+        policy_id: add_zero_policy_id(),
+        audit_enabled: false,
     };
 }
 
@@ -1974,6 +2119,8 @@ fn add_record_file_result(
     file_entry: &WorkspaceFileEntry,
     base_entry_index: isize,
     stored_id: &ObjectId,
+    policy_id: &PolicyId,
+    audit_enabled: bool,
     raw_updates: &StageEntry,
     update_index: &usize,
     raw_change_updates: &LocalChange,
@@ -2023,6 +2170,8 @@ fn add_record_file_result(
             has_staged_object: true,
             staged_object: ObjectId{ hash: stored_id.hash },
             file_mode: file_entry.file_mode,
+            policy_id: policy_id[0],
+            audit_enabled: audit_enabled,
         };
     } else {
         raw_updates[*update_index] = StageEntry{
@@ -2032,6 +2181,8 @@ fn add_record_file_result(
             has_staged_object: true,
             staged_object: ObjectId{ hash: stored_id.hash },
             file_mode: file_entry.file_mode,
+            policy_id: policy_id[0],
+            audit_enabled: audit_enabled,
         };
     }
     *update_index = *update_index + 1 as usize;
@@ -2087,6 +2238,8 @@ fn add_process_small_blob_task_status(
         file_entry,
         task.base_entry_index,
         &stored_id,
+        &task.policy_id,
+        task.audit_enabled,
         raw_updates,
         update_index,
         raw_change_updates,
@@ -2216,6 +2369,8 @@ fn add_sort_stage_entries_insertion(entries: &StageEntry, len: usize) void {
         const current_has_staged: bool = entries[i].has_staged_object;
         const current_staged_hash: Hash32 = add_hash32_clone(&entries[i].staged_object.hash);
         const current_file_mode: u32 = entries[i].file_mode;
+        const current_policy_id: PolicyId = entries[i].policy_id;
+        const current_audit_enabled: bool = entries[i].audit_enabled;
         var j: usize = i;
         while j > 0 as usize && manifest_path_compare(&entries[j - 1 as usize].path, &current_path) > 0 {
             entries[j] = entries[j - 1 as usize];
@@ -2228,6 +2383,8 @@ fn add_sort_stage_entries_insertion(entries: &StageEntry, len: usize) void {
             has_staged_object: current_has_staged,
             staged_object: ObjectId{ hash: add_hash32_clone(&current_staged_hash) },
             file_mode: current_file_mode,
+            policy_id: add_clone_policy_id(&current_policy_id),
+            audit_enabled: current_audit_enabled,
         };
         i = i + 1 as usize;
     }
@@ -2560,6 +2717,18 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     const store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
     const chunk_store_root: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_CHUNKS_REL);
     const chunk_store: ChunkStore = try chunk_store_open(repo_path_cstr(&chunk_store_root));
+    const policy_path: RepoPath = try repo_path_join_literal(root, HGIT_POLICY_REL);
+    const path_policy: PathPolicyProfile = path_policy_file_default(&arena, repo_path_cstr(&policy_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.PathPolicyInvalid) ||
+            @error_id(err) == @error_id(error.PathPolicyTooLarge) {
+            return error.AddPolicyInvalid;
+        }
+        if @error_id(err) == @error_id(error.PathPolicyOpenFailed) ||
+            @error_id(err) == @error_id(error.PathPolicyReadFailed) {
+            return error.AddReadFailed;
+        }
+        return err;
+    };
 
     var processed_results: &AddFileProcessResult = null as &AddFileProcessResult;
     if matched_count > 0 as usize {
@@ -2612,6 +2781,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         var file_index: usize = 0 as usize;
         while file_index < scanned_files.len {
             const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
+            const applied_policy: AddAppliedPolicy = add_applied_policy_for_path(&path_policy, &file_entry.path);
             const cache_lookup_started_ms: u64 = add_maybe_now_ms(profile.enabled);
             const cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(
                 &store,
@@ -2622,7 +2792,13 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
             if cached_object.hit {
                 profile.cache_hits = profile.cache_hits + 1 as usize;
                 add_progress_print_current_file(&progress, file_entry);
-                processed_results[file_index] = add_file_process_result_stored(&cached_object.object_id, 0u64, 0u64);
+                processed_results[file_index] = add_file_process_result_stored(
+                    &cached_object.object_id,
+                    0u64,
+                    0u64,
+                    &applied_policy.policy_id,
+                    applied_policy.audit_enabled,
+                );
                 add_progress_mark_file(&progress, file_entry);
                 file_index = file_index + 1 as usize;
                 continue;
@@ -2652,8 +2828,15 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
 
                     if batch_cached_hit {
                         const batch_result_index: usize = file_index;
+                        const batch_applied_policy: AddAppliedPolicy = add_applied_policy_for_path(&path_policy, &batch_entry.path);
                         profile.cache_hits = profile.cache_hits + 1 as usize;
-                        processed_results[batch_result_index] = add_file_process_result_stored(&batch_cached_object_id, 0u64, 0u64);
+                        processed_results[batch_result_index] = add_file_process_result_stored(
+                            &batch_cached_object_id,
+                            0u64,
+                            0u64,
+                            &batch_applied_policy.policy_id,
+                            batch_applied_policy.audit_enabled,
+                        );
                         add_progress_mark_file(&progress, batch_entry);
                         file_index = file_index + 1 as usize;
                         continue;
@@ -2665,6 +2848,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                     profile.cache_misses = profile.cache_misses + 1 as usize;
                     profile.small_blob_misses = profile.small_blob_misses + 1 as usize;
                     const batch_result_index: usize = file_index;
+                    const batch_applied_policy: AddAppliedPolicy = add_applied_policy_for_path(&path_policy, &batch_entry.path);
                     batch_tasks[batch_count] = AddStoreObjectTask{
                         root_fs_path: &root_fs_path,
                         file_entry: batch_entry,
@@ -2673,6 +2857,9 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                         measure_prepare_timing: profile.enabled,
                         store: &store,
                         chunk_store: &chunk_store,
+                        policy_id: batch_applied_policy.policy_id,
+                        audit_enabled: batch_applied_policy.audit_enabled,
+                        dedupe_scope: batch_applied_policy.dedupe_scope,
                     };
                     batch_count = batch_count + 1 as usize;
                     file_index = file_index + 1 as usize;
@@ -2720,6 +2907,8 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 &chunk_store,
                 file_entry,
                 add_owned_bytes_slice(&file_bytes),
+                &applied_policy.policy_id,
+                applied_policy.dedupe_scope,
                 object_timing_enabled,
             ) catch |err| {
                 if add_error_is_skippable(@error_id(err)) {
@@ -2749,6 +2938,8 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 &stored.object_id,
                 stored.hash_elapsed_ms,
                 stored.store_elapsed_ms,
+                &applied_policy.policy_id,
+                applied_policy.audit_enabled,
             );
             add_progress_mark_file(&progress, file_entry);
             file_index = file_index + 1 as usize;
@@ -2757,6 +2948,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
         var file_index: usize = 0 as usize;
         while file_index < scanned_files.len {
             const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
+            const applied_policy: AddAppliedPolicy = add_applied_policy_for_path(&path_policy, &file_entry.path);
             add_progress_print_current_file(&progress, file_entry);
             const cache_lookup_started_ms: u64 = add_maybe_now_ms(profile.enabled);
             const cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(
@@ -2767,7 +2959,13 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
             add_profile_add_elapsed(&profile.cache_lookup_elapsed_ms, cache_lookup_started_ms);
             if cached_object.hit {
                 profile.cache_hits = profile.cache_hits + 1 as usize;
-                processed_results[file_index] = add_file_process_result_stored(&cached_object.object_id, 0u64, 0u64);
+                processed_results[file_index] = add_file_process_result_stored(
+                    &cached_object.object_id,
+                    0u64,
+                    0u64,
+                    &applied_policy.policy_id,
+                    applied_policy.audit_enabled,
+                );
             } else {
                 profile.cache_misses = profile.cache_misses + 1 as usize;
                 if add_is_parallel_small_blob_candidate(file_entry) {
@@ -2799,6 +2997,8 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                     &chunk_store,
                     file_entry,
                     add_owned_bytes_slice(&file_bytes),
+                    &applied_policy.policy_id,
+                    applied_policy.dedupe_scope,
                     object_timing_enabled,
                 ) catch |err| {
                     if add_error_is_skippable(@error_id(err)) {
@@ -2828,6 +3028,8 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                     &stored.object_id,
                     stored.hash_elapsed_ms,
                     stored.store_elapsed_ms,
+                    &applied_policy.policy_id,
+                    applied_policy.audit_enabled,
                 );
             }
             add_progress_mark_file(&progress, file_entry);
@@ -2930,6 +3132,8 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
             file_entry,
             base_entry_index,
             &processed.object_id,
+            &processed.policy_id,
+            processed.audit_enabled,
             raw_updates,
             &update_index,
             raw_change_updates,
@@ -2952,6 +3156,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     while base_index < base_inputs.len {
         const base_entry: &ManifestLeafInputEntry = &base_inputs.ptr[base_index];
         if !add_workspace_has_path(&scanned_files, &base_entry.path) {
+            const delete_applied_policy: AddAppliedPolicy = add_applied_policy_for_path(&path_policy, &base_entry.path);
             const existing_local_change_index: isize = add_find_local_change(&existing_local_changes, &base_entry.path);
             var watcher_seq: u64 = 0u64;
             var reconcile_epoch: u64 = 0u64;
@@ -2980,6 +3185,8 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 has_staged_object: false,
                 staged_object: add_zero_object_id(),
                 file_mode: base_entry.mode,
+                policy_id: delete_applied_policy.policy_id,
+                audit_enabled: delete_applied_policy.audit_enabled,
             };
             update_index = update_index + 1 as usize;
             add_print_staged_path(&base_entry.path, 0u64, 0u64, 0u64, progress.print_path_timings);
@@ -3137,6 +3344,10 @@ export fn run_add() i32 {
         }
         if @error_id(err) == @error_id(error.AddUnsupportedWorkspaceEntry) {
             fprintf(stderr, "%s" as *byte, ADD_UNSUPPORTED_WORKSPACE_ENTRY_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        }
+        if @error_id(err) == @error_id(error.AddPolicyInvalid) {
+            fprintf(stderr, "%s" as *byte, ADD_POLICY_INVALID_TEXT);
             return EXIT_RUNTIME_ERROR;
         }
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {

@@ -175,13 +175,15 @@ fn doctor_verify_commit_graph(
     };
 }
 
-fn doctor_load_local_changes(arena: &Arena, root: &RepoPath) !LocalChangeList {
-    const path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
+fn doctor_load_local_changes(arena: &Arena, root: &RepoPath) LocalChangeList {
+    const path: RepoPath = repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL) catch {
+        return LocalChangeList{ ptr: null, len: 0 };
+    };
     return local_change_file_read(arena, repo_path_cstr(&path) as &const byte) catch |err| {
         if @error_id(err) == @error_id(error.LocalChangeFileNotFound) {
             return LocalChangeList{ ptr: null, len: 0 };
         }
-        return error.DoctorAlloc;
+        return LocalChangeList{ ptr: null, len: 0 };
     };
 }
 
@@ -339,10 +341,7 @@ export fn run_doctor() i32 {
         };
     }
 
-    const local_changes: LocalChangeList = doctor_load_local_changes(&arena, &root) catch {
-        fprintf(stderr, "%s" as *byte, DOCTOR_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
+    const local_changes: LocalChangeList = doctor_load_local_changes(&arena, &root);
     const state_result: DoctorWorkspaceStateReadResult = doctor_read_workspace_state(&arena, &root) catch {
         fprintf(stderr, "%s" as *byte, DOCTOR_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;

@@ -1,8 +1,10 @@
 use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.ObjectId;
+use core.ids.PolicyId;
 use core.ids.commit_id_from_object;
 use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
 use object.types.ByteList;
 
 export enum StageEntryKind {
@@ -18,7 +20,9 @@ export struct StageEntry {
     base_object: ObjectId,
     has_staged_object: bool,
     staged_object: ObjectId,
-    file_mode: u32
+    file_mode: u32,
+    policy_id: PolicyId,
+    audit_enabled: bool
 }
 
 export struct StageEntryList {
@@ -78,6 +82,10 @@ export fn stage_snapshot_init(state: StageState, entries: StageEntryList) StageS
 
 export fn stage_zero_commit_id() CommitId {
     return commit_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
+}
+
+export fn stage_zero_policy_id() PolicyId {
+    return policy_id_from_object(object_id_from_hash(Hash32{ bytes: [] }));
 }
 
 export fn stage_empty_snapshot(last_update_ms: i64) StageSnapshot {

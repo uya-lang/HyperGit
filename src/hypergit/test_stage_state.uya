@@ -7,8 +7,10 @@ use std.testing.run_test;
 use core.ids.Hash32;
 use core.ids.CommitId;
 use core.ids.ObjectId;
+use core.ids.PolicyId;
 use core.ids.commit_id_from_object;
 use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
 use object.types.ByteList;
 use workspace.stage.StageEntry;
 use workspace.stage.StageEntryKind;
@@ -32,6 +34,10 @@ fn make_hash(seed: byte) Hash32 {
 fn make_commit_id(seed: byte) CommitId {
     const object_id: ObjectId = object_id_from_hash(make_hash(seed));
     return commit_id_from_object(object_id);
+}
+
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(object_id_from_hash(make_hash(seed)));
 }
 
 fn test_stage_state_init_starts_empty() !void {
@@ -59,9 +65,12 @@ fn test_stage_entry_detects_staged_content() !void {
         has_staged_object: true,
         staged_object: object_id_from_hash(make_hash(4 as byte)),
         file_mode: 33188u32,
+        policy_id: make_policy_id(5 as byte),
+        audit_enabled: true,
     };
     try expect(stage_entry_has_staged_content(&entry));
     try expect(!stage_entry_is_delete(&entry));
+    try expect(entry.audit_enabled);
 }
 
 fn test_stage_entry_delete_does_not_require_staged_content() !void {
@@ -73,6 +82,8 @@ fn test_stage_entry_delete_does_not_require_staged_content() !void {
         has_staged_object: false,
         staged_object: object_id_from_hash(make_hash(6 as byte)),
         file_mode: 33188u32,
+        policy_id: make_policy_id(7 as byte),
+        audit_enabled: false,
     };
     try expect(!stage_entry_has_staged_content(&entry));
     try expect(stage_entry_is_delete(&entry));

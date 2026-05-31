@@ -12,8 +12,10 @@ use libc.system;
 use core.ids.Hash32;
 use core.ids.CommitId;
 use core.ids.ObjectId;
+use core.ids.PolicyId;
 use core.ids.commit_id_from_object;
 use core.ids.object_id_from_hash;
+use core.ids.policy_id_from_object;
 use object.types.ByteList;
 use workspace.stage.StageEntry;
 use workspace.stage.StageEntryKind;
@@ -44,6 +46,10 @@ fn make_commit_id(seed: byte) CommitId {
     return commit_id_from_object(make_object_id(seed));
 }
 
+fn make_policy_id(seed: byte) PolicyId {
+    return policy_id_from_object(make_object_id(seed));
+}
+
 fn test_stage_file_write_empty_roundtrip() !void {
     const setup_status: i32 = system("rm -rf build/stage-file-test && mkdir -p build/stage-file-test");
     try expect(setup_status == 0);
@@ -71,6 +77,8 @@ fn test_stage_file_roundtrip_with_entry() !void {
         has_staged_object: true,
         staged_object: make_object_id(11 as byte),
         file_mode: 33188u32,
+        policy_id: make_policy_id(12 as byte),
+        audit_enabled: true,
     };
     var entries: [StageEntry: 1] = [entry];
     const state: StageState = stage_state_with_entry_count(make_commit_id(9 as byte), 1u64, 1234i64);
@@ -90,6 +98,8 @@ fn test_stage_file_roundtrip_with_entry() !void {
     try expect(decoded.entries.ptr[0].path.ptr[0] == 's' as byte);
     try expect(decoded.entries.ptr[0].has_staged_object);
     try expect(decoded.entries.ptr[0].file_mode == 33188u32);
+    try expect(decoded.entries.ptr[0].policy_id.id.hash.bytes[0] == make_policy_id(12 as byte).id.hash.bytes[0]);
+    try expect(decoded.entries.ptr[0].audit_enabled);
 }
 
 fn test_stage_file_roundtrip_above_legacy_size_limit() !void {
@@ -114,6 +124,8 @@ fn test_stage_file_roundtrip_above_legacy_size_limit() !void {
             has_staged_object: true,
             staged_object: make_object_id(((i + 1 as usize) % 200 as usize) as byte),
             file_mode: 33188u32,
+            policy_id: make_policy_id(((i + 2 as usize) % 200 as usize) as byte),
+            audit_enabled: (i % 2 as usize) == 0 as usize,
         };
         i = i + 1 as usize;
     }
@@ -137,6 +149,7 @@ fn test_stage_file_roundtrip_above_legacy_size_limit() !void {
     try expect(decoded.entries.len == ENTRY_COUNT);
     try expect(decoded.entries.ptr[0].path.len == 12 as usize);
     try expect(decoded.entries.ptr[ENTRY_COUNT - 1 as usize].has_staged_object);
+    try expect(decoded.entries.ptr[0].policy_id.id.hash.bytes[0] == make_policy_id(2 as byte).id.hash.bytes[0]);
 }
 
 export fn main() i32 {

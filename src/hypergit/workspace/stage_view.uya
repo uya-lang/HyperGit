@@ -8,8 +8,8 @@ use libc.malloc;
 use libc.stat;
 use core.ids.CommitId;
 use core.ids.ObjectId;
+use core.ids.PolicyId;
 use core.ids.commit_id_compare;
-use core.policy.experimental_policy_id;
 use manifest.load.manifest_load_flatten;
 use manifest.path.manifest_path_compare;
 use manifest.trie.ManifestLeafInputEntry;
@@ -34,6 +34,7 @@ use workspace.stage.StageEntryKind;
 use workspace.stage.StageSnapshot;
 use workspace.stage.stage_entry_has_staged_content;
 use workspace.stage.stage_zero_commit_id;
+use workspace.stage.stage_zero_policy_id;
 
 const STAGE_VIEW_FILE_MODE_TYPE_MASK: u32 = 61440u32;
 const STAGE_VIEW_FILE_MODE_SYMLINK: u32 = 40960u32;
@@ -64,6 +65,18 @@ fn stage_view_stage_entry_kind(entry: &StageEntry) EntryKind {
         return EntryKind.Executable;
     }
     return EntryKind.File;
+}
+
+fn stage_view_policy_id_is_zero(value: &StageEntry) bool {
+    const zero: ObjectId = stage_zero_policy_id().id;
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        if value.policy_id.id.hash.bytes[i] != zero.hash.bytes[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
 }
 
 fn stage_view_commit_payload(arena: &Arena, store: &LooseObjectStore, commit_id: &CommitId) !CommitPayload {
@@ -195,11 +208,15 @@ fn stage_view_manifest_input_from_stage(
 ) !ManifestLeafInputEntry {
     var object_id: ObjectId = base_entry.object_id;
     var logical_size: u64 = base_entry.logical_size;
+    var policy_id: PolicyId = entry.policy_id;
     if stage_entry_has_staged_content(entry) {
         object_id = ObjectId{ hash: entry.staged_object.hash };
         logical_size = try stage_view_entry_logical_size(arena, store, &object_id);
     } else if !stage_view_has_object_id(&base_entry.object_id) {
         return error.StageViewUnsupportedStageEntry;
+    }
+    if stage_view_policy_id_is_zero(entry) {
+        policy_id = base_entry.policy_id;
     }
 
     return ManifestLeafInputEntry{
@@ -209,7 +226,7 @@ fn stage_view_manifest_input_from_stage(
         object_id: object_id,
         logical_size: logical_size,
         content_type: base_entry.content_type,
-        policy_id: base_entry.policy_id,
+        policy_id: policy_id,
     };
 }
 
@@ -230,7 +247,7 @@ fn stage_view_manifest_input_from_stage_without_base(
         object_id: object_id,
         logical_size: try stage_view_entry_logical_size(arena, store, &object_id),
         content_type: ContentType.Unknown,
-        policy_id: experimental_policy_id(),
+        policy_id: entry.policy_id,
     };
 }
 
