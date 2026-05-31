@@ -1,0 +1,2 @@
+export const HGX_VERSION: &const byte = "0.1.0";
+export const HGX_VERSION_TEXT: &const byte = "hgx 0.1.0\n";

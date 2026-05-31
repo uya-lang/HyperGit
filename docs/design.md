@@ -1,6 +1,6 @@
 # HyperGit / 极仓系统设计
 
-状态：设计版 v0.1  
+状态：设计版 v0.1 / 已发布里程碑 `v0.1.0`（2026-05-31）
 目标实现语言：纯 Uya  
 本机工具链：默认使用 `/home/winger/xyglasses/uya/bin/uya`，也可通过 `UYA_BIN` 覆盖；当前 `uya --version` 显示版本 `v0.9.7`
 命令行入口：`hgx`
@@ -1111,6 +1111,10 @@ CI 第一阶段至少跑：
 - 损坏对象检测脚本。
 
 ## 20. 里程碑
+
+已发布里程碑：
+
+- `v0.1.0`（2026-05-31）：首个 native `hgx` MVP 发布，覆盖 M0-M9 设计目标，并完成 `docs/todo.md` 的 Release Readiness 检查项。
 
 M0 文档和工程骨架：
 

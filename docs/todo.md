@@ -388,3 +388,4 @@
 - [x] README 能按步骤复现 MVP。
 - [x] `docs/design.md` 与实际模块命名一致。
 - [x] `docs/todo.md` 已更新真实完成状态。
+- [x] 发布首个里程碑版本 `v0.1.0` 并记录 release notes。

@@ -15,12 +15,15 @@ HyperGit / 极仓是一个用纯 Uya 设计和实现的 Git-like 版本控制系
 
 项目目前有一个可运行的 native `hgx` MVP，已覆盖本地仓库初始化、工作区扫描、stage、commit、log、diff、checkout、hydrate/dehydrate、sparse profile，以及 file remote push/fetch 的早期路径。
 
+当前发布版本：`v0.1.0`（2026-05-31），对应首个 native `hgx` MVP 里程碑。发布说明见 [v0.1.0 里程碑](docs/releases/v0.1.0.md)。
+
 继续阅读：
 
 - [系统设计文档](docs/design.md)
 - [详细 TODO 路线图](docs/todo.md)
 - [命名说明](docs/naming.md)
 - [基准记录](docs/benchmarks.md)
+- [v0.1.0 里程碑说明](docs/releases/v0.1.0.md)
 
 ## 构建
 
