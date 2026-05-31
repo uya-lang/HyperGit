@@ -76,6 +76,7 @@ test:
 	$(UYA) test src/hgx/test_checkout_security.uya
 	$(UYA) test src/hgx/test_cli_args.uya
 	./tests/test_cli_golden.sh
+	./tests/test_help_scope.sh
 	./tests/test_version_flag.sh
 	./tests/test_add_stage.sh
 	./tests/test_add_stage_concurrent.sh
