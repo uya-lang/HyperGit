@@ -16,6 +16,11 @@ use libc.ESRCH;
 use libc.Stat;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
+use core.audit_log.AUDIT_LOG_REL;
+use core.audit_log.AUDIT_LOG_ROTATE_KEEP_DEFAULT;
+use core.audit_log.AuditLogEventKind;
+use core.audit_log.AuditLogEventList;
+use core.audit_log.audit_log_file_read;
 use core.ids.CommitId;
 use core.ids.Hash32;
 use core.ids.commit_id_compare;
@@ -52,6 +57,7 @@ use workspace.state_file.workspace_state_file_read;
 const DOCTOR_ARENA_BYTES: usize = 67108864 as usize;
 const DOCTOR_LOCK_PID_MAX_BYTES: usize = 32 as usize;
 const DOCTOR_STAGE_LOCK_REL: &const byte = ".hgit/workspace/stage.hgi.lock";
+const DOCTOR_PATH_MAX: usize = 4096 as usize;
 
 error DoctorAlloc;
 
@@ -59,6 +65,13 @@ struct DoctorWorkspaceStateReadResult {
     present: bool,
     invalid: bool,
     state: WorkspaceState
+}
+
+struct DoctorAuditStatus {
+    invalid: bool,
+    current_events: usize,
+    rotated_files: usize,
+    last_kind: AuditLogEventKind
 }
 
 export const DOCTOR_NOT_REPO_TEXT: &const byte = "error: not a HyperGit repository\n";
@@ -126,6 +139,101 @@ fn doctor_print_issue_path(prefix: &const byte, path: &const byte) void {
 
 fn doctor_print_issue_text(text: &const byte) void {
     fprintf(stdout, "%s\n" as *byte, text);
+}
+
+fn doctor_audit_kind_text(kind: AuditLogEventKind) &const byte {
+    if kind == AuditLogEventKind.Checkout {
+        return "checkout" as &const byte;
+    }
+    if kind == AuditLogEventKind.Fetch {
+        return "fetch" as &const byte;
+    }
+    if kind == AuditLogEventKind.Push {
+        return "push" as &const byte;
+    }
+    return "commit" as &const byte;
+}
+
+fn doctor_copy_path_literal(out: &[byte], prefix: &const byte, suffix: &const byte) !&byte {
+    var offset: usize = 0 as usize;
+    while prefix[offset] != 0 as byte {
+        if offset + 1 as usize >= out.len {
+            return error.DoctorAlloc;
+        }
+        out.ptr[offset] = prefix[offset];
+        offset = offset + 1 as usize;
+    }
+    var suffix_index: usize = 0 as usize;
+    while suffix[suffix_index] != 0 as byte {
+        if offset + 1 as usize >= out.len {
+            return error.DoctorAlloc;
+        }
+        out.ptr[offset] = suffix[suffix_index];
+        offset = offset + 1 as usize;
+        suffix_index = suffix_index + 1 as usize;
+    }
+    out.ptr[offset] = 0 as byte;
+    return &out.ptr[0];
+}
+
+fn doctor_audit_status(arena: &Arena, root: &RepoPath) !DoctorAuditStatus {
+    const audit_path: RepoPath = try repo_path_join_literal(root, AUDIT_LOG_REL);
+    const current_events: AuditLogEventList = audit_log_file_read(arena, repo_path_cstr(&audit_path) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.AuditLogNotFound) {
+            return DoctorAuditStatus{
+                invalid: false,
+                current_events: 0 as usize,
+                rotated_files: 0 as usize,
+                last_kind: AuditLogEventKind.Commit,
+            };
+        }
+        return DoctorAuditStatus{
+            invalid: true,
+            current_events: 0 as usize,
+            rotated_files: 0 as usize,
+            last_kind: AuditLogEventKind.Commit,
+        };
+    };
+
+    var rotated_files: usize = 0 as usize;
+    var suffix_index: usize = 1 as usize;
+    while suffix_index <= AUDIT_LOG_ROTATE_KEEP_DEFAULT {
+        var suffix: [byte: 4] = [];
+        suffix[0] = '.' as byte;
+        suffix[1] = ('0' as byte) + suffix_index as byte;
+        suffix[2] = 0 as byte;
+        var path_buf: [byte: DOCTOR_PATH_MAX] = [];
+        const rotated_path: &byte = try doctor_copy_path_literal(
+            path_buf[0: DOCTOR_PATH_MAX],
+            repo_path_cstr(&audit_path) as &const byte,
+            &suffix[0] as &const byte,
+        );
+        var st: Stat = Stat{};
+        if stat(rotated_path as &const byte, &st) == 0 {
+            const rotated_events: AuditLogEventList = audit_log_file_read(arena, rotated_path as &const byte) catch {
+                return DoctorAuditStatus{
+                    invalid: true,
+                    current_events: current_events.len,
+                    rotated_files: rotated_files,
+                    last_kind: current_events.ptr[current_events.len - 1 as usize].kind,
+                };
+            };
+            _ = rotated_events;
+            rotated_files = rotated_files + 1 as usize;
+        }
+        suffix_index = suffix_index + 1 as usize;
+    }
+
+    var last_kind: AuditLogEventKind = AuditLogEventKind.Commit;
+    if current_events.len > 0 as usize {
+        last_kind = current_events.ptr[current_events.len - 1 as usize].kind;
+    }
+    return DoctorAuditStatus{
+        invalid: false,
+        current_events: current_events.len,
+        rotated_files: rotated_files,
+        last_kind: last_kind,
+    };
 }
 
 fn doctor_verify_head_objects(arena: &Arena, store: &LooseObjectStore, head_commit: &CommitId, issue_count: &usize) void {
@@ -360,6 +468,27 @@ export fn run_doctor() i32 {
         fprintf(stderr, "%s" as *byte, DOCTOR_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
+
+    const audit_status: DoctorAuditStatus = doctor_audit_status(&arena, &root) catch {
+        fprintf(stderr, "%s" as *byte, DOCTOR_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    if audit_status.invalid {
+        doctor_print_issue_text("issue: audit log is invalid");
+        issue_count = issue_count + 1 as usize;
+    } else {
+        var last_text: &const byte = "none";
+        if audit_status.current_events > 0 as usize {
+            last_text = doctor_audit_kind_text(audit_status.last_kind);
+        }
+        fprintf(
+            stdout,
+            "audit: current=%llu rotated=%llu last=%s\n" as *byte,
+            audit_status.current_events as u64,
+            audit_status.rotated_files as u64,
+            last_text as *byte,
+        );
+    }
 
     if issue_count == 0 as usize {
         fprintf(stdout, "%s" as *byte, "doctor: ok\n");

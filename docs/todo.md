@@ -425,6 +425,6 @@
 - [~] 为 checkout / fetch / push / commit 生成可落盘 audit log，并补齐 doctor / CLI 可见性与回归测试。
 - [x] 定义 repo-local audit log 文件格式、轮转边界和事件字段，并实现原子追加写入。
 - [x] 将 audit log 接入 checkout / fetch / push / commit 成功路径，记录 policy_id / dedupe_scope / audit_enabled 等最终生效元数据。
-- [~] 扩展 `hgx doctor` 对 audit log 的可见性与诊断，并补齐命令级回归测试。
+- [x] 扩展 `hgx doctor` 对 audit log 的可见性与诊断，并补齐命令级回归测试。
 - [ ] FUSE / 平台 VFS / 内核级虚拟工作区。
 - [ ] 更激进的服务端索引、云端查询和分布式执行能力。

@@ -5,7 +5,25 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-"$HOME/uya/uya/bin/uya" build "$ROOT/src/hgx/main.uya" -o "$TMP_DIR/hgx" >/dev/null 2>&1
+build_hgx() {
+    local attempt=1
+    while [ "$attempt" -le 5 ]; do
+        set +e
+        "$HOME/uya/uya/bin/uya" build "$ROOT/src/hgx/main.uya" -o "$TMP_DIR/hgx" >/dev/null 2>&1
+        status=$?
+        set -e
+        if [ "$status" -eq 0 ]; then
+            return 0
+        fi
+        if [ "$status" -ne 139 ]; then
+            return "$status"
+        fi
+        attempt=$((attempt + 1))
+    done
+    return 139
+}
+
+build_hgx
 
 create_repo() {
     local repo_dir="$1"
@@ -57,7 +75,7 @@ run_doctor_case() {
 
 CLEAN_REPO="$TMP_DIR/repo-clean"
 create_repo "$CLEAN_REPO"
-run_doctor_case clean "$CLEAN_REPO" 0 "doctor: ok"
+run_doctor_case clean "$CLEAN_REPO" 0 "audit: current=1 rotated=0 last=commit" "doctor: ok"
 
 CORRUPT_REPO="$TMP_DIR/repo-corrupt"
 create_repo "$CORRUPT_REPO"
@@ -70,6 +88,11 @@ STALE_INDEX_REPO="$TMP_DIR/repo-stale-index"
 create_repo "$STALE_INDEX_REPO"
 rm -f "$STALE_INDEX_REPO/.hgit/indexes/commit-graph.hgi"
 run_doctor_case stale-index "$STALE_INDEX_REPO" 1 "doctor: found" "commit graph index is missing or stale"
+
+AUDIT_REPO="$TMP_DIR/repo-audit-corrupt"
+create_repo "$AUDIT_REPO"
+printf '{"version":1,"kind":"commit"\n' >"$AUDIT_REPO/.hgit/audit/events.jsonl"
+run_doctor_case audit-corrupt "$AUDIT_REPO" 1 "doctor: found" "audit log is invalid"
 
 STATE_REPO="$TMP_DIR/repo-state"
 create_repo "$STATE_REPO"
