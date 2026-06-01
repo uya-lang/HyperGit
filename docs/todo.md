@@ -418,7 +418,7 @@
 ### 可明确延后到 `v1.1+`
 
 - [x] Git packed object / delta / tag / submodule / replace ref 完整互操作。
-- [~] 更复杂的 audit / policy / dedupe / storage tier 体系。
+- [x] 更复杂的 audit / policy / dedupe / storage tier 体系。
 - [x] 定义可持久化的 path policy / dedupe scope / audit / cache TTL 配置格式，并实现 repo-local 读写与 matcher。
 - [x] 将 policy / dedupe / audit 规则接入 add / commit / manifest / chunked blob 构建路径，替换当前 experimental default 常量直写。
 - [x] 为 chunk / object 存储实现 tier-aware 放置与查询策略，并补齐 `StorageTier` 的真实选择、回退和测试。
@@ -427,8 +427,8 @@
 - [x] 将 audit log 接入 checkout / fetch / push / commit 成功路径，记录 policy_id / dedupe_scope / audit_enabled 等最终生效元数据。
 - [x] 扩展 `hgx doctor` 对 audit log 的可见性与诊断，并补齐命令级回归测试。
 - [~] FUSE / 平台 VFS / 内核级虚拟工作区。
-- [~] 定义 VFS provider / placeholder entry / materialization request 数据结构与规划器，并补齐单元测试。
-- [ ] 将 sparse / hydrate / dehydrate / workspace local view 接入 VFS 规划层，并补齐回归测试。
+- [x] 定义 VFS provider / placeholder entry / materialization request 数据结构与规划器，并补齐单元测试。
+- [x] 将 sparse / hydrate / dehydrate / workspace local view 接入 VFS 规划层，并补齐回归测试。
 - [ ] 实现 Linux FUSE adapter、mount 生命周期和错误恢复。
 - [ ] 为 macOS / Windows 平台抽象 VFS 边界与降级策略。
 - [ ] 更激进的服务端索引、云端查询和分布式执行能力。
