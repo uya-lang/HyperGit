@@ -1,17 +1,25 @@
 use std.mem.arena.Arena;
-use std.mem.arena.arena_alloc;
+use std.async_frame;
 
-use manifest.path.manifest_path_compare;
+use libc.free;
+use libc.malloc;
 use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
 use core.ids.ObjectId;
-use object.types.ByteList;
 use core.ids.PolicyId;
+use workspace.local_view.workspace_local_view_filter_expected_inputs;
+use workspace.local_view.workspace_local_view_filter_target_inputs;
+use workspace.sparse_profile.SparseProfile;
 use workspace.state.ChangeStatus;
 use workspace.state.LocalChange;
 use workspace.state.LocalChangeList;
 
 error VfsAlloc;
+
+export struct VfsPath {
+    ptr: &byte,
+    len: usize
+}
 
 export enum VfsProviderKind {
     UserSpace,
@@ -26,7 +34,7 @@ export enum VfsPlaceholderState {
 }
 
 export struct VfsPlaceholderEntry {
-    path: ByteList,
+    path: VfsPath,
     object_id: ObjectId,
     logical_size: u64,
     policy_id: PolicyId,
@@ -49,7 +57,7 @@ export enum VfsMaterializationRequestKind {
 
 export struct VfsMaterializationRequest {
     kind: VfsMaterializationRequestKind,
-    path: ByteList,
+    path: VfsPath,
     object_id: ObjectId,
     logical_size: u64,
     policy_id: PolicyId
@@ -64,37 +72,105 @@ export fn vfs_materialization_request_list_from_slice(slice: &[VfsMaterializatio
     return VfsMaterializationRequestList{ ptr: slice.ptr, len: slice.len };
 }
 
-fn vfs_find_local_change(changes: &LocalChangeList, path: &ByteList) &LocalChange {
+export struct VfsWorkspacePlan {
+    provider_kind: VfsProviderKind,
+    current_materialized: ManifestLeafInputList,
+    target_materialized: ManifestLeafInputList,
+    placeholder_entries: VfsPlaceholderEntryList,
+    materialization_requests: VfsMaterializationRequestList
+}
+
+fn vfs_path_compare_raw(left_ptr: &byte, left_len: usize, right_ptr: &byte, right_len: usize) i32 {
+    var i: usize = 0 as usize;
+    while i < left_len && i < right_len {
+        const left_byte: byte = left_ptr[i];
+        const right_byte: byte = right_ptr[i];
+        if left_byte < right_byte {
+            return -1;
+        }
+        if left_byte > right_byte {
+            return 1;
+        }
+        i = i + 1 as usize;
+    }
+    if left_len < right_len {
+        return -1;
+    }
+    if left_len > right_len {
+        return 1;
+    }
+    return 0;
+}
+
+fn vfs_path_compare(left: &VfsPath, right: &VfsPath) i32 {
+    return vfs_path_compare_raw(left.ptr, left.len, right.ptr, right.len);
+}
+
+fn vfs_path_from_input(path: &ManifestLeafInputEntry) VfsPath {
+    return VfsPath{
+        ptr: path.path.ptr,
+        len: path.path.len,
+    };
+}
+
+fn vfs_path_from_change(path: &LocalChange) VfsPath {
+    return VfsPath{
+        ptr: path.path.ptr,
+        len: path.path.len,
+    };
+}
+
+fn vfs_find_local_change(changes: &LocalChangeList, path: &VfsPath) &LocalChange {
     var low: usize = 0 as usize;
     var high: usize = changes.len;
     while low < high {
         const mid: usize = low + ((high - low) / 2 as usize);
-        const cmp: i32 = manifest_path_compare(&changes.ptr[mid].path, path);
+        const cmp: i32 = vfs_path_compare_raw(
+            changes.ptr[mid].path.ptr,
+            changes.ptr[mid].path.len,
+            path.ptr,
+            path.len,
+        );
         if cmp < 0 {
             low = mid + 1 as usize;
         } else {
             high = mid;
         }
     }
-    if low < changes.len && manifest_path_compare(&changes.ptr[low].path, path) == 0 {
+    if low < changes.len && vfs_path_compare_raw(
+        changes.ptr[low].path.ptr,
+        changes.ptr[low].path.len,
+        path.ptr,
+        path.len,
+    ) == 0 {
         return &changes.ptr[low];
     }
     return null as &LocalChange;
 }
 
-fn vfs_find_manifest_input(inputs: &ManifestLeafInputList, path: &ByteList) &ManifestLeafInputEntry {
+fn vfs_find_manifest_input(inputs: &ManifestLeafInputList, path: &VfsPath) &ManifestLeafInputEntry {
     var low: usize = 0 as usize;
     var high: usize = inputs.len;
     while low < high {
         const mid: usize = low + ((high - low) / 2 as usize);
-        const cmp: i32 = manifest_path_compare(&inputs.ptr[mid].path, path);
+        const cmp: i32 = vfs_path_compare_raw(
+            inputs.ptr[mid].path.ptr,
+            inputs.ptr[mid].path.len,
+            path.ptr,
+            path.len,
+        );
         if cmp < 0 {
             low = mid + 1 as usize;
         } else {
             high = mid;
         }
     }
-    if low < inputs.len && manifest_path_compare(&inputs.ptr[low].path, path) == 0 {
+    if low < inputs.len && vfs_path_compare_raw(
+        inputs.ptr[low].path.ptr,
+        inputs.ptr[low].path.len,
+        path.ptr,
+        path.len,
+    ) == 0 {
         return &inputs.ptr[low];
     }
     return null as &ManifestLeafInputEntry;
@@ -116,11 +192,11 @@ export fn vfs_plan_placeholders(
     materialized_inputs: &ManifestLeafInputList,
     local_changes: &LocalChangeList,
 ) !VfsPlaceholderEntryList {
+    _ = arena;
     if full_inputs.len == 0 as usize {
         return VfsPlaceholderEntryList{ ptr: null, len: 0 as usize };
     }
-    const raw_entries: &VfsPlaceholderEntry = arena_alloc(
-        arena,
+    const raw_entries: &VfsPlaceholderEntry = malloc(
         @size_of(VfsPlaceholderEntry) as usize * full_inputs.len,
     ) as &VfsPlaceholderEntry;
     if raw_entries == null {
@@ -130,10 +206,18 @@ export fn vfs_plan_placeholders(
     var i: usize = 0 as usize;
     while i < full_inputs.len {
         const input: &ManifestLeafInputEntry = &full_inputs.ptr[i];
-        const materialized_entry: &ManifestLeafInputEntry = vfs_find_manifest_input(materialized_inputs, &input.path);
-        const change: &LocalChange = vfs_find_local_change(local_changes, &input.path);
+        const input_path_ptr: &byte = input.path.ptr;
+        const input_path_len: usize = input.path.len;
+        const materialized_entry: &ManifestLeafInputEntry = vfs_find_manifest_input(
+            materialized_inputs,
+            &VfsPath{ ptr: input_path_ptr, len: input_path_len },
+        );
+        const change: &LocalChange = vfs_find_local_change(
+            local_changes,
+            &VfsPath{ ptr: input_path_ptr, len: input_path_len },
+        );
         raw_entries[i] = VfsPlaceholderEntry{
-            path: ByteList{ ptr: input.path.ptr, len: input.path.len },
+            path: VfsPath{ ptr: input_path_ptr, len: input_path_len },
             object_id: input.object_id,
             logical_size: input.logical_size,
             policy_id: input.policy_id,
@@ -149,12 +233,12 @@ export fn vfs_plan_materialization_requests(
     current_materialized: &ManifestLeafInputList,
     target_materialized: &ManifestLeafInputList,
 ) !VfsMaterializationRequestList {
+    _ = arena;
     const max_len: usize = current_materialized.len + target_materialized.len;
     if max_len == 0 as usize {
         return VfsMaterializationRequestList{ ptr: null, len: 0 as usize };
     }
-    const raw_requests: &VfsMaterializationRequest = arena_alloc(
-        arena,
+    const raw_requests: &VfsMaterializationRequest = malloc(
         @size_of(VfsMaterializationRequest) as usize * max_len,
     ) as &VfsMaterializationRequest;
     if raw_requests == null {
@@ -167,11 +251,20 @@ export fn vfs_plan_materialization_requests(
     while current_index < current_materialized.len && target_index < target_materialized.len {
         const current_entry: &ManifestLeafInputEntry = &current_materialized.ptr[current_index];
         const target_entry: &ManifestLeafInputEntry = &target_materialized.ptr[target_index];
-        const cmp: i32 = manifest_path_compare(&current_entry.path, &target_entry.path);
+        const current_path_ptr: &byte = current_entry.path.ptr;
+        const current_path_len: usize = current_entry.path.len;
+        const target_path_ptr: &byte = target_entry.path.ptr;
+        const target_path_len: usize = target_entry.path.len;
+        const cmp: i32 = vfs_path_compare_raw(
+            current_path_ptr,
+            current_path_len,
+            target_path_ptr,
+            target_path_len,
+        );
         if cmp < 0 {
             raw_requests[out_index] = VfsMaterializationRequest{
                 kind: VfsMaterializationRequestKind.Dehydrate,
-                path: ByteList{ ptr: current_entry.path.ptr, len: current_entry.path.len },
+                path: VfsPath{ ptr: current_path_ptr, len: current_path_len },
                 object_id: current_entry.object_id,
                 logical_size: current_entry.logical_size,
                 policy_id: current_entry.policy_id,
@@ -183,7 +276,7 @@ export fn vfs_plan_materialization_requests(
         if cmp > 0 {
             raw_requests[out_index] = VfsMaterializationRequest{
                 kind: VfsMaterializationRequestKind.Materialize,
-                path: ByteList{ ptr: target_entry.path.ptr, len: target_entry.path.len },
+                path: VfsPath{ ptr: target_path_ptr, len: target_path_len },
                 object_id: target_entry.object_id,
                 logical_size: target_entry.logical_size,
                 policy_id: target_entry.policy_id,
@@ -200,7 +293,7 @@ export fn vfs_plan_materialization_requests(
         const current_entry: &ManifestLeafInputEntry = &current_materialized.ptr[current_index];
         raw_requests[out_index] = VfsMaterializationRequest{
             kind: VfsMaterializationRequestKind.Dehydrate,
-            path: ByteList{ ptr: current_entry.path.ptr, len: current_entry.path.len },
+            path: vfs_path_from_input(current_entry),
             object_id: current_entry.object_id,
             logical_size: current_entry.logical_size,
             policy_id: current_entry.policy_id,
@@ -213,7 +306,7 @@ export fn vfs_plan_materialization_requests(
         const target_entry: &ManifestLeafInputEntry = &target_materialized.ptr[target_index];
         raw_requests[out_index] = VfsMaterializationRequest{
             kind: VfsMaterializationRequestKind.Materialize,
-            path: ByteList{ ptr: target_entry.path.ptr, len: target_entry.path.len },
+            path: vfs_path_from_input(target_entry),
             object_id: target_entry.object_id,
             logical_size: target_entry.logical_size,
             policy_id: target_entry.policy_id,
@@ -223,4 +316,43 @@ export fn vfs_plan_materialization_requests(
     }
 
     return VfsMaterializationRequestList{ ptr: raw_requests, len: out_index };
+}
+
+export fn vfs_workspace_plan_build(
+    arena: &Arena,
+    provider_kind: VfsProviderKind,
+    full_inputs: &ManifestLeafInputList,
+    target_profile: &SparseProfile,
+    current_changes: &LocalChangeList,
+    target_changes: &LocalChangeList,
+) !VfsWorkspacePlan {
+    const current_materialized: ManifestLeafInputList = try workspace_local_view_filter_expected_inputs(
+        arena,
+        full_inputs,
+        current_changes,
+    );
+    const target_materialized: ManifestLeafInputList = try workspace_local_view_filter_target_inputs(
+        arena,
+        full_inputs,
+        target_profile,
+        target_changes,
+    );
+    const placeholder_entries: VfsPlaceholderEntryList = try vfs_plan_placeholders(
+        arena,
+        full_inputs,
+        &current_materialized,
+        current_changes,
+    );
+    const materialization_requests: VfsMaterializationRequestList = try vfs_plan_materialization_requests(
+        arena,
+        &current_materialized,
+        &target_materialized,
+    );
+    return VfsWorkspacePlan{
+        provider_kind: provider_kind,
+        current_materialized: current_materialized,
+        target_materialized: target_materialized,
+        placeholder_entries: placeholder_entries,
+        materialization_requests: materialization_requests,
+    };
 }
