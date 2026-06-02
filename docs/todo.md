@@ -431,4 +431,5 @@
 - [x] 将 sparse / hydrate / dehydrate / workspace local view 接入 VFS 规划层，并补齐回归测试。
 - [x] 实现 Linux FUSE adapter、mount 生命周期和错误恢复。
 - [x] 为 macOS / Windows 平台抽象 VFS 边界与降级策略。
-- [ ] 更激进的服务端索引、云端查询和分布式执行能力。
+- [~] 更激进的服务端索引、云端查询和分布式执行能力。
+  - blocked: 2026-06-02 Uya `v0.9.9` 的 `uya test` 入口/链接失败阻塞真实 TDD green 与回归验证，见 `.agent/toolchain-bugs/20260602-100355-uya-test-entry.md`。
