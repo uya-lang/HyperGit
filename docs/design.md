@@ -900,7 +900,7 @@ export struct LocalChange {
 - `hgx dehydrate pathspec` 删除本地内容但保留 manifest 元数据。
 - `hgx sparse add/remove` 更新工作区可见/默认物化范围。
 
-第一版可以先不实现内核级 VFS，采用“真实文件 + placeholder + manifest-aware command”的用户态模型；后续再扩展 FUSE/平台 VFS。
+第一版可以先不实现内核级 VFS，采用“真实文件 + placeholder + manifest-aware command”的用户态模型；后续再扩展 FUSE/平台 VFS。Linux 走挂载式 FUSE 边界，macOS / Windows 先通过平台边界选择器降级为用户态投影，并保持相同的 planner 语义。
 
 ## 14. 并行执行模型
 

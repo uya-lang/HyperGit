@@ -76,6 +76,7 @@ test:
 	$(UYA) test src/hgx/test_commit_partial_stage.uya
 	$(UYA) test src/hgx/test_checkout_security.uya
 	$(UYA) test src/hgx/test_cli_args.uya
+	$(UYA) test src/hypergit/test_workspace_vfs.uya
 	./tests/test_cli_golden.sh
 	./tests/test_help_scope.sh
 	./tests/test_version_flag.sh

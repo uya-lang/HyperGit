@@ -23,12 +23,17 @@ use workspace.sparse_profile.SparseProfile;
 use workspace.sparse_profile.sparse_profile_default;
 use workspace.vfs.VfsMaterializationRequestKind;
 use workspace.vfs.VfsMaterializationRequestList;
+use workspace.vfs.VfsBoundaryKind;
+use workspace.vfs.VfsDegradeKind;
 use workspace.vfs.VfsPlaceholderEntryList;
 use workspace.vfs.VfsPlaceholderState;
+use workspace.vfs.VfsPlatformBoundary;
+use workspace.vfs.VfsPlatformKind;
 use workspace.vfs.VfsProviderKind;
 use workspace.vfs.VfsWorkspacePlan;
 use workspace.vfs.vfs_plan_materialization_requests;
 use workspace.vfs.vfs_plan_placeholders;
+use workspace.vfs.vfs_platform_boundary_for;
 use workspace.vfs.vfs_workspace_plan_build;
 
 fn make_hash(seed: byte) Hash32 {
@@ -272,10 +277,31 @@ fn test_vfs_workspace_plan_builds_visible_views_and_requests() !void {
     try expect(plan.materialization_requests.ptr[0].path.ptr[0] == 'b' as byte);
 }
 
+fn test_vfs_platform_boundary_degrades_non_linux_platforms_to_user_space() !void {
+    const linux_boundary: VfsPlatformBoundary = vfs_platform_boundary_for(VfsPlatformKind.Linux);
+    try expect(linux_boundary.provider_kind == VfsProviderKind.FuseLinux);
+    try expect(linux_boundary.boundary_kind == VfsBoundaryKind.KernelMounted);
+    try expect(linux_boundary.degrade_kind == VfsDegradeKind.None);
+    try expect(linux_boundary.mount_supported);
+
+    const mac_boundary: VfsPlatformBoundary = vfs_platform_boundary_for(VfsPlatformKind.MacOS);
+    try expect(mac_boundary.provider_kind == VfsProviderKind.UserSpace);
+    try expect(mac_boundary.boundary_kind == VfsBoundaryKind.UserSpaceProjected);
+    try expect(mac_boundary.degrade_kind == VfsDegradeKind.UserSpaceProjection);
+    try expect(!mac_boundary.mount_supported);
+
+    const windows_boundary: VfsPlatformBoundary = vfs_platform_boundary_for(VfsPlatformKind.Windows);
+    try expect(windows_boundary.provider_kind == VfsProviderKind.UserSpace);
+    try expect(windows_boundary.boundary_kind == VfsBoundaryKind.UserSpaceProjected);
+    try expect(windows_boundary.degrade_kind == VfsDegradeKind.UserSpaceProjection);
+    try expect(!windows_boundary.mount_supported);
+}
+
 export fn main() i32 {
     test_suite_begin("HyperGit Workspace VFS Tests");
     run_test("vfs plan placeholders tracks virtual materialized and dirty", test_vfs_plan_placeholders_tracks_virtual_materialized_and_dirty);
     run_test("vfs plan materialization requests tracks materialize and dehydrate", test_vfs_plan_materialization_requests_tracks_materialize_and_dehydrate);
     run_test("vfs workspace plan builds visible views and requests", test_vfs_workspace_plan_builds_visible_views_and_requests);
+    run_test("vfs platform boundary degrades non linux platforms to user space", test_vfs_platform_boundary_degrades_non_linux_platforms_to_user_space);
     return test_suite_end();
 }

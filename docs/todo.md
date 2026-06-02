@@ -430,5 +430,5 @@
 - [x] 定义 VFS provider / placeholder entry / materialization request 数据结构与规划器，并补齐单元测试。
 - [x] 将 sparse / hydrate / dehydrate / workspace local view 接入 VFS 规划层，并补齐回归测试。
 - [x] 实现 Linux FUSE adapter、mount 生命周期和错误恢复。
-- [ ] 为 macOS / Windows 平台抽象 VFS 边界与降级策略。
+- [x] 为 macOS / Windows 平台抽象 VFS 边界与降级策略。
 - [ ] 更激进的服务端索引、云端查询和分布式执行能力。

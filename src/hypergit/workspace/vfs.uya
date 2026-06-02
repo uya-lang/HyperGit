@@ -27,6 +27,22 @@ export enum VfsProviderKind {
     PlatformNative
 }
 
+export enum VfsBoundaryKind {
+    KernelMounted,
+    UserSpaceProjected
+}
+
+export enum VfsDegradeKind {
+    None,
+    UserSpaceProjection
+}
+
+export enum VfsPlatformKind {
+    Linux,
+    MacOS,
+    Windows
+}
+
 export enum VfsPlaceholderState {
     VirtualOnly,
     Materialized,
@@ -70,6 +86,30 @@ export struct VfsMaterializationRequestList {
 
 export fn vfs_materialization_request_list_from_slice(slice: &[VfsMaterializationRequest]) VfsMaterializationRequestList {
     return VfsMaterializationRequestList{ ptr: slice.ptr, len: slice.len };
+}
+
+export struct VfsPlatformBoundary {
+    provider_kind: VfsProviderKind,
+    boundary_kind: VfsBoundaryKind,
+    degrade_kind: VfsDegradeKind,
+    mount_supported: bool
+}
+
+export fn vfs_platform_boundary_for(platform_kind: VfsPlatformKind) VfsPlatformBoundary {
+    if platform_kind == VfsPlatformKind.Linux {
+        return VfsPlatformBoundary{
+            provider_kind: VfsProviderKind.FuseLinux,
+            boundary_kind: VfsBoundaryKind.KernelMounted,
+            degrade_kind: VfsDegradeKind.None,
+            mount_supported: true
+        };
+    }
+    return VfsPlatformBoundary{
+        provider_kind: VfsProviderKind.UserSpace,
+        boundary_kind: VfsBoundaryKind.UserSpaceProjected,
+        degrade_kind: VfsDegradeKind.UserSpaceProjection,
+        mount_supported: false
+    };
 }
 
 export struct VfsWorkspacePlan {
