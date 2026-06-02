@@ -1,6 +1,9 @@
 ## Summary
 `uya test` 在编译 `workspace.vfs` 相关测试时，会生成引用 `struct AsyncFrameDescriptorTable` 的 C 代码，但未带入该结构体定义，导致宿主 `cc` 在 C 编译阶段失败。向 `src/hypergit/workspace/vfs.uya` 显式加入 `use std.async_frame;` 后，问题可暂时绕过。
 
+## Status
+Resolved as of 2026-06-02 by the Uya C99 async-frame descriptor emission fix. The corrected repro script now compiles, links, and runs successfully; the generated test reports `minimal vfs workspace plan build ... OK`.
+
 ## Affected Tasks
 - FUSE / 平台 VFS / 内核级虚拟工作区。
 - 定义 VFS provider / placeholder entry / materialization request 数据结构与规划器，并补齐单元测试。
@@ -58,6 +61,7 @@ use workspace.state.local_change_list_from_slice;
 use workspace.sparse_profile.SparseProfile;
 use workspace.sparse_profile.sparse_profile_default;
 use workspace.vfs.VfsProviderKind;
+use workspace.vfs.VfsWorkspacePlan;
 use workspace.vfs.vfs_workspace_plan_build;
 
 fn make_hash(seed: byte) Hash32 {
@@ -129,7 +133,7 @@ fn test_vfs_workspace_plan_build_minimal() !void {
     const current_change_list: LocalChangeList = local_change_list_from_slice(current_changes[0: 1]);
     const target_change_list: LocalChangeList = local_change_list_from_slice(target_changes[0: 1]);
     const profile: SparseProfile = try sparse_profile_default(&arena);
-    const plan = try vfs_workspace_plan_build(
+    const plan: VfsWorkspacePlan = try vfs_workspace_plan_build(
         &arena,
         VfsProviderKind.UserSpace,
         &full_list,
@@ -153,5 +157,5 @@ chmod +x "$TMP_UYA"
 ```
 
 ## Notes
-- 这是在 `src/hypergit/workspace/vfs.uya` 未显式导入 `std.async_frame` 的状态下观察到的失败；当前工作区已加上该 import，作为 workaround 重新验证通过。
-- 这个问题看起来是 Uya C99 后端在某些输入图下漏发 `AsyncFrameDescriptorTable` 定义，而不是 `workspace.vfs` 语义错误。
+- 这是 Uya C99 后端在某些输入图下漏发 `AsyncFrameDescriptorTable` / `_uya_async_frame_descriptors` 定义，而不是 `workspace.vfs` 语义错误。
+- 回归覆盖已加入 Uya：`tests/verify_c99_async_frame_empty_descriptors.sh` 验证无 `@async_fn` 时仍会发射空 descriptor 表和 `int32_t _uya_async_frame_descriptor_count = 0;`。

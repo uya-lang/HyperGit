@@ -1,6 +1,9 @@
 ## Summary
 在当前 audit log 接线改动下，`uya build src/hgx/main.uya` 会在类型检查阶段稳定报 `错误集已满`，并连带把 `hydrate/status` 中的 `@error_id` 参数推断打坏，无法继续验证主程序构建。
 
+## Status
+Not reproduced as of 2026-06-02 after rebuilding `/home/winger/uya/uya/bin/uya` from the current Uya toolchain. The repro command completed type checking, code generation, split-C compilation, and linked `/tmp/hgx-audit-error-set-full` successfully.
+
 ## Affected Tasks
 - 更复杂的 audit / policy / dedupe / storage tier 体系。
 - 为 checkout / fetch / push / commit 生成可落盘 audit log，并补齐 doctor / CLI 可见性与回归测试。
@@ -35,4 +38,4 @@ cd "$ROOT"
 
 ## Notes
 - 该 repro 依赖当前工作区中的 audit log 接线改动。
-- 现象更像是 Uya 类型检查器/错误集推断上限问题，而不是单一业务模块的确定性语义错误。
+- 当前本地工具链已不再触发 `错误集已满`；若后续再次出现，应重新确认是否由新的 audit/error-set 增量触发。

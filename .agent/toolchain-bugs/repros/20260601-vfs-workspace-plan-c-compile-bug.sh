@@ -30,6 +30,7 @@ use workspace.state.local_change_list_from_slice;
 use workspace.sparse_profile.SparseProfile;
 use workspace.sparse_profile.sparse_profile_default;
 use workspace.vfs.VfsProviderKind;
+use workspace.vfs.VfsWorkspacePlan;
 use workspace.vfs.vfs_workspace_plan_build;
 
 fn make_hash(seed: byte) Hash32 {
@@ -101,7 +102,7 @@ fn test_vfs_workspace_plan_build_minimal() !void {
     const current_change_list: LocalChangeList = local_change_list_from_slice(current_changes[0: 1]);
     const target_change_list: LocalChangeList = local_change_list_from_slice(target_changes[0: 1]);
     const profile: SparseProfile = try sparse_profile_default(&arena);
-    const plan = try vfs_workspace_plan_build(
+    const plan: VfsWorkspacePlan = try vfs_workspace_plan_build(
         &arena,
         VfsProviderKind.UserSpace,
         &full_list,

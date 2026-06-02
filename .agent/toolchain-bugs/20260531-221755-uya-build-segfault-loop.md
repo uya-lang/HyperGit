@@ -1,6 +1,9 @@
 ## Summary
 `uya build src/hgx/main.uya -o <tmp>/hgx >/dev/null 2>&1` 在 shell 回归里会偶发崩溃，表现为 `Segmentation fault`，导致 `tests/test_doctor_diagnostics.sh`、`tests/test_checkout_content.sh`、`tests/test_file_remote_fetch_push_happy_path.sh` 等命令级回归无法稳定执行。
 
+## Status
+Monitoring as of 2026-06-02. After rebuilding `/home/winger/uya/uya/bin/uya`, a corrected 20-iteration build loop that preserves the real command exit code completed with `no failure observed`. Because this was originally intermittent, keep this bug open for observation rather than marking it fully resolved.
+
 ## Affected Tasks
 - 为 checkout / fetch / push / commit 生成可落盘 audit log，并补齐 doctor / CLI 可见性与回归测试。
 - 扩展 `hgx doctor` 对 audit log 的可见性与诊断，并补齐命令级回归测试。
@@ -44,3 +47,4 @@ echo "no failure observed"
 ## Notes
 - 这是间歇性崩溃，不是每次都能在第一次迭代触发。
 - 当前 audit / doctor 子任务已经有业务层回归测试，但 shell 测试入口被这个编译器稳定性问题污染，无法作为可靠完成证据。
+- 原 repro 脚本已修正 `if ! command; then status=$?` 会把失败状态记录为 `0` 的 shell 陷阱。

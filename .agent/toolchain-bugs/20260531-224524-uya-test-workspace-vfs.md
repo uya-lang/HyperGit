@@ -1,6 +1,9 @@
 ## Summary
 `uya test src/hypergit/test_workspace_vfs.uya` 在类型检查和代码生成之后异常退出，返回码显示为 `-1`，没有继续到对象编译/链接或测试执行阶段，导致 FUSE/VFS 规划层的新单元测试无法作为完成证据。
 
+## Status
+Resolved as of 2026-06-02 by the Uya C99 async-frame descriptor emission fix. The repro command now compiles, links, and runs successfully: all 4 HyperGit Workspace VFS tests passed with 28 assertions.
+
 ## Affected Tasks
 - FUSE / 平台 VFS / 内核级虚拟工作区。
 - 定义 VFS provider / placeholder entry / materialization request 数据结构与规划器，并补齐单元测试。
@@ -35,4 +38,4 @@ cd "$ROOT"
 
 ## Notes
 - 同一仓库里 `uya test src/hypergit/test_local_view.uya` 可以正常完成并运行测试。
-- 当前 `src/hypergit/test_workspace_vfs.uya` 已通过类型检查，问题更像是 `uya test/build` 对该测试单元的后续阶段异常退出，而不是源码语义错误。
+- 根因对应 Uya C99 后端在无 async frame metadata 但运行时引用 descriptor 表时漏发 `_uya_async_frame_descriptors`。

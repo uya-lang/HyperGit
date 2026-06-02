@@ -1,6 +1,9 @@
 ## Summary
 `/home/winger/uya/uya/bin/uya test src/hypergit/test_object_model.uya` segfaults during code generation, which prevents `make test` from completing even after the Linux FUSE fix passes in isolation.
 
+## Status
+Not reproduced as of 2026-06-02 after rebuilding `/home/winger/uya/uya/bin/uya` from the current Uya toolchain. The repro command completed successfully: all 5 HyperGit object model tests passed with 25 assertions.
+
 ## Affected Tasks
 - `实现 Linux FUSE adapter、mount 生命周期和错误恢复。`
 
@@ -25,4 +28,4 @@ cd /media/winger/_dde_home/winger/uya/HyperGit
 ```
 
 ## Notes
-This repro is independent of the Linux FUSE bridge changes. The isolated Linux FUSE wrapper test passes under `unshare -Urnm`, but the broader `make test` gate is currently blocked by this separate Uya crash.
+This repro was independent of the Linux FUSE bridge changes. It is no longer blocking the broader test gate in the current local toolchain.
