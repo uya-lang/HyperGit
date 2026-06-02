@@ -893,7 +893,7 @@ fn http_remote_store_view(arena: &Arena, store: &LooseObjectStore, view: &Publis
 
 export fn http_remote_capabilities_json(arena: &Arena, runtime: &HttpRemoteRuntime) !ByteList {
     const default_branch: &[byte] = (&runtime.default_branch[0] as &byte)[0: runtime.default_branch_len];
-    const total_len: usize = 320 as usize + default_branch.len;
+    const total_len: usize = 640 as usize + default_branch.len;
     const out: &[byte] = try http_remote_arena_bytes(arena, total_len);
     var offset: usize = 0;
     try http_remote_append_literal(out, &offset, "{\"service\":");
@@ -908,6 +908,7 @@ export fn http_remote_capabilities_json(arena: &Arena, runtime: &HttpRemoteRunti
     } else {
         try http_remote_append_literal(out, &offset, "false");
     }
+    try http_remote_append_literal(out, &offset, ",\"capabilities\":[\"server_index\",\"cloud_query\",\"manifest_query\",\"path_history_query\",\"server_side_diff\",\"server_side_merge_base\",\"parallel_pack_segments\",\"distributed_execution\"]");
     try http_remote_append_literal(out, &offset, ",\"routes\":{\"capabilities\":\"/capabilities\",\"object_batch\":\"/objects/batch\",\"manifest_query\":\"/manifest/query\",\"fetch\":\"/fetch\",\"push\":\"/push\"}}\n");
     return ByteList{ ptr: out.ptr, len: offset };
 }

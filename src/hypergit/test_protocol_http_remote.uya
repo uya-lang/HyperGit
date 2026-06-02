@@ -386,6 +386,9 @@ fn test_http_remote_capabilities_and_routes() !void {
     try expect(contains_bytes(body.ptr[0: body.len], literal_bytes("\"default_branch\":\"main\"")));
     try expect(contains_bytes(body.ptr[0: body.len], literal_bytes("\"object_batch\":\"/objects/batch\"")));
     try expect(contains_bytes(body.ptr[0: body.len], literal_bytes("\"auth_required\":true")));
+    try expect(contains_bytes(body.ptr[0: body.len], literal_bytes("\"server_index\"")));
+    try expect(contains_bytes(body.ptr[0: body.len], literal_bytes("\"cloud_query\"")));
+    try expect(contains_bytes(body.ptr[0: body.len], literal_bytes("\"distributed_execution\"")));
 }
 
 fn test_http_remote_object_batch_returns_present_and_missing_records() !void {

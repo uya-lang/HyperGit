@@ -1,0 +1,120 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use exec.task.TaskKind;
+use index.server_index.CloudQueryKind;
+use index.server_index.ServerIndexCapability;
+use index.server_index.ServerIndexDistributedTaskList;
+use index.server_index.ServerIndexExecutionKind;
+use index.server_index.ServerIndexQueryPlan;
+use index.server_index.ServerIndexQueryRequest;
+use index.server_index.ServerIndexSnapshot;
+use index.server_index.server_index_build_distributed_tasks;
+use index.server_index.server_index_capability_name;
+use index.server_index.server_index_plan_cloud_query;
+use index.server_index.server_index_query_request_init;
+use index.server_index.server_index_snapshot_init;
+use object.types.ByteList;
+
+fn byte_list_equals_literal(value: ByteList, text: &const byte) bool {
+    var len: usize = 0;
+    while text[len] != 0 as byte {
+        len = len + 1 as usize;
+    }
+    if value.len != len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < len {
+        if value.ptr[i] != text[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn test_server_side_diff_query_uses_distributed_shards() !void {
+    const snapshot: ServerIndexSnapshot = server_index_snapshot_init(
+        120000u64,
+        4096u64,
+        2048u64,
+        32000u64,
+        12u64,
+    );
+    const request: ServerIndexQueryRequest = server_index_query_request_init(
+        CloudQueryKind.ServerSideDiff,
+        4 as usize,
+        196608u64,
+        128u64 * 1024u64,
+        4u64 * 1024u64 * 1024u64,
+    );
+
+    const plan: ServerIndexQueryPlan = try server_index_plan_cloud_query(&snapshot, &request, 6 as usize);
+    try expect(plan.uses_serving_index);
+    try expect(plan.execution_kind == ServerIndexExecutionKind.Distributed);
+    try expect(plan.task_kind == TaskKind.DiffShard);
+    try expect(plan.task_count == 6 as usize);
+    try expect(plan.candidate_items == 196608u64);
+    try expect(plan.index_entries_scanned == 2048u64);
+
+    var arena_buf: [byte: 4096] = [];
+    var arena: Arena = Arena{ buffer: &arena_buf[0], size: 0, used: 0 };
+    arena_init(&arena, &arena_buf[0], 4096 as usize);
+    const tasks: ServerIndexDistributedTaskList = try server_index_build_distributed_tasks(&arena, &plan, 100u64);
+    try expect(tasks.len == 6 as usize);
+    try expect(tasks.ptr[0].id == 100u64);
+    try expect(tasks.ptr[0].kind == TaskKind.DiffShard);
+    try expect(tasks.ptr[0].input_offset == 0u64);
+    try expect(tasks.ptr[0].input_len == 32768u64);
+    try expect(tasks.ptr[5].id == 105u64);
+    try expect(tasks.ptr[5].input_offset == 163840u64);
+    try expect(tasks.ptr[5].input_len == 32768u64);
+}
+
+fn test_path_history_query_requires_path_history_index() !void {
+    const snapshot: ServerIndexSnapshot = server_index_snapshot_init(
+        32u64,
+        0u64,
+        4u64,
+        8u64,
+        7u64,
+    );
+    const request: ServerIndexQueryRequest = server_index_query_request_init(
+        CloudQueryKind.PathHistory,
+        1 as usize,
+        8u64,
+        4096u64,
+        1024u64 * 1024u64,
+    );
+
+    const plan: ServerIndexQueryPlan = server_index_plan_cloud_query(&snapshot, &request, 4 as usize) catch |err| {
+        try expect(@error_id(err) == @error_id(error.ServerIndexUnavailable));
+        return;
+    };
+    _ = plan;
+    return error.AssertionFailed;
+}
+
+fn test_capability_names_are_stable_for_protocol_advertising() !void {
+    try expect(byte_list_equals_literal(server_index_capability_name(ServerIndexCapability.ServerIndex), "server_index"));
+    try expect(byte_list_equals_literal(server_index_capability_name(ServerIndexCapability.CloudQuery), "cloud_query"));
+    try expect(byte_list_equals_literal(server_index_capability_name(ServerIndexCapability.ManifestQuery), "manifest_query"));
+    try expect(byte_list_equals_literal(server_index_capability_name(ServerIndexCapability.PathHistoryQuery), "path_history_query"));
+    try expect(byte_list_equals_literal(server_index_capability_name(ServerIndexCapability.ServerSideDiff), "server_side_diff"));
+    try expect(byte_list_equals_literal(server_index_capability_name(ServerIndexCapability.ParallelPackSegments), "parallel_pack_segments"));
+    try expect(byte_list_equals_literal(server_index_capability_name(ServerIndexCapability.DistributedExecution), "distributed_execution"));
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Server Index Tests");
+    run_test("server-side diff query uses distributed shards", test_server_side_diff_query_uses_distributed_shards);
+    run_test("path history query requires path history index", test_path_history_query_requires_path_history_index);
+    run_test("capability names are stable for protocol advertising", test_capability_names_are_stable_for_protocol_advertising);
+    return test_suite_end();
+}

@@ -1,0 +1,281 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_alloc;
+
+use exec.task.ExecTask;
+use exec.task.TaskKind;
+use exec.task.task_init;
+use object.types.ByteList;
+
+error ServerIndexAlloc;
+error ServerIndexUnavailable;
+error ServerIndexQueryTooLarge;
+
+const SERVER_INDEX_DISTRIBUTED_MIN_ITEMS: u64 = 65536u64;
+const SERVER_INDEX_TARGET_ITEMS_PER_TASK: u64 = 32768u64;
+const SERVER_INDEX_PRIORITY_NORMAL: u16 = 32 as u16;
+const SERVER_INDEX_PRIORITY_FETCH: u16 = 24 as u16;
+
+export enum CloudQueryKind {
+    ManifestQuery,
+    PathHistory,
+    ServerSideDiff,
+    ServerSideMergeBase,
+    PackSegmentFetch
+}
+
+export enum ServerIndexCapability {
+    ServerIndex,
+    CloudQuery,
+    ManifestQuery,
+    PathHistoryQuery,
+    ServerSideDiff,
+    ServerSideMergeBase,
+    ParallelPackSegments,
+    DistributedExecution
+}
+
+export enum ServerIndexExecutionKind {
+    Local,
+    Distributed
+}
+
+export struct ServerIndexSnapshot {
+    manifest_locator_entries: u64,
+    path_history_entries: u64,
+    commit_graph_entries: u64,
+    pack_segment_entries: u64,
+    generation: u64
+}
+
+export struct ServerIndexQueryRequest {
+    kind: CloudQueryKind,
+    pathspec_count: usize,
+    candidate_items: u64,
+    estimated_result_bytes: u64,
+    max_result_bytes: u64
+}
+
+export struct ServerIndexQueryPlan {
+    kind: CloudQueryKind,
+    uses_serving_index: bool,
+    execution_kind: ServerIndexExecutionKind,
+    task_kind: TaskKind,
+    task_count: usize,
+    candidate_items: u64,
+    estimated_result_bytes: u64,
+    index_entries_scanned: u64,
+    snapshot_generation: u64,
+    pathspec_count: usize
+}
+
+export struct ServerIndexDistributedTaskList {
+    ptr: &ExecTask,
+    len: usize
+}
+
+fn server_index_literal_len(text: &const byte) usize {
+    var len: usize = 0;
+    while text[len] != 0 as byte {
+        len = len + 1 as usize;
+    }
+    return len;
+}
+
+fn server_index_literal_byte_list(text: &const byte) ByteList {
+    return ByteList{ ptr: text as &byte, len: server_index_literal_len(text) };
+}
+
+fn server_index_min_u64(left: u64, right: u64) u64 {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+fn server_index_ceil_div_u64(value: u64, divisor: u64) u64 {
+    if divisor == 0u64 || value == 0u64 {
+        return 0u64;
+    }
+    return ((value - 1u64) / divisor) + 1u64;
+}
+
+fn server_index_required_entries(snapshot: &ServerIndexSnapshot, kind: CloudQueryKind) u64 {
+    if kind == CloudQueryKind.ManifestQuery {
+        return snapshot.manifest_locator_entries;
+    }
+    if kind == CloudQueryKind.PathHistory {
+        return snapshot.path_history_entries;
+    }
+    if kind == CloudQueryKind.ServerSideDiff {
+        return server_index_min_u64(snapshot.manifest_locator_entries, snapshot.commit_graph_entries);
+    }
+    if kind == CloudQueryKind.ServerSideMergeBase {
+        return snapshot.commit_graph_entries;
+    }
+    return snapshot.pack_segment_entries;
+}
+
+fn server_index_task_kind_for_query(kind: CloudQueryKind) TaskKind {
+    if kind == CloudQueryKind.ServerSideDiff {
+        return TaskKind.DiffShard;
+    }
+    if kind == CloudQueryKind.PackSegmentFetch {
+        return TaskKind.FetchSegment;
+    }
+    return TaskKind.ReadObject;
+}
+
+fn server_index_task_priority(kind: TaskKind) u16 {
+    if kind == TaskKind.FetchSegment {
+        return SERVER_INDEX_PRIORITY_FETCH;
+    }
+    return SERVER_INDEX_PRIORITY_NORMAL;
+}
+
+fn server_index_plan_task_count(candidate_items: u64, worker_count: usize) usize {
+    if candidate_items == 0u64 {
+        return 0 as usize;
+    }
+    if worker_count <= 1 as usize || candidate_items < SERVER_INDEX_DISTRIBUTED_MIN_ITEMS {
+        return 1 as usize;
+    }
+    var wanted: u64 = server_index_ceil_div_u64(candidate_items, SERVER_INDEX_TARGET_ITEMS_PER_TASK);
+    if wanted == 0u64 {
+        wanted = 1u64;
+    }
+    if wanted > (worker_count as u64) {
+        wanted = worker_count as u64;
+    }
+    return wanted as usize;
+}
+
+export fn server_index_snapshot_init(
+    manifest_locator_entries: u64,
+    path_history_entries: u64,
+    commit_graph_entries: u64,
+    pack_segment_entries: u64,
+    generation: u64,
+) ServerIndexSnapshot {
+    return ServerIndexSnapshot{
+        manifest_locator_entries: manifest_locator_entries,
+        path_history_entries: path_history_entries,
+        commit_graph_entries: commit_graph_entries,
+        pack_segment_entries: pack_segment_entries,
+        generation: generation,
+    };
+}
+
+export fn server_index_query_request_init(
+    kind: CloudQueryKind,
+    pathspec_count: usize,
+    candidate_items: u64,
+    estimated_result_bytes: u64,
+    max_result_bytes: u64,
+) ServerIndexQueryRequest {
+    return ServerIndexQueryRequest{
+        kind: kind,
+        pathspec_count: pathspec_count,
+        candidate_items: candidate_items,
+        estimated_result_bytes: estimated_result_bytes,
+        max_result_bytes: max_result_bytes,
+    };
+}
+
+export fn server_index_capability_name(capability: ServerIndexCapability) ByteList {
+    if capability == ServerIndexCapability.ServerIndex {
+        return server_index_literal_byte_list("server_index");
+    }
+    if capability == ServerIndexCapability.CloudQuery {
+        return server_index_literal_byte_list("cloud_query");
+    }
+    if capability == ServerIndexCapability.ManifestQuery {
+        return server_index_literal_byte_list("manifest_query");
+    }
+    if capability == ServerIndexCapability.PathHistoryQuery {
+        return server_index_literal_byte_list("path_history_query");
+    }
+    if capability == ServerIndexCapability.ServerSideDiff {
+        return server_index_literal_byte_list("server_side_diff");
+    }
+    if capability == ServerIndexCapability.ServerSideMergeBase {
+        return server_index_literal_byte_list("server_side_merge_base");
+    }
+    if capability == ServerIndexCapability.ParallelPackSegments {
+        return server_index_literal_byte_list("parallel_pack_segments");
+    }
+    return server_index_literal_byte_list("distributed_execution");
+}
+
+export fn server_index_plan_cloud_query(
+    snapshot: &ServerIndexSnapshot,
+    request: &ServerIndexQueryRequest,
+    worker_count: usize,
+) !ServerIndexQueryPlan {
+    if request.max_result_bytes > 0u64 && request.estimated_result_bytes > request.max_result_bytes {
+        return error.ServerIndexQueryTooLarge;
+    }
+
+    const required_entries: u64 = server_index_required_entries(snapshot, request.kind);
+    if required_entries == 0u64 {
+        return error.ServerIndexUnavailable;
+    }
+
+    const task_kind: TaskKind = server_index_task_kind_for_query(request.kind);
+    const task_count: usize = server_index_plan_task_count(request.candidate_items, worker_count);
+    var execution_kind: ServerIndexExecutionKind = ServerIndexExecutionKind.Local;
+    if task_count > 1 as usize {
+        execution_kind = ServerIndexExecutionKind.Distributed;
+    }
+
+    return ServerIndexQueryPlan{
+        kind: request.kind,
+        uses_serving_index: true,
+        execution_kind: execution_kind,
+        task_kind: task_kind,
+        task_count: task_count,
+        candidate_items: request.candidate_items,
+        estimated_result_bytes: request.estimated_result_bytes,
+        index_entries_scanned: required_entries,
+        snapshot_generation: snapshot.generation,
+        pathspec_count: request.pathspec_count,
+    };
+}
+
+export fn server_index_build_distributed_tasks(
+    arena: &Arena,
+    plan: &ServerIndexQueryPlan,
+    base_task_id: u64,
+) !ServerIndexDistributedTaskList {
+    if plan.task_count == 0 as usize {
+        return ServerIndexDistributedTaskList{ ptr: null, len: 0 as usize };
+    }
+
+    const raw: &ExecTask = arena_alloc(arena, @size_of(ExecTask) as usize * plan.task_count) as &ExecTask;
+    if raw == null {
+        return error.ServerIndexAlloc;
+    }
+
+    const base_len: u64 = plan.candidate_items / (plan.task_count as u64);
+    const remainder: u64 = plan.candidate_items % (plan.task_count as u64);
+    const priority: u16 = server_index_task_priority(plan.task_kind);
+
+    var offset: u64 = 0u64;
+    var i: usize = 0;
+    while i < plan.task_count {
+        var input_len: u64 = base_len;
+        if (i as u64) < remainder {
+            input_len = input_len + 1u64;
+        }
+        raw[i] = task_init(
+            base_task_id + (i as u64),
+            plan.task_kind,
+            priority,
+            offset,
+            input_len,
+        );
+        offset = offset + input_len;
+        i = i + 1 as usize;
+    }
+
+    return ServerIndexDistributedTaskList{ ptr: raw, len: plan.task_count };
+}

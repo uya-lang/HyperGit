@@ -53,6 +53,7 @@ test:
 	$(UYA) test src/hypergit/test_manifest_diff.uya
 	$(UYA) test src/hypergit/test_commit_build.uya
 	$(UYA) test src/hypergit/test_commit_graph.uya
+	$(UYA) test src/hypergit/test_server_index.uya
 	$(UYA) test src/hypergit/test_stage_state.uya
 	$(UYA) test src/hypergit/test_stage_file.uya
 	$(UYA) test src/hypergit/test_small_blob_hash.uya
