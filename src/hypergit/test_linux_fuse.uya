@@ -1,0 +1,138 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.run_test;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+
+use libc.system;
+use object.types.ByteList;
+use workspace.linux_fuse.LinuxFuseEntry;
+use workspace.linux_fuse.LinuxFuseEntryList;
+use workspace.linux_fuse.LinuxFuseMount;
+use workspace.linux_fuse.LinuxFusePlaceholderState;
+use workspace.linux_fuse.LinuxFuseSnapshot;
+use workspace.linux_fuse.linux_fuse_entry_list_from_slice;
+use workspace.linux_fuse.linux_fuse_mount_destroy;
+use workspace.linux_fuse.linux_fuse_mount_join;
+use workspace.linux_fuse.linux_fuse_mount_start;
+use workspace.linux_fuse.linux_fuse_mount_stop;
+use workspace.linux_fuse.linux_fuse_snapshot_from_entries;
+
+fn linux_fuse_mount_should_fail(snapshot: &LinuxFuseSnapshot, mountpoint: &ByteList) !bool {
+    const mount: LinuxFuseMount = linux_fuse_mount_start(snapshot, mountpoint) catch {
+        return true;
+    };
+    linux_fuse_mount_stop(&mount);
+    _ = try linux_fuse_mount_join(&mount);
+    linux_fuse_mount_destroy(&mount);
+    return false;
+}
+
+fn test_linux_fuse_mount_roundtrip_and_stop() !void {
+    try expect(system("rm -rf build/linux-fuse-test && mkdir -p build/linux-fuse-test/repo build/linux-fuse-test/mnt") == 0);
+    try expect(system("printf hello > build/linux-fuse-test/repo/hello.txt") == 0);
+
+    var hello_path: [byte: 10] = ['h' as byte, 'e' as byte, 'l' as byte, 'l' as byte, 'o' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte, 0 as byte];
+    var hello_backing: [byte: 38] = ['b' as byte, 'u' as byte, 'i' as byte, 'l' as byte, 'd' as byte, '/' as byte, 'l' as byte, 'i' as byte, 'n' as byte, 'u' as byte, 'x' as byte, '-' as byte, 'f' as byte, 'u' as byte, 's' as byte, 'e' as byte, '-' as byte, 't' as byte, 'e' as byte, 's' as byte, 't' as byte, '/' as byte, 'r' as byte, 'e' as byte, 'p' as byte, 'o' as byte, '/' as byte, 'h' as byte, 'e' as byte, 'l' as byte, 'l' as byte, 'o' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte, 0 as byte];
+    var ghost_path: [byte: 10] = ['g' as byte, 'h' as byte, 'o' as byte, 's' as byte, 't' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte, 0 as byte];
+    var repo_root_path: [byte: 25] = ['/' as byte, 't' as byte, 'm' as byte, 'p' as byte, '/' as byte, 'h' as byte, 'y' as byte, 'p' as byte, 'e' as byte, 'r' as byte, 'g' as byte, 'i' as byte, 't' as byte, '-' as byte, 'l' as byte, 'i' as byte, 'n' as byte, 'u' as byte, 'x' as byte, '-' as byte, 'f' as byte, 'u' as byte, 's' as byte, 'e' as byte, 0 as byte];
+    const repo_root: ByteList = ByteList{ ptr: &repo_root_path[0], len: 24 as usize };
+
+    var entries: [LinuxFuseEntry: 2] = [
+        LinuxFuseEntry{
+            path: ByteList{ ptr: &hello_path[0], len: 9 as usize },
+            backing_path: ByteList{ ptr: &hello_backing[0], len: 36 as usize },
+            mode: 33188u32,
+            logical_size: 5u64,
+            placeholder_state: LinuxFusePlaceholderState.Materialized,
+        },
+        LinuxFuseEntry{
+            path: ByteList{ ptr: &ghost_path[0], len: 9 as usize },
+            backing_path: ByteList{ ptr: null, len: 0 as usize },
+            mode: 33188u32,
+            logical_size: 11u64,
+            placeholder_state: LinuxFusePlaceholderState.VirtualOnly,
+        },
+    ];
+    const entry_list: LinuxFuseEntryList = linux_fuse_entry_list_from_slice(entries[0: 2]);
+    const snapshot: LinuxFuseSnapshot = linux_fuse_snapshot_from_entries(&repo_root, &entry_list);
+    var mountpoint: [byte: 29] = ['b' as byte, 'u' as byte, 'i' as byte, 'l' as byte, 'd' as byte, '/' as byte, 'l' as byte, 'i' as byte, 'n' as byte, 'u' as byte, 'x' as byte, '-' as byte, 'f' as byte, 'u' as byte, 's' as byte, 'e' as byte, '-' as byte, 't' as byte, 'e' as byte, 's' as byte, 't' as byte, '/' as byte, 'm' as byte, 'n' as byte, 't' as byte, 0 as byte, 0 as byte, 0 as byte, 0 as byte];
+    const mountpoint_view: ByteList = ByteList{ ptr: &mountpoint[0], len: 25 as usize };
+    const mount: LinuxFuseMount = try linux_fuse_mount_start(&snapshot, &mountpoint_view);
+
+    try expect(system("test -f build/linux-fuse-test/mnt/hello.txt") == 0);
+    try expect(system("test -f build/linux-fuse-test/mnt/ghost.txt") == 0);
+    try expect(system("cat build/linux-fuse-test/mnt/hello.txt | grep -Fx hello >/dev/null") == 0);
+    try expect(system("test \"$(stat -c %s build/linux-fuse-test/mnt/ghost.txt)\" = 0") == 0);
+    try expect(system("grep -F \"$(pwd)/build/linux-fuse-test/mnt\" /proc/mounts >/dev/null") == 0);
+
+    linux_fuse_mount_stop(&mount);
+    _ = try linux_fuse_mount_join(&mount);
+    linux_fuse_mount_destroy(&mount);
+
+    try expect(system("grep -F \"$(pwd)/build/linux-fuse-test/mnt\" /proc/mounts >/dev/null") != 0);
+}
+
+fn test_linux_fuse_snapshot_rejects_invalid_paths() !void {
+    try expect(system("rm -rf build/linux-fuse-invalid && mkdir -p build/linux-fuse-invalid/repo build/linux-fuse-invalid/mnt") == 0);
+
+    var invalid_path: [byte: 14] = ['.' as byte, '.' as byte, '/' as byte, 'e' as byte, 's' as byte, 'c' as byte, 'a' as byte, 'p' as byte, 'e' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte, 0 as byte];
+    var invalid_repo_root_path: [byte: 33] = ['/' as byte, 't' as byte, 'm' as byte, 'p' as byte, '/' as byte, 'h' as byte, 'y' as byte, 'p' as byte, 'e' as byte, 'r' as byte, 'g' as byte, 'i' as byte, 't' as byte, '-' as byte, 'l' as byte, 'i' as byte, 'n' as byte, 'u' as byte, 'x' as byte, '-' as byte, 'f' as byte, 'u' as byte, 's' as byte, 'e' as byte, '-' as byte, 'i' as byte, 'n' as byte, 'v' as byte, 'a' as byte, 'l' as byte, 'i' as byte, 'd' as byte, 0 as byte];
+    const invalid_repo_root: ByteList = ByteList{ ptr: &invalid_repo_root_path[0], len: 32 as usize };
+    var invalid_entries: [LinuxFuseEntry: 1] = [
+        LinuxFuseEntry{
+            path: ByteList{ ptr: &invalid_path[0], len: 13 as usize },
+            backing_path: ByteList{ ptr: null as &byte, len: 0 as usize },
+            mode: 33188u32,
+            logical_size: 0u64,
+            placeholder_state: LinuxFusePlaceholderState.VirtualOnly,
+        },
+    ];
+    const entry_list: LinuxFuseEntryList = linux_fuse_entry_list_from_slice(invalid_entries[0: 1]);
+    const snapshot: LinuxFuseSnapshot = linux_fuse_snapshot_from_entries(&invalid_repo_root, &entry_list);
+    var mountpoint: [byte: 32] = ['b' as byte, 'u' as byte, 'i' as byte, 'l' as byte, 'd' as byte, '/' as byte, 'l' as byte, 'i' as byte, 'n' as byte, 'u' as byte, 'x' as byte, '-' as byte, 'f' as byte, 'u' as byte, 's' as byte, 'e' as byte, '-' as byte, 'i' as byte, 'n' as byte, 'v' as byte, 'a' as byte, 'l' as byte, 'i' as byte, 'd' as byte, '/' as byte, 'm' as byte, 'n' as byte, 't' as byte, 0 as byte, 0 as byte, 0 as byte, 0 as byte];
+    const invalid_mountpoint: ByteList = ByteList{ ptr: &mountpoint[0], len: 28 as usize };
+
+    try expect(try linux_fuse_mount_should_fail(&snapshot, &invalid_mountpoint));
+}
+
+fn test_linux_fuse_mount_failure_recovery_and_remount() !void {
+    try expect(system("rm -rf build/linux-fuse-recovery && mkdir -p build/linux-fuse-recovery/repo") == 0);
+    try expect(system("printf hello > build/linux-fuse-recovery/repo/hello.txt") == 0);
+
+    var hello_path: [byte: 10] = ['h' as byte, 'e' as byte, 'l' as byte, 'l' as byte, 'o' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte, 0 as byte];
+    var hello_backing: [byte: 41] = ['b' as byte, 'u' as byte, 'i' as byte, 'l' as byte, 'd' as byte, '/' as byte, 'l' as byte, 'i' as byte, 'n' as byte, 'u' as byte, 'x' as byte, '-' as byte, 'f' as byte, 'u' as byte, 's' as byte, 'e' as byte, '-' as byte, 'r' as byte, 'e' as byte, 'c' as byte, 'o' as byte, 'v' as byte, 'e' as byte, 'r' as byte, 'y' as byte, '/' as byte, 'r' as byte, 'e' as byte, 'p' as byte, 'o' as byte, '/' as byte, 'h' as byte, 'e' as byte, 'l' as byte, 'l' as byte, 'o' as byte, '.' as byte, 't' as byte, 'x' as byte, 't' as byte, 0 as byte];
+    var repo_root_path: [byte: 34] = ['/' as byte, 't' as byte, 'm' as byte, 'p' as byte, '/' as byte, 'h' as byte, 'y' as byte, 'p' as byte, 'e' as byte, 'r' as byte, 'g' as byte, 'i' as byte, 't' as byte, '-' as byte, 'l' as byte, 'i' as byte, 'n' as byte, 'u' as byte, 'x' as byte, '-' as byte, 'f' as byte, 'u' as byte, 's' as byte, 'e' as byte, '-' as byte, 'r' as byte, 'e' as byte, 'c' as byte, 'o' as byte, 'v' as byte, 'e' as byte, 'r' as byte, 'y' as byte, 0 as byte];
+    const repo_root: ByteList = ByteList{ ptr: &repo_root_path[0], len: 33 as usize };
+
+    var entries: [LinuxFuseEntry: 1] = [
+        LinuxFuseEntry{
+            path: ByteList{ ptr: &hello_path[0], len: 9 as usize },
+            backing_path: ByteList{ ptr: &hello_backing[0], len: 40 as usize },
+            mode: 33188u32,
+            logical_size: 5u64,
+            placeholder_state: LinuxFusePlaceholderState.Materialized,
+        },
+    ];
+    const entry_list: LinuxFuseEntryList = linux_fuse_entry_list_from_slice(entries[0: 1]);
+    const snapshot: LinuxFuseSnapshot = linux_fuse_snapshot_from_entries(&repo_root, &entry_list);
+    var mountpoint: [byte: 30] = ['b' as byte, 'u' as byte, 'i' as byte, 'l' as byte, 'd' as byte, '/' as byte, 'l' as byte, 'i' as byte, 'n' as byte, 'u' as byte, 'x' as byte, '-' as byte, 'f' as byte, 'u' as byte, 's' as byte, 'e' as byte, '-' as byte, 'r' as byte, 'e' as byte, 'c' as byte, 'o' as byte, 'v' as byte, 'e' as byte, 'r' as byte, 'y' as byte, '/' as byte, 'm' as byte, 'n' as byte, 't' as byte, 0 as byte];
+    const missing_mountpoint: ByteList = ByteList{ ptr: &mountpoint[0], len: 29 as usize };
+
+    try expect(try linux_fuse_mount_should_fail(&snapshot, &missing_mountpoint));
+    try expect(system("mkdir -p build/linux-fuse-recovery/mnt") == 0);
+
+    const mount: LinuxFuseMount = try linux_fuse_mount_start(&snapshot, &missing_mountpoint);
+    try expect(system("cat build/linux-fuse-recovery/mnt/hello.txt | grep -Fx hello >/dev/null") == 0);
+    linux_fuse_mount_stop(&mount);
+    _ = try linux_fuse_mount_join(&mount);
+    linux_fuse_mount_destroy(&mount);
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Linux FUSE Tests");
+    run_test("linux fuse mount roundtrip and stop", test_linux_fuse_mount_roundtrip_and_stop);
+    run_test("linux fuse snapshot rejects invalid paths", test_linux_fuse_snapshot_rejects_invalid_paths);
+    run_test("linux fuse mount failure recovery and remount", test_linux_fuse_mount_failure_recovery_and_remount);
+    return test_suite_end();
+}

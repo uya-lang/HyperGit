@@ -1,0 +1,96 @@
+@c_import("linux_fuse_bridge.c", "-D_FILE_OFFSET_BITS=64 -std=c11 -O2 -pthread -lfuse3");
+
+use object.types.ByteList;
+
+error LinuxFuseMountFailed;
+error LinuxFuseMountJoinFailed;
+
+/// 描述 Linux FUSE placeholder 的展示状态。
+export enum LinuxFusePlaceholderState {
+    VirtualOnly,
+    Materialized,
+    DirtyMaterialized
+}
+
+/// 描述一个 Linux FUSE 条目。
+export struct LinuxFuseEntry {
+    path: ByteList,
+    backing_path: ByteList,
+    mode: u32,
+    logical_size: u64,
+    placeholder_state: LinuxFusePlaceholderState
+}
+
+/// 描述 Linux FUSE 条目列表。
+export struct LinuxFuseEntryList {
+    ptr: &LinuxFuseEntry,
+    len: usize
+}
+
+/// 将切片包装成 Linux FUSE 条目列表视图。
+export fn linux_fuse_entry_list_from_slice(slice: &[LinuxFuseEntry]) LinuxFuseEntryList {
+    return LinuxFuseEntryList{ ptr: slice.ptr, len: slice.len };
+}
+
+/// 描述一个 Linux FUSE 快照。
+export struct LinuxFuseSnapshot {
+    repo_root: ByteList,
+    entries: LinuxFuseEntryList
+}
+
+/// 将条目列表包装成 Linux FUSE 快照视图。
+export fn linux_fuse_snapshot_from_entries(repo_root: &ByteList, entries: &LinuxFuseEntryList) LinuxFuseSnapshot {
+    return LinuxFuseSnapshot{
+        repo_root: ByteList{ ptr: repo_root.ptr, len: repo_root.len },
+        entries: LinuxFuseEntryList{ ptr: entries.ptr, len: entries.len },
+    };
+}
+
+/// 描述一个已启动的 Linux FUSE 挂载。
+export struct LinuxFuseMount {
+    handle: &byte
+}
+
+extern fn hypergit_linux_fuse_mount_start(snapshot: &LinuxFuseSnapshot, mountpoint: &byte, mountpoint_len: usize) &byte;
+extern fn hypergit_linux_fuse_mount_stop(handle: &byte) void;
+extern fn hypergit_linux_fuse_mount_join(handle: &byte) i32;
+extern fn hypergit_linux_fuse_mount_destroy(handle: &byte) void;
+
+/// 启动 Linux FUSE 挂载。
+export fn linux_fuse_mount_start(snapshot: &LinuxFuseSnapshot, mountpoint: &ByteList) !LinuxFuseMount {
+    if snapshot == null || mountpoint == null || mountpoint.ptr == null || mountpoint.len == 0 as usize {
+        return error.LinuxFuseMountFailed;
+    }
+    const handle: &byte = hypergit_linux_fuse_mount_start(snapshot, mountpoint.ptr, mountpoint.len);
+    if handle == null {
+        return error.LinuxFuseMountFailed;
+    }
+    return LinuxFuseMount{ handle: handle };
+}
+
+/// 请求 Linux FUSE 挂载退出并卸载。
+export fn linux_fuse_mount_stop(mount: &LinuxFuseMount) void {
+    if mount.handle == null {
+        return;
+    }
+    hypergit_linux_fuse_mount_stop(mount.handle);
+}
+
+/// 等待 Linux FUSE 挂载后台线程退出。
+export fn linux_fuse_mount_join(mount: &LinuxFuseMount) !void {
+    if mount.handle == null {
+        return;
+    }
+    if hypergit_linux_fuse_mount_join(mount.handle) != 0i32 {
+        return error.LinuxFuseMountJoinFailed;
+    }
+}
+
+/// 销毁 Linux FUSE 挂载并释放原生资源。
+export fn linux_fuse_mount_destroy(mount: &LinuxFuseMount) void {
+    if mount.handle == null {
+        return;
+    }
+    hypergit_linux_fuse_mount_destroy(mount.handle);
+    mount.handle = null as &byte;
+}

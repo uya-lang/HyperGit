@@ -63,6 +63,7 @@ test:
 	$(UYA) test src/hypergit/test_local_view.uya
 	$(UYA) test src/hypergit/test_sparse_profile.uya
 	$(UYA) test src/hypergit/test_workspace_reconcile.uya
+	./tests/test_linux_fuse.sh
 	$(UYA) test src/hypergit/test_loose_store.uya
 	$(UYA) test src/hypergit/test_segment_pack.uya
 	$(UYA) test src/hypergit/test_composite_store.uya
