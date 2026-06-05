@@ -21,6 +21,8 @@ use large.prepare.LargePreparedChunkedBlob;
 use large.prepare.large_prepare_recommended_arena_bytes;
 use large.prepare.prepare_chunked_blob_repository_with_workers;
 use large.prepare.prepare_chunked_blob_repository_default;
+use core.policy.experimental_policy_id;
+use core.policy.experimental_dedupe_scope;
 use object.types.ChunkRef;
 use object.types.FileType;
 use object.types.StorageTier;
@@ -296,6 +298,8 @@ fn test_parallel_prepare_queues_more_chunks_than_workers() !void {
         payload_ptr[0: MANY_CHUNK_REPRO_BYTES],
         FileType.Binary,
         2 as i32,
+        experimental_policy_id(),
+        experimental_dedupe_scope(),
     ) catch |err| {
         print_prepare_error("queued parallel prepare failed: ", @error_id(err));
         return err;
