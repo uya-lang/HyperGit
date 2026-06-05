@@ -1,5 +1,87 @@
 # HyperGit Benchmarks
 
+## 2026-06-06 Million-File End-to-End vs git
+
+This run drives the full command surface (`init`, `status`, `add`, `commit`,
+`log`, `diff`) end-to-end on a synthetic one-million-file repository and compares
+each step against `git` on the same dataset. It is the headline benchmark for the
+"2x git on core commands" goal.
+
+Command:
+
+```bash
+HGX_BENCH_MIN_SPEEDUP=0 bash bench/bench_million_files_repo.sh 1000000 256 1000
+```
+
+Machine:
+
+- `uname`: `Linux winger-PC 6.12.65-amd64-desktop-rolling #25.01.01.11 SMP PREEMPT_DYNAMIC Wed Jan 14 15:36:12 CST 2026 x86_64 GNU/Linux`
+- `cpu`: `Intel(R) Xeon(R) CPU E5-2696 v4 @ 2.20GHz`
+- `cores`: `44`
+- `git`: `2.51.0`, `uya`: `v0.9.9`
+- `filesystem`: `/dev/nvme0n1p5` ext4 (1.5T, 782G free)
+
+Results (1,000,000 files of ~1.6KB across 1000 directories):
+
+| step | hgx_ms | git_ms | git/hgx |
+| --- | ---: | ---: | ---: |
+| init | 3 | 6 | `2.00x` |
+| status_untracked | 1245 | 1498 | `1.20x` |
+| add_initial | 101231 | 125754 | `1.24x` |
+| status_staged | 4840 | 3836 | `0.79x` |
+| commit_initial | 5646 | 23827 | `4.22x` |
+| status_clean | 4010 | 3297 | `0.82x` |
+| log_initial | 3 | 55235 | `18411x` |
+| diff_workspace | 3987 | 1839 | `0.46x` |
+| add_modified | 171 | 800 | `4.68x` |
+| commit_modified | 685 | 2409 | `3.52x` |
+| log_modified | 3 | 48500 | `16166x` |
+| diff_commit_to_commit | 4 | 10 | `2.50x` |
+
+### add_initial: a 10x regression fixed by un-parallelizing the store
+
+The headline finding was that the first bulk `add` of a million small files had
+regressed catastrophically: `1343598 ms` (`0.095x` vs git, i.e. ~10x SLOWER)
+before this change, now `101231 ms` (`1.24x`), a ~13x speedup.
+
+Root cause is allocator thread contention, not the filesystem. Profiling one
+100k-file `add` (`HGX_ADD_PROFILE=1`) isolated it to the object-store step:
+
+| workers | elapsed_ms | object_store sum_ms |
+| ---: | ---: | ---: |
+| 20 (parallel) | 77602 | 506023 |
+| 1 (serial) | 8781 | 3802 |
+
+Hashing/encoding parallelized fine, but the per-object `malloc` + loose-object
+write did not: Uya's process allocator serializes `malloc`/`free` across threads,
+so 20 workers turned that serialization into ~133x of aggregate lock contention
+on the store step alone. A "parallel prepare + serial store" rewrite was tried
+and was even worse (~27x slower than the fused parallel path), because it moved
+the malloc-heavy read/encode into the parallel phase.
+
+The fix keeps the bulk small-blob store serial when the workload is store-bound:
+`ADD_PARALLEL_TINY_SMALL_BLOB_AVG_BYTES` was raised `64 → 65536`, so adds whose
+average file is below ~64 KiB run serial by default. Larger small-blobs (where
+hashing dominates) and explicit `HGX_ADD_PARALLEL_WORKERS=N` still parallelize,
+and serial vs parallel still produce byte-identical objects
+(`tests/test_add_parallel_small_blob.sh`).
+
+### Takeaways by category
+
+- **Compute-bound commands already exceed 2x:** `commit_initial` (4.2x),
+  `commit_modified` (3.5x), `add_modified` (4.7x), `diff_commit_to_commit` (2.5x),
+  and `log` (git's `log --stat --summary` over a million-file tree is pathological,
+  hence the absurd ratios). `init` is a 3ms-vs-6ms wash.
+- **Scan-bound commands sit at parity with git** (`status_*` ~0.8-1.2x,
+  `diff_workspace` ~0.46x): both tools must `lstat` every one of a million files,
+  and on a freshly-copied (cold-cache) tree that syscall cost dominates. HyperGit
+  also pays a one-time read of the million-entry local-change index. Beating git
+  by 2x here is not achievable without a watcher / stat-cache incremental layer;
+  see `docs/todo.md` section 25.
+- **add_initial is now competitive (1.24x)** instead of a 10x regression. A true
+  2x on bulk add is deferred to a follow-up (malloc-free parallel-prepare buffer
+  pool, or pack-on-add) — tracked in `docs/todo.md` section 25.
+
 ## 2026-05-29 BLAKE3 Official C/SIMD Shim
 
 This run compares the old pure-Uya `std.crypto.blake3` path with the new

@@ -72,6 +72,10 @@ fn manifest_load_decode(arena: &Arena, store: &LooseObjectStore, id: &ManifestId
     };
 }
 
+export fn manifest_load_node(arena: &Arena, store: &LooseObjectStore, id: &ManifestId) !ManifestNodePayload {
+    return manifest_load_decode(arena, store, id);
+}
+
 fn manifest_load_count_entries(arena: &Arena, store: &LooseObjectStore, id: &ManifestId) !usize {
     const payload: ManifestNodePayload = try manifest_load_decode(arena, store, id);
     var total: usize = payload.entries.len;

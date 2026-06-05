@@ -98,8 +98,10 @@ use object.types.FileType;
 use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
 use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_prepare_fanout_dirs;
 use store.loose_store.loose_store_open;
 use store.loose_store.loose_store_put_known_id;
+use store.loose_store.loose_store_put_known_id_fresh;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
@@ -111,7 +113,10 @@ use store.repo_layout.repo_find_root_from_cwd;
 use store.repo_layout.repo_path_cstr;
 use store.repo_layout.repo_path_join_literal;
 use workspace.local_change_file.local_change_file_read;
+use workspace.local_change_file.local_change_file_find;
+use workspace.local_change_file.local_change_file_replace_existing;
 use workspace.local_change_file.local_change_file_write;
+use workspace.local_change_file.LocalChangeLookup;
 use workspace.scan.WorkspaceFileEntry;
 use workspace.scan.WorkspaceFileKind;
 use workspace.scan.WorkspaceFileList;
@@ -136,20 +141,30 @@ use workspace.stage_file.stage_file_lock_release;
 use workspace.stage_file.stage_file_read;
 use workspace.stage_file.stage_file_write;
 
-const ADD_ARENA_BYTES: usize = 268435456 as usize;
+const ADD_ARENA_BYTES: usize = 1073741824 as usize;
 const ADD_PATHSPEC_ARENA_BYTES: usize = 65536 as usize;
 const ADD_PATH_MAX: usize = 4096;
-const ADD_PARALLEL_WORKERS_DEFAULT: i32 = 2;
+const ADD_PARALLEL_WORKERS_DEFAULT: i32 = 4;
 const ADD_PARALLEL_MAX_WORKERS: usize = 1024 as usize;
+const ADD_PARALLEL_DEFAULT_MAX_WORKERS: i32 = 20;
+const ADD_PREPARE_FANOUT_MIN_FILES: usize = 1024 as usize;
+const ADD_PARALLEL_BATCH_MAX_FILES: usize = 65536 as usize;
 const ADD_SMALL_BLOB_FAST_MAX_BYTES: usize = 4096 as usize;
 const ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES: usize = ADD_SMALL_BLOB_FAST_MAX_BYTES + 64 as usize;
 const ADD_SMALL_BLOB_FAST_HASH_BYTES: usize = ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES + 128 as usize;
 const ADD_PROGRESS_MIN_FILES: usize = 4096 as usize;
 const ADD_PROGRESS_INTERVAL_FILES: usize = 4096 as usize;
 const ADD_PROGRESS_MIN_BYTES: u64 = 1073741824u64;
-// Tiny-file first-add is metadata-bound; inter-file parallelism amplifies open/write contention.
+// Small-file first-add is allocation/metadata-bound, not CPU-bound: each object is
+// a malloc + open(O_CREAT|O_EXCL)+write+rename, and the process allocator serializes
+// malloc/free across threads. Spreading these across workers turns that serialization
+// into heavy lock contention instead of speeding anything up. Measured on a 1M-file
+// repo (avg ~1.6KB), 20-worker add was ~9x SLOWER than serial. Hashing only begins to
+// dominate the per-file cost once files reach tens of KB, so below that average we keep
+// the bulk small-blob path serial; larger small blobs and explicit worker requests still
+// parallelize.
 const ADD_PARALLEL_TINY_SMALL_BLOB_MIN_FILES: usize = 4096 as usize;
-const ADD_PARALLEL_TINY_SMALL_BLOB_AVG_BYTES: u64 = 64u64;
+const ADD_PARALLEL_TINY_SMALL_BLOB_AVG_BYTES: u64 = 65536u64;
 const ADD_PREPARE_SMALL_PERMISSION: usize = 1 as usize;
 const ADD_PREPARE_SMALL_READ_FAILED: usize = 2 as usize;
 const ADD_PREPARE_SMALL_ALLOC_FAILED: usize = 3 as usize;
@@ -302,7 +317,8 @@ struct AddProgressState {
     total_bytes: u64,
     processed_files: usize,
     processed_bytes: u64,
-    next_report_files: usize
+    next_report_files: usize,
+    final_reported: bool
 }
 
 struct AddPrintablePath {
@@ -562,7 +578,11 @@ fn add_owned_bytes_free(value: &AddOwnedBytes) void {
 }
 
 fn add_parallel_default_requested_workers() i32 {
-    return parallel_default_requested_workers(ADD_PARALLEL_WORKERS_DEFAULT);
+    const detected: i32 = parallel_default_requested_workers(ADD_PARALLEL_WORKERS_DEFAULT);
+    if detected > ADD_PARALLEL_DEFAULT_MAX_WORKERS {
+        return ADD_PARALLEL_DEFAULT_MAX_WORKERS;
+    }
+    return detected;
 }
 
 fn add_parallel_env_requested_workers() i32 {
@@ -939,7 +959,7 @@ fn add_store_small_blob_bytes(store: &LooseObjectStore, content: &[byte]) !Objec
 }
 
 fn add_store_small_blob_encoded(store: &LooseObjectStore, object_id: &ObjectId, encoded: &[byte]) !ObjectId {
-    return loose_store_put_known_id(store, object_id, ObjectKind.SmallBlob, encoded) catch {
+    return loose_store_put_known_id_fresh(store, object_id, ObjectKind.SmallBlob, encoded) catch {
         return error.AddStoreFailed;
     };
 }
@@ -1560,6 +1580,7 @@ fn add_local_change_clone(change: &LocalChange) LocalChange {
         last_seen_inode: change.last_seen_inode,
         last_seen_mtime_ns: change.last_seen_mtime_ns,
         last_seen_logical_size: change.last_seen_logical_size,
+        last_seen_file_mode: change.last_seen_file_mode,
         watcher_seq: change.watcher_seq,
         reconcile_epoch: change.reconcile_epoch,
     };
@@ -1829,6 +1850,7 @@ fn add_progress_init(files: &WorkspaceFileList) AddProgressState {
         processed_files: 0 as usize,
         processed_bytes: 0u64,
         next_report_files: ADD_PROGRESS_INTERVAL_FILES,
+        final_reported: false,
     };
 }
 
@@ -1847,6 +1869,9 @@ fn add_progress_maybe_report(progress: &AddProgressState) void {
         progress.processed_bytes,
         progress.total_bytes,
     );
+    if progress.processed_files == progress.total_files {
+        progress.final_reported = true;
+    }
     while progress.next_report_files <= progress.processed_files {
         progress.next_report_files = progress.next_report_files + ADD_PROGRESS_INTERVAL_FILES;
     }
@@ -1880,6 +1905,9 @@ fn add_progress_finish(progress: &AddProgressState) void {
         return;
     }
     if progress.processed_files == 0 as usize {
+        return;
+    }
+    if progress.final_reported {
         return;
     }
     if progress.processed_files >= progress.next_report_files {
@@ -2153,6 +2181,7 @@ fn add_record_file_result(
         last_seen_inode: file_entry.inode,
         last_seen_mtime_ns: file_entry.mtime_ns,
         last_seen_logical_size: file_entry.logical_size,
+        last_seen_file_mode: file_entry.file_mode,
         watcher_seq: watcher_seq,
         reconcile_epoch: reconcile_epoch,
     };
@@ -2485,6 +2514,7 @@ fn add_sort_local_changes_insertion(changes: &LocalChange, len: usize) void {
         const current_inode: u64 = changes[i].last_seen_inode;
         const current_mtime_ns: i64 = changes[i].last_seen_mtime_ns;
         const current_logical_size: u64 = changes[i].last_seen_logical_size;
+        const current_file_mode: u32 = changes[i].last_seen_file_mode;
         const current_watcher_seq: u64 = changes[i].watcher_seq;
         const current_reconcile_epoch: u64 = changes[i].reconcile_epoch;
         var j: usize = i;
@@ -2500,6 +2530,7 @@ fn add_sort_local_changes_insertion(changes: &LocalChange, len: usize) void {
             last_seen_inode: current_inode,
             last_seen_mtime_ns: current_mtime_ns,
             last_seen_logical_size: current_logical_size,
+            last_seen_file_mode: current_file_mode,
             watcher_seq: current_watcher_seq,
             reconcile_epoch: current_reconcile_epoch,
         };
@@ -2672,6 +2703,48 @@ fn add_merge_local_changes(arena: &Arena, existing: LocalChangeList, updates: &L
     return local_change_list_from_slice(raw[0: out_index]);
 }
 
+fn add_write_merged_local_changes(
+    arena: &Arena,
+    local_change_path: &RepoPath,
+    existing: &LocalChangeList,
+    updates: &LocalChange,
+    update_len: usize,
+    merged: &LocalChangeList,
+) !void {
+    if update_len == 1 as usize && merged.len == existing.len {
+        const existing_index: isize = add_find_local_change(existing, &updates[0].path);
+        if existing_index >= 0 as isize {
+            const replaced: bool = local_change_file_replace_existing(
+                arena,
+                repo_path_cstr(local_change_path) as &const byte,
+                &updates[0],
+            ) catch {
+                false;
+            };
+            if replaced {
+                return;
+            }
+        }
+    }
+
+    local_change_file_write(repo_path_cstr(local_change_path) as &const byte, merged) catch {
+        return error.AddLocalChangeWriteFailed;
+    };
+}
+
+fn add_replace_single_local_change(arena: &Arena, local_change_path: &RepoPath, update: &LocalChange) !void {
+    const replaced: bool = local_change_file_replace_existing(
+        arena,
+        repo_path_cstr(local_change_path) as &const byte,
+        update,
+    ) catch {
+        false;
+    };
+    if !replaced {
+        return error.AddLocalChangeWriteFailed;
+    }
+}
+
 export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) !AddStageResult {
     var profile: AddProfileState = add_profile_init();
     const arena_storage: &byte = malloc(ADD_ARENA_BYTES) as &byte;
@@ -2714,7 +2787,13 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     var progress: AddProgressState = add_progress_init(&scanned_files);
 
     const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
-    const store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
+    var store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
+    if matched_count >= ADD_PREPARE_FANOUT_MIN_FILES &&
+        add_all_files_are_parallel_small_blob_candidates(&scanned_files) {
+        loose_store_prepare_fanout_dirs(&store) catch {
+            return error.AddStoreFailed;
+        };
+    }
     const chunk_store_root: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_CHUNKS_REL);
     const chunk_store: ChunkStore = try chunk_store_open(repo_path_cstr(&chunk_store_root));
     const policy_path: RepoPath = try repo_path_join_literal(root, HGIT_POLICY_REL);
@@ -2752,10 +2831,32 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     var cached_local_changes: LocalChangeList = LocalChangeList{ ptr: null, len: 0 };
     var cached_local_change_version: AddFileVersion = add_file_version_invalid();
     var cached_local_change_reusable: bool = false;
+    var cached_local_changes_partial: bool = false;
+    var cached_single_local_change: [LocalChange: 1] = [];
     if matched_count > 0 as usize {
         const local_change_version_before: AddFileVersion = add_local_change_file_version(&local_change_path);
         const local_read_started_ms: u64 = add_maybe_now_ms(profile.enabled);
-        cached_local_changes = try add_load_local_changes(&local_change_path, &arena);
+        var loaded_partial_local_change: bool = false;
+        if matched_count == 1 as usize &&
+            pathspecs.len == 1 as usize &&
+            manifest_path_compare(&pathspecs.ptr[0], &scanned_files.ptr[0].path) == 0 {
+            const lookup: LocalChangeLookup = local_change_file_find(
+                &arena,
+                repo_path_cstr(&local_change_path) as &const byte,
+                &scanned_files.ptr[0].path,
+            ) catch {
+                return error.AddLocalChangeReadFailed;
+            };
+            if lookup.found {
+                cached_single_local_change[0] = lookup.change;
+                cached_local_changes = local_change_list_from_slice(cached_single_local_change[0: 1]);
+                cached_local_changes_partial = true;
+                loaded_partial_local_change = true;
+            }
+        }
+        if !loaded_partial_local_change {
+            cached_local_changes = try add_load_local_changes(&local_change_path, &arena);
+        }
         add_profile_add_elapsed(&profile.local_change_read_elapsed_ms, local_read_started_ms);
         const local_change_version_after: AddFileVersion = add_local_change_file_version(&local_change_path);
         cached_local_change_reusable = add_file_version_equal(&local_change_version_before, &local_change_version_after);
@@ -2771,9 +2872,13 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     var skipped_count: usize = 0;
     const process_files_started_ms: u64 = add_maybe_now_ms(profile.enabled);
     if effective_parallel_workers > 1 as usize {
+        var batch_task_capacity: usize = matched_count;
+        if batch_task_capacity > ADD_PARALLEL_BATCH_MAX_FILES {
+            batch_task_capacity = ADD_PARALLEL_BATCH_MAX_FILES;
+        }
         const batch_tasks: &AddStoreObjectTask = arena_alloc(
             &arena,
-            @size_of(AddStoreObjectTask) as usize * matched_count,
+            @size_of(AddStoreObjectTask) as usize * batch_task_capacity,
         ) as &AddStoreObjectTask;
         if batch_tasks == null {
             return error.AddAlloc;
@@ -2807,7 +2912,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
             if add_is_parallel_small_blob_candidate(file_entry) {
                 var batch_count: usize = 0 as usize;
                 var seeded_first_entry: bool = false;
-                while file_index < scanned_files.len {
+                while file_index < scanned_files.len && batch_count < batch_task_capacity {
                     const batch_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
                     var batch_cached_hit: bool = false;
                     var batch_cached_object_id: ObjectId = add_zero_object_id();
@@ -3067,8 +3172,10 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     const existing_snapshot: StageSnapshot = try add_load_existing_snapshot(&stage_path, &arena);
     add_profile_add_elapsed(&profile.stage_read_elapsed_ms, stage_read_started_ms);
     var existing_local_changes: LocalChangeList = LocalChangeList{ ptr: null, len: 0 };
+    var existing_local_changes_partial: bool = false;
     if use_cached_local_changes {
         existing_local_changes = cached_local_changes;
+        existing_local_changes_partial = cached_local_changes_partial;
     } else {
         const local_read_started_ms: u64 = add_maybe_now_ms(profile.enabled);
         existing_local_changes = try add_load_local_changes(&local_change_path, &arena);
@@ -3173,6 +3280,7 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
                 last_seen_inode: 0u64,
                 last_seen_mtime_ns: 0i64,
                 last_seen_logical_size: 0u64,
+                last_seen_file_mode: base_entry.mode,
                 watcher_seq: watcher_seq,
                 reconcile_epoch: reconcile_epoch,
             };
@@ -3197,22 +3305,33 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
 
     if update_index == 0 {
         if change_update_index > 0 as usize {
-            const local_sort_started_ms: u64 = add_maybe_now_ms(profile.enabled);
-            add_sort_local_changes(raw_change_updates, change_update_index);
-            add_profile_add_elapsed(&profile.local_change_sort_elapsed_ms, local_sort_started_ms);
-            const local_merge_started_ms: u64 = add_maybe_now_ms(profile.enabled);
-            const merged_local_changes: LocalChangeList = try add_merge_local_changes(
-                &arena,
-                LocalChangeList{ ptr: existing_local_changes.ptr, len: existing_local_changes.len },
-                raw_change_updates,
-                change_update_index,
-            );
-            add_profile_add_elapsed(&profile.local_change_merge_elapsed_ms, local_merge_started_ms);
-            const local_write_started_ms: u64 = add_maybe_now_ms(profile.enabled);
-            local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &merged_local_changes) catch {
-                return error.AddLocalChangeWriteFailed;
-            };
-            add_profile_add_elapsed(&profile.local_change_write_elapsed_ms, local_write_started_ms);
+            if existing_local_changes_partial && change_update_index == 1 as usize {
+                const local_write_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+                try add_replace_single_local_change(&arena, &local_change_path, &raw_change_updates[0]);
+                add_profile_add_elapsed(&profile.local_change_write_elapsed_ms, local_write_started_ms);
+            } else {
+                const local_sort_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+                add_sort_local_changes(raw_change_updates, change_update_index);
+                add_profile_add_elapsed(&profile.local_change_sort_elapsed_ms, local_sort_started_ms);
+                const local_merge_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+                const merged_local_changes: LocalChangeList = try add_merge_local_changes(
+                    &arena,
+                    LocalChangeList{ ptr: existing_local_changes.ptr, len: existing_local_changes.len },
+                    raw_change_updates,
+                    change_update_index,
+                );
+                add_profile_add_elapsed(&profile.local_change_merge_elapsed_ms, local_merge_started_ms);
+                const local_write_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+                try add_write_merged_local_changes(
+                    &arena,
+                    &local_change_path,
+                    &existing_local_changes,
+                    raw_change_updates,
+                    change_update_index,
+                    &merged_local_changes,
+                );
+                add_profile_add_elapsed(&profile.local_change_write_elapsed_ms, local_write_started_ms);
+            }
         }
         add_profile_print_summary(&profile, matched_count, 0 as usize, delete_match_count, skipped_count);
         return AddStageResult{
@@ -3239,22 +3358,33 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     add_profile_add_elapsed(&profile.stage_write_elapsed_ms, stage_write_started_ms);
 
     if change_update_index > 0 as usize {
-        const local_sort_started_ms: u64 = add_maybe_now_ms(profile.enabled);
-        add_sort_local_changes(raw_change_updates, change_update_index);
-        add_profile_add_elapsed(&profile.local_change_sort_elapsed_ms, local_sort_started_ms);
-        const local_merge_started_ms: u64 = add_maybe_now_ms(profile.enabled);
-        const merged_local_changes: LocalChangeList = try add_merge_local_changes(
-            &arena,
-            LocalChangeList{ ptr: existing_local_changes.ptr, len: existing_local_changes.len },
-            raw_change_updates,
-            change_update_index,
-        );
-        add_profile_add_elapsed(&profile.local_change_merge_elapsed_ms, local_merge_started_ms);
-        const local_write_started_ms: u64 = add_maybe_now_ms(profile.enabled);
-        local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &merged_local_changes) catch {
-            return error.AddLocalChangeWriteFailed;
-        };
-        add_profile_add_elapsed(&profile.local_change_write_elapsed_ms, local_write_started_ms);
+        if existing_local_changes_partial && change_update_index == 1 as usize {
+            const local_write_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+            try add_replace_single_local_change(&arena, &local_change_path, &raw_change_updates[0]);
+            add_profile_add_elapsed(&profile.local_change_write_elapsed_ms, local_write_started_ms);
+        } else {
+            const local_sort_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+            add_sort_local_changes(raw_change_updates, change_update_index);
+            add_profile_add_elapsed(&profile.local_change_sort_elapsed_ms, local_sort_started_ms);
+            const local_merge_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+            const merged_local_changes: LocalChangeList = try add_merge_local_changes(
+                &arena,
+                LocalChangeList{ ptr: existing_local_changes.ptr, len: existing_local_changes.len },
+                raw_change_updates,
+                change_update_index,
+            );
+            add_profile_add_elapsed(&profile.local_change_merge_elapsed_ms, local_merge_started_ms);
+            const local_write_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+            try add_write_merged_local_changes(
+                &arena,
+                &local_change_path,
+                &existing_local_changes,
+                raw_change_updates,
+                change_update_index,
+                &merged_local_changes,
+            );
+            add_profile_add_elapsed(&profile.local_change_write_elapsed_ms, local_write_started_ms);
+        }
     }
     add_profile_print_summary(&profile, matched_count, update_index, delete_match_count, skipped_count);
     return AddStageResult{

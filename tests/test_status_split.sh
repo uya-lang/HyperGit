@@ -129,3 +129,56 @@ Changes not staged for commit:
 EOF
 
 run_status_case "$REPO_COMMITTED_SPLIT" "$TMP_DIR/repo-committed-split.expected"
+
+REPO_LOCAL_CACHE_FAST="$TMP_DIR/repo-local-cache-fast"
+mkdir -p "$REPO_LOCAL_CACHE_FAST"
+(
+    cd "$REPO_LOCAL_CACHE_FAST"
+    "$TMP_DIR/hgx" init >/dev/null 2>&1
+    mkdir -p docs src tools
+    printf 'alpha\n' >src/main.uya
+    printf 'keep\n' >docs/keep.txt
+    printf 'remove\n' >docs/remove.txt
+    printf '#!/bin/sh\nprintf tool\n' >tools/run.sh
+    chmod 0644 tools/run.sh
+    "$TMP_DIR/hgx" add . >/dev/null 2>&1
+    HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' "$TMP_DIR/hgx" commit -m "first" >/dev/null 2>&1
+    printf 'alpha\nbeta\n' >src/main.uya
+    rm docs/remove.txt
+    printf 'new\n' >docs/new.txt
+    chmod 0755 tools/run.sh
+)
+
+cat >"$TMP_DIR/repo-local-cache-fast.expected" <<'EOF'
+On branch main
+
+Changes not staged for commit:
+  new file:   docs/new.txt
+  deleted:   docs/remove.txt
+  modified:   src/main.uya
+  modified:   tools/run.sh
+EOF
+
+run_status_case "$REPO_LOCAL_CACHE_FAST" "$TMP_DIR/repo-local-cache-fast.expected"
+
+REPO_SYMLINK_REPLACED="$TMP_DIR/repo-symlink-replaced"
+mkdir -p "$REPO_SYMLINK_REPLACED"
+(
+    cd "$REPO_SYMLINK_REPLACED"
+    "$TMP_DIR/hgx" init >/dev/null 2>&1
+    printf 'target\n' >target.txt
+    printf 'regular\n' >linked.txt
+    "$TMP_DIR/hgx" add . >/dev/null 2>&1
+    HGX_AUTHOR_NAME='Test User' HGX_AUTHOR_EMAIL='test@example.com' "$TMP_DIR/hgx" commit -m "first" >/dev/null 2>&1
+    rm linked.txt
+    ln -s target.txt linked.txt
+)
+
+cat >"$TMP_DIR/repo-symlink-replaced.expected" <<'EOF'
+On branch main
+
+Changes not staged for commit:
+  modified:   linked.txt
+EOF
+
+run_status_case "$REPO_SYMLINK_REPLACED" "$TMP_DIR/repo-symlink-replaced.expected"

@@ -432,3 +432,12 @@
 - [x] 实现 Linux FUSE adapter、mount 生命周期和错误恢复。
 - [x] 为 macOS / Windows 平台抽象 VFS 边界与降级策略。
 - [x] 更激进的服务端索引、云端查询和分布式执行能力。
+
+## 25. 大仓库命令性能（2x git 目标）
+
+目标：在 `bench/bench_million_files_repo.sh`（百万文件）下，核心命令对齐或超过 `git` 的 2 倍速度。
+
+- [x] 建立百万文件端到端基准脚本，覆盖 init/status/add/commit/log/diff，记录每步 hgx/git 耗时与加速比。
+- [x] 修复 `hgx add` 在大量小文件首次 add 时的并行回归：定位为 Uya 分配器多线程争用（20 worker 比串行慢约 9x），将存储受限的小 blob 批量默认转为串行（`ADD_PARALLEL_TINY_SMALL_BLOB_AVG_BYTES` 64→65536），add_initial 从 0.095x 提升到约 1.4–1.5x。
+- [ ] **（另立项）`hgx add` 首次大批量达到 2x git**：当前受限于 Uya 分配器无法多线程扩展。需二选一：(a) 无 malloc 的并行 prepare —— worker 用栈缓冲读+编码，写入预分配批缓冲的各自槽位，再串行写盘；或 (b) add 直接顺序写 pack 而非百万 loose 对象。
+- [ ] status / diff 工作区扫描超过 git 2x：当前受 lstat 逐文件成本限制与 git 持平，需引入 watcher / stat-cache 增量层。

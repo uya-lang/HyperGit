@@ -8,6 +8,7 @@ use std.string.strlen;
 use std.time.now_ms;
 
 use libc.getenv;
+use libc.fflush;
 use libc.free;
 use libc.fprintf;
 use libc.malloc;
@@ -46,6 +47,7 @@ use index.commit_graph.commit_graph_load_incremental;
 use index.commit_graph.commit_graph_merge_base;
 use index.commit_graph.commit_graph_path_list_from_slice;
 use manifest.load.manifest_load_flatten;
+use manifest.load.manifest_load_node;
 use manifest.path.manifest_path_compare;
 use manifest.root.manifest_root_build_and_store;
 use manifest.trie.ManifestLeafInputEntry;
@@ -54,6 +56,7 @@ use manifest.trie.manifest_leaf_input_list_from_slice;
 use object.codec.decode_chunked_blob_object;
 use object.codec.decode_object_kind;
 use object.codec.decode_small_blob_object;
+use object.codec.manifest_node_payload_to_canonical;
 use object.commit_build.commit_object_build_and_store;
 use object.types.ByteList;
 use object.types.BloomFilter;
@@ -62,6 +65,8 @@ use object.types.CommitPayload;
 use object.types.ContentType;
 use object.types.EntryKind;
 use object.types.Identity;
+use object.types.ManifestEntry;
+use object.types.ManifestNodePayload;
 use object.types.ModuleBitmap;
 use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
@@ -259,6 +264,14 @@ fn commit_profile_add_elapsed(total: &u64, started_ms: u64) void {
         return;
     }
     *total = *total + commit_elapsed_ms_since(started_ms);
+}
+
+fn commit_profile_trace(profile: &CommitProfileState, label: &const byte, elapsed_ms: u64) void {
+    if !profile.enabled {
+        return;
+    }
+    fprintf(stderr, "info: commit profile phase %s=%llu\n" as *byte, label, elapsed_ms);
+    _ = fflush(stderr);
 }
 
 fn commit_profile_print_summary(profile: &CommitProfileState, staged_count: usize, manifest_count: usize) void {
@@ -467,13 +480,29 @@ fn commit_stage_arena_bytes(stage_path: &RepoPath) !usize {
     );
 }
 
-fn commit_work_arena_bytes(snapshot: &StageSnapshot) !usize {
-    return try commit_scaled_bytes(
+fn commit_work_arena_bytes(root: &RepoPath, snapshot: &StageSnapshot) !usize {
+    var want: usize = try commit_scaled_bytes(
         snapshot.entries.len,
         COMMIT_WORK_ARENA_PER_ENTRY_BYTES,
         COMMIT_WORK_ARENA_EXTRA_BYTES,
         COMMIT_WORK_ARENA_MIN_BYTES,
     );
+    const local_change_path: RepoPath = repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL) catch {
+        return want;
+    };
+    var st: Stat = Stat{};
+    if stat(repo_path_cstr(&local_change_path) as &const byte, &st) == 0 && st.st_size > 0 {
+        const local_want: usize = try commit_scaled_bytes(
+            st.st_size as usize,
+            12 as usize,
+            COMMIT_WORK_ARENA_EXTRA_BYTES,
+            COMMIT_WORK_ARENA_MIN_BYTES,
+        );
+        if local_want > want {
+            want = local_want;
+        }
+    }
+    return want;
 }
 
 fn commit_sync_arena_bytes(manifest_inputs: &ManifestLeafInputList) !usize {
@@ -646,9 +675,10 @@ fn commit_manifest_inputs_from_stage(
             return error.CommitUnsupportedStageEntry;
         }
 
-        var policy_id: PolicyId = entry.policy_id;
-        if policy_id_compare(&policy_id, &stage_zero_policy_id()) == 0 {
-            policy_id = stage_zero_policy_id();
+        var policy_id: PolicyId = commit_clone_policy_id(&entry.policy_id);
+        const zero_policy: PolicyId = stage_zero_policy_id();
+        if policy_id_compare(&policy_id, &zero_policy) == 0 {
+            policy_id = commit_clone_policy_id(&zero_policy);
         }
         raw_inputs[out_index] = ManifestLeafInputEntry{
             path: commit_clone_byte_list(&entry.path),
@@ -856,7 +886,9 @@ fn commit_audit_summary_from_snapshot(
             policy_id = manifest_entry.policy_id;
         }
         var logical_size: u64 = 0u64;
-        if stage_entry_has_staged_content(entry) {
+        if manifest_entry != null {
+            logical_size = manifest_entry.logical_size;
+        } else if stage_entry_has_staged_content(entry) {
             logical_size = try commit_stage_entry_logical_size(store, &entry.staged_object);
         } else if object_id_compare(&entry.base_object, &ObjectId{ hash: Hash32{ bytes: [] } }) != 0 {
             logical_size = try commit_stage_entry_logical_size(store, &entry.base_object);
@@ -869,6 +901,260 @@ fn commit_audit_summary_from_snapshot(
         commit_audit_builder_add(
             &builder,
             &policy_id,
+            &dedupe_scope,
+            entry.audit_enabled,
+            logical_size,
+        );
+        i = i + 1 as usize;
+    }
+    return commit_audit_builder_finish(&builder);
+}
+
+fn commit_stage_entry_supported_incremental_modify(entry: &StageEntry) bool {
+    return entry.kind == StageEntryKind.Modify && stage_entry_has_staged_content(entry);
+}
+
+fn commit_stage_entry_at_or_after(entries: StageEntryList, path: &ByteList, index: &usize) &StageEntry {
+    while *index < entries.len && manifest_path_compare(&entries.ptr[*index].path, path) < 0 {
+        *index = *index + 1 as usize;
+    }
+    if *index < entries.len && manifest_path_compare(&entries.ptr[*index].path, path) == 0 {
+        return &entries.ptr[*index];
+    }
+    return null as &StageEntry;
+}
+
+fn commit_can_use_incremental_modify_fast_path(
+    snapshot: &StageSnapshot,
+    head_commit: &CommitId,
+    stored_changes: &LocalChangeList,
+) bool {
+    if snapshot.entries.len == 0 as usize || commit_id_compare(&snapshot.state.base_commit, head_commit) != 0 {
+        return false;
+    }
+    if stored_changes.len == 0 as usize {
+        return false;
+    }
+
+    var stage_index: usize = 0 as usize;
+    while stage_index < snapshot.entries.len {
+        const entry: &StageEntry = &snapshot.entries.ptr[stage_index];
+        if !commit_stage_entry_supported_incremental_modify(entry) {
+            return false;
+        }
+        stage_index = stage_index + 1 as usize;
+    }
+
+    stage_index = 0 as usize;
+    var change_index: usize = 0 as usize;
+    while change_index < stored_changes.len {
+        const change: &LocalChange = &stored_changes.ptr[change_index];
+        const staged: &StageEntry = commit_stage_entry_at_or_after(snapshot.entries, &change.path, &stage_index);
+        if staged == null {
+            if change.status != ChangeStatus.Materialized {
+                return false;
+            }
+            change_index = change_index + 1 as usize;
+            continue;
+        }
+        if change.status != ChangeStatus.Modified ||
+            change.last_seen_file_mode != staged.file_mode ||
+            hash32_compare(&change.working_hash, &staged.staged_object.hash) != 0 {
+            return false;
+        }
+        change_index = change_index + 1 as usize;
+    }
+
+    return stage_index == snapshot.entries.len;
+}
+
+fn commit_incremental_sparse_profile_is_plain(arena: &Arena, root: &RepoPath) bool {
+    const sparse_path: RepoPath = repo_path_join_literal(root, HGIT_WORKSPACE_SPARSE_REL) catch {
+        return false;
+    };
+    const profile: SparseProfile = sparse_profile_file_default(arena, repo_path_cstr(&sparse_path) as &const byte) catch {
+        return false;
+    };
+    return profile.rules.len == 0 as usize;
+}
+
+fn commit_path_has_prefix(path: &ByteList, prefix: &ByteList) bool {
+    if prefix.len == 0 as usize {
+        return true;
+    }
+    if prefix.len > path.len {
+        return false;
+    }
+    var i: usize = 0 as usize;
+    while i < prefix.len {
+        if path.ptr[i] != prefix.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    if prefix.len == path.len {
+        return true;
+    }
+    return path.ptr[prefix.len] == '/' as byte;
+}
+
+fn commit_path_suffix_after_prefix(path: &ByteList, prefix: &ByteList) !ByteList {
+    if !commit_path_has_prefix(path, prefix) {
+        return error.CommitManifestFailed;
+    }
+    if prefix.len == 0 as usize {
+        return ByteList{ ptr: path.ptr, len: path.len };
+    }
+    if path.len <= prefix.len + 1 as usize {
+        return error.CommitManifestFailed;
+    }
+    const start: usize = prefix.len + 1 as usize;
+    const suffix: &[byte] = path.ptr[start: path.len - start];
+    return ByteList{ ptr: suffix.ptr, len: suffix.len };
+}
+
+fn commit_join_manifest_path(arena: &Arena, prefix: &ByteList, suffix: &ByteList) !ByteList {
+    if prefix.len == 0 as usize {
+        return ByteList{ ptr: suffix.ptr, len: suffix.len };
+    }
+    const total_len: usize = prefix.len + 1 as usize + suffix.len;
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.CommitAlloc;
+    }
+    var i: usize = 0 as usize;
+    while i < total_len {
+        if i < prefix.len {
+            raw[i] = prefix.ptr[i];
+        } else if i == prefix.len {
+            raw[i] = '/' as byte;
+        } else {
+            raw[i] = suffix.ptr[i - prefix.len - 1 as usize];
+        }
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: raw, len: total_len };
+}
+
+fn commit_manifest_store_payload(arena: &Arena, store: &LooseObjectStore, payload: &ManifestNodePayload) !ManifestId {
+    const encoded: ByteList = try manifest_node_payload_to_canonical(arena, payload);
+    const object_id: ObjectId = try store.put(ObjectKind.ManifestNode, encoded.ptr[0: encoded.len]);
+    return manifest_id_from_object(object_id);
+}
+
+fn commit_manifest_child_contains_path(arena: &Arena, payload: &ManifestNodePayload, child_index: usize, path: &ByteList) !bool {
+    const child_min: ByteList = try commit_join_manifest_path(arena, &payload.prefix.bytes, &payload.children.ptr[child_index].min_name);
+    const child_max: ByteList = try commit_join_manifest_path(arena, &payload.prefix.bytes, &payload.children.ptr[child_index].max_name);
+    return manifest_path_compare(&child_min, path) <= 0 && manifest_path_compare(path, &child_max) <= 0;
+}
+
+fn commit_manifest_update_node_for_modify(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    node_id: &ManifestId,
+    entry: &StageEntry,
+    logical_size: u64,
+) !ManifestId {
+    var payload: ManifestNodePayload = manifest_load_node(arena, store, node_id) catch {
+        return error.CommitStoreFailed;
+    };
+
+    var i: usize = 0 as usize;
+    while i < payload.entries.len {
+        const entry_path: ByteList = try commit_join_manifest_path(arena, &payload.prefix.bytes, &payload.entries.ptr[i].name);
+        if manifest_path_compare(&entry_path, &entry.path) == 0 {
+            if object_id_compare(&payload.entries.ptr[i].object_id, &entry.base_object) != 0 {
+                return error.CommitManifestFailed;
+            }
+            const suffix: ByteList = try commit_path_suffix_after_prefix(&entry.path, &payload.prefix.bytes);
+            payload.entries.ptr[i] = ManifestEntry{
+                name: ByteList{ ptr: suffix.ptr, len: suffix.len },
+                kind: commit_stage_entry_kind(entry),
+                mode: entry.file_mode,
+                object_id: ObjectId{ hash: commit_copy_hash32(&entry.staged_object.hash) },
+                logical_size: logical_size,
+                content_type: ContentType.Unknown,
+                policy_id: commit_clone_policy_id(&entry.policy_id),
+            };
+            return try commit_manifest_store_payload(arena, store, &payload);
+        }
+        i = i + 1 as usize;
+    }
+
+    i = 0 as usize;
+    while i < payload.children.len {
+        const contains: bool = try commit_manifest_child_contains_path(arena, &payload, i, &entry.path);
+        if contains {
+            const new_child_id: ManifestId = try commit_manifest_update_node_for_modify(
+                arena,
+                store,
+                &payload.children.ptr[i].child_id,
+                entry,
+                logical_size,
+            );
+            payload.children.ptr[i].child_id = manifest_id_from_object(commit_copy_object_id(&new_child_id.id));
+            payload.children.ptr[i].child_hash = commit_copy_hash32(&new_child_id.id.hash);
+            return try commit_manifest_store_payload(arena, store, &payload);
+        }
+        i = i + 1 as usize;
+    }
+
+    return error.CommitManifestFailed;
+}
+
+fn commit_manifest_update_existing_modifies(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    parent_root: &ManifestId,
+    snapshot: &StageSnapshot,
+    stored_changes: &LocalChangeList,
+    profile: &CommitProfileState,
+) !ManifestId {
+    var root_id: ManifestId = parent_root[0];
+    var local_change_index: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < snapshot.entries.len {
+        const entry: &StageEntry = &snapshot.entries.ptr[i];
+        const logical_size: u64 = try commit_stage_entry_logical_size_cached_cursor(
+            store,
+            entry,
+            stored_changes,
+            &local_change_index,
+            profile,
+        );
+        root_id = try commit_manifest_update_node_for_modify(arena, store, &root_id, entry, logical_size);
+        i = i + 1 as usize;
+    }
+    return root_id;
+}
+
+fn commit_audit_summary_from_stage_fast(
+    store: &LooseObjectStore,
+    policy: &PathPolicyProfile,
+    snapshot: &StageSnapshot,
+    stored_changes: &LocalChangeList,
+) !AuditSummary {
+    var builder: CommitAuditSummaryBuilder = commit_audit_builder_init();
+    var local_change_index: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < snapshot.entries.len {
+        const entry: &StageEntry = &snapshot.entries.ptr[i];
+        var logical_size: u64 = 0u64;
+        const change: &LocalChange = commit_cached_change_at_path(stored_changes, &entry.path, &local_change_index);
+        if change != null && hash32_compare(&change.working_hash, &entry.staged_object.hash) == 0 {
+            logical_size = change.last_seen_logical_size;
+        } else if stage_entry_has_staged_content(entry) {
+            logical_size = try commit_stage_entry_logical_size(store, &entry.staged_object);
+        }
+
+        const matched: PathPolicyMatch = path_policy_match(policy, &entry.path);
+        var dedupe_scope: ByteList = commit_audit_literal("repository");
+        if matched.matched && policy_id_compare(&matched.policy_id, &entry.policy_id) == 0 {
+            dedupe_scope = commit_audit_scope_text(&matched);
+        }
+        commit_audit_builder_add(
+            &builder,
+            &entry.policy_id,
             &dedupe_scope,
             entry.audit_enabled,
             logical_size,
@@ -995,6 +1281,7 @@ fn commit_reconcile_change_from_parts(
         last_seen_inode: entry.inode,
         last_seen_mtime_ns: entry.mtime_ns,
         last_seen_logical_size: entry.logical_size,
+        last_seen_file_mode: entry.file_mode,
         watcher_seq: watcher_seq,
         reconcile_epoch: reconcile_epoch,
     };
@@ -1009,6 +1296,7 @@ fn commit_reconcile_deleted_change(base: &ManifestLeafInputEntry, watcher_seq: u
         last_seen_inode: 0u64,
         last_seen_mtime_ns: 0i64,
         last_seen_logical_size: 0u64,
+        last_seen_file_mode: base.mode,
         watcher_seq: watcher_seq,
         reconcile_epoch: reconcile_epoch,
     };
@@ -1167,10 +1455,15 @@ fn commit_can_sync_workspace_from_stored_changes(
     while i < manifest_inputs.len {
         const input: &ManifestLeafInputEntry = &manifest_inputs.ptr[i];
         const change: &LocalChange = &stored_changes.ptr[i];
-        if change.status != ChangeStatus.Added {
+        if change.status == ChangeStatus.Virtual ||
+            change.status == ChangeStatus.Deleted ||
+            change.status == ChangeStatus.Conflict {
             return false;
         }
         if manifest_path_compare(&input.path, &change.path) != 0 {
+            return false;
+        }
+        if input.mode != change.last_seen_file_mode {
             return false;
         }
         if hash32_compare(&input.object_id.hash, &change.working_hash) != 0 {
@@ -1207,6 +1500,7 @@ fn commit_materialized_changes_from_stored(
             last_seen_inode: change.last_seen_inode,
             last_seen_mtime_ns: change.last_seen_mtime_ns,
             last_seen_logical_size: change.last_seen_logical_size,
+            last_seen_file_mode: input.mode,
             watcher_seq: 0u64,
             reconcile_epoch: 1u64,
         };
@@ -1306,6 +1600,104 @@ fn commit_sync_workspace_state(
     try workspace_state_file_write(repo_path_cstr(&state_path) as &const byte, &state);
     commit_profile_add_elapsed(&commit_profile.sync_state_write_elapsed_ms, sync_state_write_started_ms);
 
+    const sync_local_write_started_ms: u64 = commit_maybe_now_ms(commit_profile.enabled);
+    try local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &merged_changes);
+    commit_profile_add_elapsed(&commit_profile.sync_local_write_elapsed_ms, sync_local_write_started_ms);
+}
+
+fn commit_materialized_changes_after_incremental_stage(
+    arena: &Arena,
+    snapshot: &StageSnapshot,
+    stored_changes: &LocalChangeList,
+) !LocalChangeList {
+    if stored_changes.len == 0 as usize {
+        return LocalChangeList{ ptr: null, len: 0 };
+    }
+    const raw_changes: &LocalChange = arena_alloc(arena, @size_of(LocalChange) as usize * stored_changes.len) as &LocalChange;
+    if raw_changes == null {
+        return error.CommitAlloc;
+    }
+
+    var stage_index: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < stored_changes.len {
+        const change: &LocalChange = &stored_changes.ptr[i];
+        const staged: &StageEntry = commit_stage_entry_at_or_after(snapshot.entries, &change.path, &stage_index);
+        if staged == null {
+            raw_changes[i] = LocalChange{
+                path: ByteList{ ptr: change.path.ptr, len: change.path.len },
+                base_object: change.base_object,
+                working_hash: change.working_hash,
+                status: ChangeStatus.Materialized,
+                last_seen_inode: change.last_seen_inode,
+                last_seen_mtime_ns: change.last_seen_mtime_ns,
+                last_seen_logical_size: change.last_seen_logical_size,
+                last_seen_file_mode: change.last_seen_file_mode,
+                watcher_seq: change.watcher_seq,
+                reconcile_epoch: change.reconcile_epoch,
+            };
+        } else {
+            raw_changes[i] = LocalChange{
+                path: ByteList{ ptr: change.path.ptr, len: change.path.len },
+                base_object: ObjectId{ hash: staged.staged_object.hash },
+                working_hash: staged.staged_object.hash,
+                status: ChangeStatus.Materialized,
+                last_seen_inode: change.last_seen_inode,
+                last_seen_mtime_ns: change.last_seen_mtime_ns,
+                last_seen_logical_size: change.last_seen_logical_size,
+                last_seen_file_mode: staged.file_mode,
+                watcher_seq: 0u64,
+                reconcile_epoch: 1u64,
+            };
+        }
+        i = i + 1 as usize;
+    }
+    return local_change_list_from_slice(raw_changes[0: stored_changes.len]);
+}
+
+fn commit_sync_workspace_state_incremental_fast(
+    arena: &Arena,
+    root: &RepoPath,
+    commit_id: &CommitId,
+    snapshot: &StageSnapshot,
+    stored_changes: &LocalChangeList,
+    commit_profile: &CommitProfileState,
+) !void {
+    const sparse_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_SPARSE_REL);
+    const sync_sparse_started_ms: u64 = commit_maybe_now_ms(commit_profile.enabled);
+    const profile: SparseProfile = try sparse_profile_file_default(arena, repo_path_cstr(&sparse_path) as &const byte);
+    commit_profile_add_elapsed(&commit_profile.sync_sparse_elapsed_ms, sync_sparse_started_ms);
+    if profile.rules.len != 0 as usize {
+        return error.CommitManifestFailed;
+    }
+
+    const sync_reconcile_started_ms: u64 = commit_maybe_now_ms(commit_profile.enabled);
+    const merged_changes: LocalChangeList = try commit_materialized_changes_after_incremental_stage(
+        arena,
+        snapshot,
+        stored_changes,
+    );
+    commit_profile_add_elapsed(&commit_profile.sync_reconcile_elapsed_ms, sync_reconcile_started_ms);
+
+    const sync_counts_started_ms: u64 = commit_maybe_now_ms(commit_profile.enabled);
+    const materialized_count: u64 = merged_changes.len as u64;
+    const dirty_count: u64 = 0u64;
+    commit_profile_add_elapsed(&commit_profile.sync_counts_elapsed_ms, sync_counts_started_ms);
+
+    var state: WorkspaceState = workspace_state_with_counts(
+        commit_repo_root_bytes(root),
+        commit_id[0],
+        materialized_count,
+        dirty_count,
+        0u64,
+    );
+    state.sparse_profile_id = profile.profile_id;
+    const state_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_STATE_REL);
+    const sync_state_write_started_ms: u64 = commit_maybe_now_ms(commit_profile.enabled);
+    try workspace_state_file_write(repo_path_cstr(&state_path) as &const byte, &state);
+    commit_profile_add_elapsed(&commit_profile.sync_state_write_elapsed_ms, sync_state_write_started_ms);
+
+    const local_change_path: RepoPath = try repo_path_join_literal(root, HGIT_WORKSPACE_LOCAL_CHANGE_REL);
     const sync_local_write_started_ms: u64 = commit_maybe_now_ms(commit_profile.enabled);
     try local_change_file_write(repo_path_cstr(&local_change_path) as &const byte, &merged_changes);
     commit_profile_add_elapsed(&commit_profile.sync_local_write_elapsed_ms, sync_local_write_started_ms);
@@ -1415,6 +1807,7 @@ export fn run_commit() i32 {
         return EXIT_RUNTIME_ERROR;
     };
     commit_profile_add_elapsed(&profile.stage_lock_elapsed_ms, stage_lock_started_ms);
+    commit_profile_trace(&profile, "stage_lock", profile.stage_lock_elapsed_ms);
     defer {
         stage_file_lock_release(&stage_lock);
     }
@@ -1433,6 +1826,7 @@ export fn run_commit() i32 {
     var stage_arena: Arena = Arena{ buffer: stage_arena_storage, size: 0, used: 0 };
     arena_init(&stage_arena, stage_arena_storage, stage_arena_bytes);
     commit_profile_add_elapsed(&profile.stage_arena_elapsed_ms, stage_arena_started_ms);
+    commit_profile_trace(&profile, "stage_arena", profile.stage_arena_elapsed_ms);
 
     const stage_read_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
     const snapshot: StageSnapshot = commit_load_stage_snapshot(&stage_path, &stage_arena) catch |err| {
@@ -1444,12 +1838,13 @@ export fn run_commit() i32 {
         return EXIT_RUNTIME_ERROR;
     };
     commit_profile_add_elapsed(&profile.stage_read_elapsed_ms, stage_read_started_ms);
+    commit_profile_trace(&profile, "stage_read", profile.stage_read_elapsed_ms);
     if snapshot.entries.len == 0 {
         fprintf(stderr, "%s" as *byte, COMMIT_NOTHING_STAGED_TEXT);
         return EXIT_RUNTIME_ERROR;
     }
     const work_arena_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
-    const work_arena_bytes: usize = commit_work_arena_bytes(&snapshot) catch {
+    const work_arena_bytes: usize = commit_work_arena_bytes(&root, &snapshot) catch {
         fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
@@ -1463,6 +1858,7 @@ export fn run_commit() i32 {
     var work_arena: Arena = Arena{ buffer: work_arena_storage, size: 0, used: 0 };
     arena_init(&work_arena, work_arena_storage, work_arena_bytes);
     commit_profile_add_elapsed(&profile.work_arena_elapsed_ms, work_arena_started_ms);
+    commit_profile_trace(&profile, "work_arena", profile.work_arena_elapsed_ms);
     const zero_commit: CommitId = stage_zero_commit_id();
     const has_base_commit: bool = commit_id_compare(&snapshot.state.base_commit, &zero_commit) != 0;
 
@@ -1500,6 +1896,7 @@ export fn run_commit() i32 {
             return EXIT_RUNTIME_ERROR;
         };
         commit_profile_add_elapsed(&profile.parent_load_elapsed_ms, parent_load_started_ms);
+        commit_profile_trace(&profile, "parent_load", profile.parent_load_elapsed_ms);
         parent_manifest_root = parent_payload.manifest_root;
         parent_generation = parent_payload.generation;
     } else if has_base_commit {
@@ -1513,6 +1910,7 @@ export fn run_commit() i32 {
         return EXIT_RUNTIME_ERROR;
     };
     commit_profile_add_elapsed(&profile.local_change_read_elapsed_ms, local_change_read_started_ms);
+    commit_profile_trace(&profile, "local_read", profile.local_change_read_elapsed_ms);
 
     if has_head && commit_id_compare(&snapshot.state.base_commit, &head_commit) != 0 {
         const base_manifest_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
@@ -1544,6 +1942,7 @@ export fn run_commit() i32 {
             return EXIT_RUNTIME_ERROR;
         };
         commit_profile_add_elapsed(&profile.base_manifest_elapsed_ms, base_manifest_started_ms);
+        commit_profile_trace(&profile, "base_manifest", profile.base_manifest_elapsed_ms);
 
         if has_base_commit {
             const graph_path: RepoPath = repo_path_join_literal(&root, HGIT_INDEXES_COMMIT_GRAPH_REL) catch {
@@ -1572,40 +1971,81 @@ export fn run_commit() i32 {
         effective_snapshot = commit_snapshot_with_base(&snapshot, &head_commit);
     }
 
-    const staged_inputs_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
-    const manifest_inputs: ManifestLeafInputList = stage_view_manifest_inputs_from_snapshot(
-        &work_arena,
-        &store,
-        &effective_snapshot,
-        &zero_commit,
-    ) catch |err| {
-        if @error_id(err) == @error_id(error.StageViewStoreFailed) {
+    var manifest_inputs: ManifestLeafInputList = ManifestLeafInputList{ ptr: null, len: 0 };
+    var manifest_root: ManifestId = commit_zero_manifest_id();
+    var manifest_count: usize = 0 as usize;
+    var used_incremental_modify_fast_path: bool = false;
+    if has_head &&
+        commit_can_use_incremental_modify_fast_path(&effective_snapshot, &head_commit, &stored_changes) &&
+        commit_incremental_sparse_profile_is_plain(&work_arena, &root) {
+        const manifest_build_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
+        manifest_root = commit_manifest_update_existing_modifies(
+            &work_arena,
+            &store,
+            &parent_manifest_root,
+            &effective_snapshot,
+            &stored_changes,
+            &profile,
+        ) catch {
             fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
+        };
+        commit_profile_add_elapsed(&profile.manifest_build_elapsed_ms, manifest_build_started_ms);
+        commit_profile_trace(&profile, "manifest_build", profile.manifest_build_elapsed_ms);
+        manifest_count = stored_changes.len;
+        used_incremental_modify_fast_path = true;
+    } else {
+        const staged_inputs_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
+        if !has_head {
+            manifest_inputs = commit_manifest_inputs_from_stage(
+                &work_arena,
+                &store,
+                &effective_snapshot,
+                &stored_changes,
+                &profile,
+            ) catch {
+                fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            };
+        } else {
+            manifest_inputs = stage_view_manifest_inputs_from_snapshot(
+                &work_arena,
+                &store,
+                &effective_snapshot,
+                &zero_commit,
+            ) catch |err| {
+                if @error_id(err) == @error_id(error.StageViewStoreFailed) {
+                    fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+                    return EXIT_RUNTIME_ERROR;
+                }
+                if @error_id(err) == @error_id(error.StageViewUnsupportedStageEntry) {
+                    fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+                    return EXIT_RUNTIME_ERROR;
+                }
+                fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            };
         }
-        if @error_id(err) == @error_id(error.StageViewUnsupportedStageEntry) {
-            fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
-            return EXIT_RUNTIME_ERROR;
-        }
-        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
-    commit_profile_add_elapsed(&profile.staged_inputs_elapsed_ms, staged_inputs_started_ms);
+        commit_profile_add_elapsed(&profile.staged_inputs_elapsed_ms, staged_inputs_started_ms);
+        commit_profile_trace(&profile, "staged_inputs", profile.staged_inputs_elapsed_ms);
 
-    const manifest_build_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
-    const manifest_root: ManifestId = manifest_root_build_and_store(
-        &work_arena,
-        &store,
-        ManifestLeafInputList{ ptr: manifest_inputs.ptr, len: manifest_inputs.len },
-    ) catch |err| {
-        if @error_id(err) == @error_id(error.StorePermissionDenied) {
-            fprintf(stderr, "%s" as *byte, COMMIT_PERMISSION_TEXT);
+        const manifest_build_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
+        manifest_root = manifest_root_build_and_store(
+            &work_arena,
+            &store,
+            ManifestLeafInputList{ ptr: manifest_inputs.ptr, len: manifest_inputs.len },
+        ) catch |err| {
+            if @error_id(err) == @error_id(error.StorePermissionDenied) {
+                fprintf(stderr, "%s" as *byte, COMMIT_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
-        }
-        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
-    commit_profile_add_elapsed(&profile.manifest_build_elapsed_ms, manifest_build_started_ms);
+        };
+        commit_profile_add_elapsed(&profile.manifest_build_elapsed_ms, manifest_build_started_ms);
+        commit_profile_trace(&profile, "manifest_build", profile.manifest_build_elapsed_ms);
+        manifest_count = manifest_inputs.len;
+    }
 
     const author: Identity = commit_default_identity(&work_arena) catch {
         fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
@@ -1661,6 +2101,7 @@ export fn run_commit() i32 {
         return EXIT_RUNTIME_ERROR;
     };
     commit_profile_add_elapsed(&profile.commit_object_elapsed_ms, commit_object_started_ms);
+    commit_profile_trace(&profile, "commit_object", profile.commit_object_elapsed_ms);
 
     const graph_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
     const graph_path: RepoPath = repo_path_join_literal(&root, HGIT_INDEXES_COMMIT_GRAPH_REL) catch {
@@ -1682,12 +2123,16 @@ export fn run_commit() i32 {
         return EXIT_RUNTIME_ERROR;
     };
     commit_profile_add_elapsed(&profile.graph_elapsed_ms, graph_started_ms);
+    commit_profile_trace(&profile, "graph", profile.graph_elapsed_ms);
 
     const sync_arena_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
-    const sync_arena_bytes: usize = commit_sync_arena_bytes(&manifest_inputs) catch {
-        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
+    var sync_arena_bytes: usize = COMMIT_SYNC_ARENA_MIN_BYTES;
+    if !used_incremental_modify_fast_path {
+        sync_arena_bytes = commit_sync_arena_bytes(&manifest_inputs) catch {
+            fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+    }
     const sync_arena_storage: &byte = commit_malloc_arena_storage(sync_arena_bytes) catch {
         fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
@@ -1698,18 +2143,39 @@ export fn run_commit() i32 {
     var sync_arena: Arena = Arena{ buffer: sync_arena_storage, size: 0, used: 0 };
     arena_init(&sync_arena, sync_arena_storage, sync_arena_bytes);
     commit_profile_add_elapsed(&profile.sync_arena_elapsed_ms, sync_arena_started_ms);
+    commit_profile_trace(&profile, "sync_arena", profile.sync_arena_elapsed_ms);
 
     const sync_workspace_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
-    commit_sync_workspace_state(&sync_arena, &root, &commit_id, &manifest_inputs, &stored_changes, &profile) catch |err| {
-        if @error_id(err) == @error_id(error.RepoPermissionDenied) ||
-            @error_id(err) == @error_id(error.StorePermissionDenied) {
-            fprintf(stderr, "%s" as *byte, COMMIT_PERMISSION_TEXT);
+    if used_incremental_modify_fast_path {
+        commit_sync_workspace_state_incremental_fast(
+            &sync_arena,
+            &root,
+            &commit_id,
+            &effective_snapshot,
+            &stored_changes,
+            &profile,
+        ) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) ||
+                @error_id(err) == @error_id(error.StorePermissionDenied) {
+                fprintf(stderr, "%s" as *byte, COMMIT_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
-        }
-        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
+        };
+    } else {
+        commit_sync_workspace_state(&sync_arena, &root, &commit_id, &manifest_inputs, &stored_changes, &profile) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) ||
+                @error_id(err) == @error_id(error.StorePermissionDenied) {
+                fprintf(stderr, "%s" as *byte, COMMIT_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+    }
     commit_profile_add_elapsed(&profile.sync_workspace_elapsed_ms, sync_workspace_started_ms);
+    commit_profile_trace(&profile, "sync_workspace", profile.sync_workspace_elapsed_ms);
 
     const head_write_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
     repo_write_head_commit(&root, &config, &commit_id) catch |err| {
@@ -1721,6 +2187,7 @@ export fn run_commit() i32 {
         return EXIT_RUNTIME_ERROR;
     };
     commit_profile_add_elapsed(&profile.head_write_elapsed_ms, head_write_started_ms);
+    commit_profile_trace(&profile, "head_write", profile.head_write_elapsed_ms);
 
     const stage_clear_started_ms: u64 = commit_maybe_now_ms(profile.enabled);
     commit_write_empty_stage(&stage_path, commit_id, timestamp_ms as i64) catch {
@@ -1728,6 +2195,7 @@ export fn run_commit() i32 {
         return EXIT_RUNTIME_ERROR;
     };
     commit_profile_add_elapsed(&profile.stage_clear_elapsed_ms, stage_clear_started_ms);
+    commit_profile_trace(&profile, "stage_clear", profile.stage_clear_elapsed_ms);
 
     const audit_policy: PathPolicyProfile = audit_policy_profile_default(&work_arena, &root);
     var audit_summary: AuditSummary = AuditSummary{
@@ -1737,15 +2205,27 @@ export fn run_commit() i32 {
         affected_path_count: 0u64,
         affected_byte_count: 0u64,
     };
-    audit_summary = commit_audit_summary_from_snapshot(
-        &store,
-        &audit_policy,
-        &snapshot,
-        &manifest_inputs,
-    ) catch {
-        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
+    if used_incremental_modify_fast_path {
+        audit_summary = commit_audit_summary_from_stage_fast(
+            &store,
+            &audit_policy,
+            &snapshot,
+            &stored_changes,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+    } else {
+        audit_summary = commit_audit_summary_from_snapshot(
+            &store,
+            &audit_policy,
+            &snapshot,
+            &manifest_inputs,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+    }
     var head_before_hex: [byte: HASH32_HEX_BYTES] = [];
     var head_after_hex: [byte: HASH32_HEX_BYTES] = [];
     var head_before_text: ByteList = ByteList{ ptr: null, len: 0 as usize };
@@ -1775,6 +2255,6 @@ export fn run_commit() i32 {
         return EXIT_RUNTIME_ERROR;
     }
 
-    commit_profile_print_summary(&profile, snapshot.entries.len, manifest_inputs.len);
+    commit_profile_print_summary(&profile, snapshot.entries.len, manifest_count);
     return EXIT_OK;
 }

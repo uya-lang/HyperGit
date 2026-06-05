@@ -16,6 +16,28 @@
 另外，编译器仓库现在有专门的 C99 回归脚本 `tests/verify_c99_struct_array_and_typed_route_regressions.sh`，并已接入 `make check`，用于覆盖本页这两个 2026-05-31 修复掉的 codegen 回归。
 2026-05-31 补充复验：在 `~/uya/uya` 执行 `make uya` 重建默认自举编译器后，`./tests/verify_c99_struct_array_and_typed_route_regressions.sh` 也直接通过，因此这两个 C99 codegen 回归已经落到主线 `bin/uya`，不再只依赖 `bin/uya-hosted`。
 
+## Non-deterministic spurious "catch 的操作数必须是错误联合类型 !T" on `hgx` build
+
+- Observed (2026-06-06, `v0.9.9`): `uya check`/`build src/hgx/main.uya` intermittently
+  fails type-checking with hundreds (~746-748, count varies run-to-run) of
+  `catch 的操作数必须是错误联合类型 !T` errors, then succeeds again on retry with the
+  exact same source and the same compiler binary.
+- The reported error sites include UNMODIFIED files that are byte-identical to `HEAD`
+  (e.g. `src/hgx/commands/doctor.uya:358` — `_ = sys_kill(pid as i64, 0 as i32) catch |err| {...}`,
+  which is valid: `sys_kill` returns an error union), so the errors are spurious, not
+  real type errors.
+- Pattern: cold builds (fresh process / freshly-cleared `.uyacache`, as in the
+  per-test `uya build` inside `tests/*.sh`) are the ones that flake; once a warm
+  `.uyacache` exists, `make check` was observed passing 10/10 in a row. This is why
+  `make test` can fail at an arbitrary shell test (the cold `uya build` inside it),
+  while `make check`/`make build` pass and the produced `bin/hgx` runs every command
+  correctly (full `bench/bench_million_files_repo.sh` run, all unit/shell tests pass
+  on retry).
+- The error count varying between otherwise identical runs (746 vs 748) confirms the
+  type checker is non-deterministic here rather than reacting to a real source change.
+- Mitigation for now: retry the build; a warm shared `.uyacache` greatly reduces the
+  flake rate. No standalone minimal reproducer isolated yet.
+
 ## Array field copy in a struct literal generates a pointer-to-byte initializer
 
 - Current status (2026-05-31): 不再复现。使用当前工作区源码重建后的 `~/uya/uya/bin/uya` 重新验证，`docs/repros/uya_array_field_copy_generates_pointer_initializer.uya` 现在可直接构建并运行成功，退出码为 `0`，宿主 C 编译阶段也不再出现 `-Wint-conversion` 警告。

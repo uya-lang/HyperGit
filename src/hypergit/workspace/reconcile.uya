@@ -32,6 +32,7 @@ fn workspace_reconcile_entry_from_base(
     inode: u64,
     mtime_ns: i64,
     logical_size: u64,
+    file_mode: u32,
     watcher_seq: u64,
     reconcile_epoch: u64,
 ) LocalChange {
@@ -43,6 +44,7 @@ fn workspace_reconcile_entry_from_base(
         last_seen_inode: inode,
         last_seen_mtime_ns: mtime_ns,
         last_seen_logical_size: logical_size,
+        last_seen_file_mode: file_mode,
         watcher_seq: watcher_seq,
         reconcile_epoch: reconcile_epoch,
     };
@@ -63,6 +65,7 @@ fn workspace_reconcile_added_change(
         entry.inode,
         entry.mtime_ns,
         entry.logical_size,
+        entry.file_mode,
         watcher_seq,
         reconcile_epoch,
     );
@@ -89,6 +92,7 @@ fn workspace_reconcile_materialized_or_modified_change(
         entry.inode,
         entry.mtime_ns,
         entry.logical_size,
+        entry.file_mode,
         watcher_seq,
         reconcile_epoch,
     );
@@ -107,6 +111,7 @@ fn workspace_reconcile_deleted_change(
         0u64,
         0i64,
         0u64,
+        base.mode,
         watcher_seq,
         reconcile_epoch,
     );

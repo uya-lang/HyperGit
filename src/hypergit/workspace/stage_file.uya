@@ -65,7 +65,7 @@ export const STAGE_FILE_VERSION: u16 = 2u16;
 const STAGE_FILE_FLAGS: u16 = 0u16;
 const STAGE_FILE_HEADER_BYTES: usize = 56 as usize;
 const STAGE_FILE_LOCK_PID_MAX_BYTES: usize = 32 as usize;
-const STAGE_FILE_MAX_BYTES: usize = 67108864 as usize;
+const STAGE_FILE_MAX_BYTES: usize = 1073741824 as usize;
 const STAGE_FILE_PATH_MAX: usize = 4096 as usize;
 
 error StageFileOpenFailed;

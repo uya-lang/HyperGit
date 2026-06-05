@@ -1,24 +1,57 @@
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
 use std.mem.arena.arena_init;
+use std.async.Future;
+use std.async.block_on;
+use std.thread.ThreadPool;
+use std.thread.async_compute;
+use std.thread.thread_pool_new;
+use std.thread.thread_pool_shutdown;
+use std.time.now_ms;
 
 use libc.Stat;
+use libc.DIR;
+use libc.Dirent;
+use libc.AT_SYMLINK_NOFOLLOW;
+use libc.ENOENT;
+use libc.EACCES;
+use libc.EPERM;
+use libc.O_CLOEXEC;
+use libc.O_DIRECTORY;
+use libc.O_RDONLY;
+use libc.SYS_newfstatat;
+use libc.closedir;
+use libc.errno;
 use libc.free;
 use libc.fprintf;
+use libc.fflush;
+use libc.getenv;
 use libc.malloc;
+use libc.opendir;
+use libc.readdir;
 use libc.stat;
 use libc.stderr;
 use libc.stdout;
+use libc.sys_close;
+use libc.sys_open;
+use libc.write_stdout_bytes;
 
 use commands.add.add_worktree_object_id;
 use cli.EXIT_OK;
 use cli.EXIT_RUNTIME_ERROR;
 use core.ids.CommitId;
 use core.ids.ObjectId;
+use core.ids.commit_id_compare;
+use core.ids.hash32_compare;
 use core.ids.object_id_compare;
+use core.parallel.parallel_default_requested_workers;
+use core.parallel.parallel_worker_count;
 use manifest.path.manifest_path_compare;
 use manifest.trie.ManifestLeafInputEntry;
 use manifest.trie.ManifestLeafInputList;
+use manifest.trie.manifest_leaf_input_list_from_slice;
+use object.types.ContentType;
+use object.types.EntryKind;
 use object.types.ByteList;
 use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_open;
@@ -33,25 +66,49 @@ use store.repo_layout.repo_find_root_from_cwd;
 use store.repo_layout.repo_path_join_literal;
 use store.repo_layout.repo_read_config;
 use store.repo_layout.repo_path_cstr;
+use syscall.sys_lstat;
 use workspace.local_change_file.local_change_file_read;
 use workspace.local_view.workspace_local_view_filter_expected_inputs;
-use workspace.local_view.workspace_local_view_find_change;
 use workspace.scan.WorkspaceFileEntry;
+use workspace.scan.WorkspaceFileKind;
 use workspace.scan.WorkspaceFileList;
+use workspace.scan.workspace_scan_file_paths;
 use workspace.scan.workspace_scan_files;
 use workspace.stage.StageEntryKind;
 use workspace.stage.StageEntry;
 use workspace.stage.StageEntryList;
 use workspace.stage.StageSnapshot;
 use workspace.stage.stage_empty_snapshot;
+use workspace.stage.stage_entry_has_staged_content;
 use workspace.stage.stage_zero_commit_id;
+use workspace.stage.stage_zero_policy_id;
 use workspace.stage_file.stage_file_read;
 use workspace.stage_view.stage_view_manifest_inputs_from_snapshot;
 use workspace.state.ChangeStatus;
 use workspace.state.LocalChange;
 use workspace.state.LocalChangeList;
 
-const STATUS_ARENA_BYTES: usize = 268435456 as usize;
+const STATUS_ARENA_BYTES: usize = 2147483648 as usize;
+const STATUS_FILE_MODE_TYPE_MASK: u32 = 61440u32;
+const STATUS_FILE_MODE_DIR: u32 = 16384u32;
+const STATUS_FILE_MODE_REGULAR: u32 = 32768u32;
+const STATUS_FILE_MODE_SYMLINK: u32 = 40960u32;
+const STATUS_FILE_MODE_EXEC_BITS: u32 = 73u32;
+const STATUS_MODE_FILE: u32 = 0o100644u32;
+const STATUS_MODE_EXECUTABLE: u32 = 0o100755u32;
+const STATUS_MODE_SYMLINK: u32 = 0o120000u32;
+const STATUS_TRACKED_CLEAN_PARALLEL_WORKERS_DEFAULT: i32 = 4;
+const STATUS_TRACKED_CLEAN_PARALLEL_MAX_WORKERS: usize = 16 as usize;
+const STATUS_TRACKED_CLEAN_PARALLEL_MIN_FILES: usize = 1000000 as usize;
+const STATUS_TRACKED_CLEAN_TASK_OK: usize = 0 as usize;
+const STATUS_TRACKED_CLEAN_TASK_CHANGED: usize = 1 as usize;
+const STATUS_TRACKED_CLEAN_TASK_READ_FAILED: usize = 2 as usize;
+const STATUS_TRACKED_CLEAN_TASK_PATH_TOO_LONG: usize = 3 as usize;
+const STATUS_DIRECT_BUFFER_BYTES: usize = 1048576 as usize;
+const STATUS_DIRECT_DT_UNKNOWN: i8 = 0i8;
+const STATUS_DIRECT_DT_DIR: i8 = 4i8;
+const STATUS_DIRECT_DT_REG: i8 = 8i8;
+const STATUS_DIRECT_DT_LNK: i8 = 10i8;
 
 error StatusAlloc;
 error StatusPathTooLong;
@@ -61,6 +118,7 @@ error StatusWorkspaceReadFailed;
 error StatusInvalidPath;
 error StatusReservedName;
 error StatusUnsupportedWorkspaceEntry;
+error StatusFastStageViewUnsupported;
 
 enum StatusChangeKind {
     NewFile,
@@ -80,6 +138,47 @@ struct StatusChangeList {
 
 struct StatusPrintablePath {
     bytes: [byte: 4096] = []
+}
+
+struct StatusFsPath {
+    bytes: [byte: 4096] = [],
+    len: usize
+}
+
+struct StatusProfileState {
+    enabled: bool,
+    total_started_ms: u64,
+    stage_read_ms: u64,
+    local_read_ms: u64,
+    staged_view_ms: u64,
+    expected_filter_ms: u64,
+    workspace_scan_ms: u64,
+    unstaged_collect_ms: u64
+}
+
+struct StatusTrackedCleanTask {
+    root: StatusFsPath,
+    changes: &LocalChange,
+    start_index: usize,
+    end_index: usize
+}
+
+struct StatusDirectDirItem {
+    name: ByteList,
+    mode_type: u32
+}
+
+struct StatusDirectDirItemBuffer {
+    ptr: &StatusDirectDirItem,
+    len: usize,
+    cap: usize
+}
+
+struct StatusDirectOutputBuffer {
+    ptr: &byte,
+    len: usize,
+    cap: usize,
+    file_count: usize
 }
 
 export const STATUS_BRANCH_TEXT: &const byte = "On branch %s\n";
@@ -197,6 +296,111 @@ fn status_change_label(kind: StatusChangeKind) &const byte {
     return STATUS_MODIFIED_LABEL;
 }
 
+fn status_change_label_len(kind: StatusChangeKind) usize {
+    if kind == StatusChangeKind.NewFile {
+        return 8 as usize;
+    }
+    if kind == StatusChangeKind.Deleted {
+        return 7 as usize;
+    }
+    return 8 as usize;
+}
+
+fn status_cstr_len(text: &const byte) usize {
+    var len: usize = 0 as usize;
+    while text[len] != 0 as byte {
+        len = len + 1 as usize;
+    }
+    return len;
+}
+
+fn status_profile_env_enabled() bool {
+    const raw: &byte = getenv("HGX_STATUS_PROFILE");
+    if raw == null || raw[0] == 0 as byte {
+        return false;
+    }
+    return !(raw[0] == '0' as byte && raw[1] == 0 as byte);
+}
+
+fn status_now_ms_or_zero() u64 {
+    return now_ms() catch {
+        return 0u64;
+    };
+}
+
+fn status_maybe_now_ms(enabled: bool) u64 {
+    if !enabled {
+        return 0u64;
+    }
+    return status_now_ms_or_zero();
+}
+
+fn status_profile_add_elapsed(slot: &u64, started_ms: u64) void {
+    if started_ms == 0u64 {
+        return;
+    }
+    const finished_ms: u64 = status_now_ms_or_zero();
+    if finished_ms < started_ms {
+        return;
+    }
+    *slot = *slot + (finished_ms - started_ms);
+}
+
+fn status_profile_init() StatusProfileState {
+    const enabled: bool = status_profile_env_enabled();
+    return StatusProfileState{
+        enabled: enabled,
+        total_started_ms: status_maybe_now_ms(enabled),
+        stage_read_ms: 0u64,
+        local_read_ms: 0u64,
+        staged_view_ms: 0u64,
+        expected_filter_ms: 0u64,
+        workspace_scan_ms: 0u64,
+        unstaged_collect_ms: 0u64,
+    };
+}
+
+fn status_profile_report(profile: &StatusProfileState, staged_len: usize, local_len: usize, expected_len: usize, worktree_len: usize, unstaged_len: usize) void {
+    if !profile.enabled {
+        return;
+    }
+    var total_ms: u64 = 0u64;
+    if profile.total_started_ms != 0u64 {
+        const finished_ms: u64 = status_now_ms_or_zero();
+        if finished_ms >= profile.total_started_ms {
+            total_ms = finished_ms - profile.total_started_ms;
+        }
+    }
+    fprintf(
+        stderr,
+        "info: status profile counts staged=%llu local=%llu expected=%llu worktree=%llu unstaged=%llu\n" as *byte,
+        staged_len,
+        local_len,
+        expected_len,
+        worktree_len,
+        unstaged_len,
+    );
+    fprintf(
+        stderr,
+        "info: status profile wall_ms total=%llu stage_read=%llu local_read=%llu staged_view=%llu expected_filter=%llu workspace_scan=%llu unstaged_collect=%llu\n" as *byte,
+        total_ms,
+        profile.stage_read_ms,
+        profile.local_read_ms,
+        profile.staged_view_ms,
+        profile.expected_filter_ms,
+        profile.workspace_scan_ms,
+        profile.unstaged_collect_ms,
+    );
+}
+
+fn status_profile_trace(profile: &StatusProfileState, label: &const byte, elapsed_ms: u64) void {
+    if !profile.enabled {
+        return;
+    }
+    fprintf(stderr, "info: status profile phase %s=%llu\n" as *byte, label, elapsed_ms);
+    _ = fflush(stderr);
+}
+
 fn status_stage_change_kind(entry: &StageEntry) StatusChangeKind {
     if entry.kind == StageEntryKind.Add {
         return StatusChangeKind.NewFile;
@@ -205,6 +409,843 @@ fn status_stage_change_kind(entry: &StageEntry) StatusChangeKind {
         return StatusChangeKind.Deleted;
     }
     return StatusChangeKind.Modified;
+}
+
+fn status_stage_entry_kind(entry: &StageEntry) EntryKind {
+    if (entry.file_mode & STATUS_FILE_MODE_TYPE_MASK) == STATUS_FILE_MODE_SYMLINK {
+        return EntryKind.Symlink;
+    }
+    if (entry.file_mode & STATUS_FILE_MODE_EXEC_BITS) != 0u32 {
+        return EntryKind.Executable;
+    }
+    return EntryKind.File;
+}
+
+fn status_mode_type(mode: u32) u32 {
+    return mode & STATUS_FILE_MODE_TYPE_MASK;
+}
+
+fn status_workspace_kind_from_mode(mode: u32) !WorkspaceFileKind {
+    const kind: u32 = status_mode_type(mode);
+    if kind == STATUS_FILE_MODE_REGULAR {
+        return WorkspaceFileKind.Regular;
+    }
+    if kind == STATUS_FILE_MODE_SYMLINK {
+        return WorkspaceFileKind.Symlink;
+    }
+    return error.StatusUnsupportedWorkspaceEntry;
+}
+
+fn status_canonical_mode(mode: u32) u32 {
+    const kind: u32 = status_mode_type(mode);
+    if kind == STATUS_FILE_MODE_SYMLINK {
+        return STATUS_MODE_SYMLINK;
+    }
+    if (mode & STATUS_FILE_MODE_EXEC_BITS) != 0u32 {
+        return STATUS_MODE_EXECUTABLE;
+    }
+    return STATUS_MODE_FILE;
+}
+
+fn status_logical_size(st: &Stat) u64 {
+    if st.st_size < 0 {
+        return 0u64;
+    }
+    return st.st_size as u64;
+}
+
+fn status_inode(st: &Stat) u64 {
+    if st.st_ino < 0 {
+        return 0u64;
+    }
+    return st.st_ino as u64;
+}
+
+fn status_mtime_ns_from_stat(st: &Stat) i64 {
+    return (st.st_mtime * 1000000000i64) + st.st_mtime_nsec;
+}
+
+fn status_fs_path_from_repo_path(root: &RepoPath) StatusFsPath {
+    var out: StatusFsPath = StatusFsPath{ bytes: [], len: root.len };
+    var i: usize = 0 as usize;
+    while i < root.len {
+        out.bytes[i] = root.bytes[i];
+        i = i + 1 as usize;
+    }
+    out.bytes[root.len] = 0 as byte;
+    return out;
+}
+
+fn status_fs_path_join(root: &StatusFsPath, path: &ByteList) !StatusFsPath {
+    var out: StatusFsPath = StatusFsPath{ bytes: [], len: 0 as usize };
+    var pos: usize = 0 as usize;
+    while pos < root.len {
+        out.bytes[pos] = root.bytes[pos];
+        pos = pos + 1 as usize;
+    }
+    if pos > 0 as usize {
+        const last_index: usize = pos - 1 as usize;
+        if out.bytes[last_index] != '/' as byte {
+            if pos + 1 as usize >= REPO_PATH_MAX {
+                return error.StatusPathTooLong;
+            }
+            out.bytes[pos] = '/' as byte;
+            pos = pos + 1 as usize;
+        }
+    }
+    if pos + path.len >= REPO_PATH_MAX {
+        return error.StatusPathTooLong;
+    }
+    var i: usize = 0 as usize;
+    while i < path.len {
+        out.bytes[pos + i] = path.ptr[i];
+        i = i + 1 as usize;
+    }
+    pos = pos + path.len;
+    out.bytes[pos] = 0 as byte;
+    out.len = pos;
+    return out;
+}
+
+fn status_direct_errno_permission() bool {
+    return errno == EACCES || errno == EPERM;
+}
+
+fn status_direct_dirent_name_len(entry: &Dirent) usize {
+    var len: usize = 0 as usize;
+    while entry.d_name[len] != 0 as byte {
+        len = len + 1 as usize;
+    }
+    return len;
+}
+
+fn status_direct_dirent_equals(entry: &Dirent, text: &const byte) bool {
+    var i: usize = 0 as usize;
+    while true {
+        const left: byte = entry.d_name[i];
+        const right: byte = text[i];
+        if left != right {
+            return false;
+        }
+        if left == 0 as byte {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn status_direct_dirent_is_dot(entry: &Dirent) bool {
+    if entry.d_name[0] != '.' as byte {
+        return false;
+    }
+    if entry.d_name[1] == 0 as byte {
+        return true;
+    }
+    if entry.d_name[1] == '.' as byte && entry.d_name[2] == 0 as byte {
+        return true;
+    }
+    return false;
+}
+
+fn status_direct_dirent_is_repo_metadata(entry: &Dirent) bool {
+    return status_direct_dirent_equals(entry, ".hgit") ||
+        status_direct_dirent_equals(entry, ".git") ||
+        status_direct_dirent_equals(entry, ".hg") ||
+        status_direct_dirent_equals(entry, ".svn") ||
+        status_direct_dirent_equals(entry, ".repo");
+}
+
+fn status_direct_dirent_should_skip(entry: &Dirent) bool {
+    return status_direct_dirent_is_dot(entry) || status_direct_dirent_is_repo_metadata(entry);
+}
+
+fn status_direct_path_join(base: &StatusFsPath, name: &ByteList) !StatusFsPath {
+    var out: StatusFsPath = *base;
+    var pos: usize = out.len;
+    if pos >= REPO_PATH_MAX {
+        return error.StatusPathTooLong;
+    }
+    if name.len == 0 as usize {
+        out.bytes[pos] = 0 as byte;
+        return out;
+    }
+
+    if pos > 0 as usize {
+        const last_index: usize = pos - 1 as usize;
+        if last_index >= REPO_PATH_MAX {
+            return error.StatusPathTooLong;
+        }
+        if out.bytes[last_index] != '/' as byte {
+            if pos + 1 as usize >= REPO_PATH_MAX {
+                return error.StatusPathTooLong;
+            }
+            out.bytes[pos] = '/' as byte;
+            pos = pos + 1 as usize;
+        }
+    }
+    if pos + name.len >= REPO_PATH_MAX {
+        return error.StatusPathTooLong;
+    }
+
+    var i: usize = 0 as usize;
+    while i < name.len {
+        out.bytes[pos + i] = name.ptr[i];
+        i = i + 1 as usize;
+    }
+    pos = pos + name.len;
+    out.bytes[pos] = 0 as byte;
+    out.len = pos;
+    return out;
+}
+
+fn status_direct_name_copy(arena: &Arena, entry: &Dirent, len: usize) !ByteList {
+    var want: usize = len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const out: &byte = arena_alloc(arena, want) as &byte;
+    if out == null {
+        return error.StatusAlloc;
+    }
+
+    var i: usize = 0 as usize;
+    while i < len {
+        out[i] = entry.d_name[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out, len: len };
+}
+
+fn status_direct_mode_type_from_unknown(current_path: &StatusFsPath, name: &ByteList) !u32 {
+    const child_path: StatusFsPath = try status_direct_path_join(current_path, name);
+    var st: Stat = Stat{};
+    _ = sys_lstat(&child_path.bytes[0] as &const byte, &st) catch |err| {
+        if @error_id(err) == ENOENT as u32 {
+            return error.StatusWorkspaceReadFailed;
+        }
+        return error.StatusWorkspaceReadFailed;
+    };
+    return status_mode_type(st.st_mode as u32);
+}
+
+fn status_direct_dir_item_from_dirent(
+    arena: &Arena,
+    current_path: &StatusFsPath,
+    entry: &Dirent,
+    name_len: usize,
+) !StatusDirectDirItem {
+    const name: ByteList = try status_direct_name_copy(arena, entry, name_len);
+    var mode_type: u32 = 0u32;
+    if entry.d_type == STATUS_DIRECT_DT_REG {
+        mode_type = STATUS_FILE_MODE_REGULAR;
+    } else if entry.d_type == STATUS_DIRECT_DT_DIR {
+        mode_type = STATUS_FILE_MODE_DIR;
+    } else if entry.d_type == STATUS_DIRECT_DT_LNK {
+        mode_type = STATUS_FILE_MODE_SYMLINK;
+    } else if entry.d_type == STATUS_DIRECT_DT_UNKNOWN {
+        mode_type = try status_direct_mode_type_from_unknown(current_path, &name);
+    } else {
+        return error.StatusUnsupportedWorkspaceEntry;
+    }
+
+    if mode_type != STATUS_FILE_MODE_REGULAR &&
+        mode_type != STATUS_FILE_MODE_SYMLINK &&
+        mode_type != STATUS_FILE_MODE_DIR {
+        return error.StatusUnsupportedWorkspaceEntry;
+    }
+    return StatusDirectDirItem{ name: ByteList{ ptr: name.ptr, len: name.len }, mode_type: mode_type };
+}
+
+fn status_direct_dir_item_buffer_init() StatusDirectDirItemBuffer {
+    return StatusDirectDirItemBuffer{ ptr: null, len: 0 as usize, cap: 0 as usize };
+}
+
+fn status_direct_dir_item_buffer_reserve(arena: &Arena, buffer: &StatusDirectDirItemBuffer, additional: usize) !void {
+    if additional == 0 as usize {
+        return;
+    }
+    const needed: usize = buffer.len + additional;
+    if needed <= buffer.cap {
+        return;
+    }
+
+    var next_cap: usize = 32 as usize;
+    if buffer.cap > 0 as usize {
+        next_cap = buffer.cap * 2 as usize;
+    }
+    while next_cap < needed {
+        next_cap = next_cap * 2 as usize;
+    }
+
+    const raw: &StatusDirectDirItem = arena_alloc(arena, @size_of(StatusDirectDirItem) as usize * next_cap) as &StatusDirectDirItem;
+    if raw == null {
+        return error.StatusAlloc;
+    }
+
+    var i: usize = 0 as usize;
+    while i < buffer.len {
+        raw[i] = buffer.ptr[i];
+        i = i + 1 as usize;
+    }
+    buffer.ptr = raw;
+    buffer.cap = next_cap;
+}
+
+fn status_direct_dir_item_buffer_append(arena: &Arena, buffer: &StatusDirectDirItemBuffer, item: &StatusDirectDirItem) !void {
+    try status_direct_dir_item_buffer_reserve(arena, buffer, 1 as usize);
+    buffer.ptr[buffer.len] = item[0];
+    buffer.len = buffer.len + 1 as usize;
+}
+
+fn status_direct_read_dir_items(arena: &Arena, current_path: &StatusFsPath) !StatusDirectDirItemBuffer {
+    const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
+    if dir == null {
+        if status_direct_errno_permission() {
+            return error.RepoPermissionDenied;
+        }
+        return error.StatusWorkspaceReadFailed;
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    var buffer: StatusDirectDirItemBuffer = status_direct_dir_item_buffer_init();
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            return buffer;
+        }
+        if status_direct_dirent_should_skip(entry) {
+            continue;
+        }
+
+        const name_len: usize = status_direct_dirent_name_len(entry);
+        const item: StatusDirectDirItem = try status_direct_dir_item_from_dirent(arena, current_path, entry, name_len);
+        try status_direct_dir_item_buffer_append(arena, &buffer, &item);
+    }
+    return buffer;
+}
+
+fn status_direct_byte_list_compare(left: &ByteList, right: &ByteList) i32 {
+    var i: usize = 0 as usize;
+    while i < left.len && i < right.len {
+        const left_byte: byte = left.ptr[i];
+        const right_byte: byte = right.ptr[i];
+        if left_byte < right_byte {
+            return -1;
+        }
+        if left_byte > right_byte {
+            return 1;
+        }
+        i = i + 1 as usize;
+    }
+    if left.len < right.len {
+        return -1;
+    }
+    if left.len > right.len {
+        return 1;
+    }
+    return 0;
+}
+
+fn status_direct_dir_item_compare(left: &StatusDirectDirItem, right: &StatusDirectDirItem) i32 {
+    return status_direct_byte_list_compare(&left.name, &right.name);
+}
+
+fn status_direct_sort_dir_items(arena: &Arena, items: &StatusDirectDirItem, len: usize) !void {
+    if len <= 1 as usize {
+        return;
+    }
+
+    const scratch: &StatusDirectDirItem = arena_alloc(arena, @size_of(StatusDirectDirItem) as usize * len) as &StatusDirectDirItem;
+    if scratch == null {
+        return error.StatusAlloc;
+    }
+
+    var width: usize = 1 as usize;
+    while width < len {
+        var start: usize = 0 as usize;
+        while start < len {
+            const mid: usize = min_usize(start + width, len);
+            const end: usize = min_usize(mid + width, len);
+
+            var left: usize = start;
+            var right: usize = mid;
+            var out: usize = start;
+            while left < mid && right < end {
+                if status_direct_dir_item_compare(&items[left], &items[right]) <= 0 {
+                    scratch[out] = items[left];
+                    left = left + 1 as usize;
+                } else {
+                    scratch[out] = items[right];
+                    right = right + 1 as usize;
+                }
+                out = out + 1 as usize;
+            }
+            while left < mid {
+                scratch[out] = items[left];
+                left = left + 1 as usize;
+                out = out + 1 as usize;
+            }
+            while right < end {
+                scratch[out] = items[right];
+                right = right + 1 as usize;
+                out = out + 1 as usize;
+            }
+
+            var i: usize = start;
+            while i < end {
+                items[i] = scratch[i];
+                i = i + 1 as usize;
+            }
+            start = end;
+        }
+        width = width * 2 as usize;
+    }
+}
+
+fn status_direct_output_flush(out: &StatusDirectOutputBuffer) void {
+    if out.len == 0 as usize {
+        return;
+    }
+    _ = write_stdout_bytes(out.ptr as &const byte, out.len);
+    out.len = 0 as usize;
+}
+
+fn status_direct_output_append(out: &StatusDirectOutputBuffer, bytes: &const byte, len: usize) void {
+    if len == 0 as usize {
+        return;
+    }
+    if out.len + len > out.cap {
+        status_direct_output_flush(out);
+    }
+    var i: usize = 0 as usize;
+    while i < len {
+        out.ptr[out.len + i] = bytes[i];
+        i = i + 1 as usize;
+    }
+    out.len = out.len + len;
+}
+
+fn status_direct_output_append_new_file(out: &StatusDirectOutputBuffer, path: &StatusFsPath) void {
+    const newline: [byte: 1] = ['\n' as byte];
+    const prefix: [byte: 2] = [' ' as byte, ' ' as byte];
+    const separator: [byte: 4] = [':' as byte, ' ' as byte, ' ' as byte, ' ' as byte];
+
+    if out.file_count == 0 as usize {
+        status_direct_output_append(out, &newline[0] as &const byte, 1 as usize);
+        status_direct_output_append(out, STATUS_UNSTAGED_HEADER_TEXT, status_cstr_len(STATUS_UNSTAGED_HEADER_TEXT));
+    }
+
+    status_direct_output_append(out, &prefix[0] as &const byte, 2 as usize);
+    status_direct_output_append(out, STATUS_NEW_FILE_LABEL, status_change_label_len(StatusChangeKind.NewFile));
+    status_direct_output_append(out, &separator[0] as &const byte, 4 as usize);
+    status_direct_output_append(out, &path.bytes[0] as &const byte, path.len);
+    status_direct_output_append(out, &newline[0] as &const byte, 1 as usize);
+    out.file_count = out.file_count + 1 as usize;
+}
+
+fn status_direct_print_untracked_files_in_dir(
+    arena: &Arena,
+    current_path: &StatusFsPath,
+    relative: &StatusFsPath,
+    out: &StatusDirectOutputBuffer,
+) !void {
+    const items: StatusDirectDirItemBuffer = try status_direct_read_dir_items(arena, current_path);
+    if items.len == 0 as usize {
+        return;
+    }
+
+    try status_direct_sort_dir_items(arena, items.ptr, items.len);
+
+    var i: usize = 0 as usize;
+    while i < items.len {
+        const child_relative: StatusFsPath = try status_direct_path_join(relative, &items.ptr[i].name);
+        if items.ptr[i].mode_type == STATUS_FILE_MODE_DIR {
+            const child_path: StatusFsPath = try status_direct_path_join(current_path, &items.ptr[i].name);
+            try status_direct_print_untracked_files_in_dir(arena, &child_path, &child_relative, out);
+            i = i + 1 as usize;
+            continue;
+        }
+
+        status_direct_output_append_new_file(out, &child_relative);
+        i = i + 1 as usize;
+    }
+}
+
+fn status_print_no_head_untracked_direct(arena: &Arena, root: &RepoPath) !usize {
+    const raw: &byte = arena_alloc(arena, STATUS_DIRECT_BUFFER_BYTES) as &byte;
+    if raw == null {
+        return error.StatusAlloc;
+    }
+
+    var out: StatusDirectOutputBuffer = StatusDirectOutputBuffer{
+        ptr: raw,
+        len: 0 as usize,
+        cap: STATUS_DIRECT_BUFFER_BYTES,
+        file_count: 0 as usize,
+    };
+    const root_path: StatusFsPath = status_fs_path_from_repo_path(root);
+    const relative: StatusFsPath = StatusFsPath{ bytes: [], len: 0 as usize };
+    try status_direct_print_untracked_files_in_dir(arena, &root_path, &relative, &out);
+    status_direct_output_flush(&out);
+    return out.file_count;
+}
+
+fn status_workspace_entry_from_change_stat(change: &LocalChange, st: &Stat) !WorkspaceFileEntry {
+    return WorkspaceFileEntry{
+        path: ByteList{ ptr: change.path.ptr, len: change.path.len },
+        kind: try status_workspace_kind_from_mode(st.st_mode as u32),
+        file_mode: status_canonical_mode(st.st_mode as u32),
+        logical_size: status_logical_size(st),
+        inode: status_inode(st),
+        mtime_ns: status_mtime_ns_from_stat(st),
+    };
+}
+
+fn status_stat_change_path(change: &LocalChange, fs_path: &StatusFsPath, st: &Stat) !bool {
+    _ = sys_lstat(&fs_path.bytes[0] as &const byte, st) catch |err| {
+        if @error_id(err) == ENOENT as u32 {
+            return false;
+        }
+        return error.StatusWorkspaceReadFailed;
+    };
+    return true;
+}
+
+fn status_sys_newfstatat(dir_fd: i32, path: &const byte, st: &Stat, flags: i32) !i32 {
+    return @syscall(SYS_newfstatat, dir_fd as i64, path as i64, st as i64, flags as i64) as! i32;
+}
+
+fn status_path_dir_len(path: &ByteList) usize {
+    var i: usize = path.len;
+    while i > 0 as usize {
+        i = i - 1 as usize;
+        if path.ptr[i] == '/' as byte {
+            return i;
+        }
+    }
+    return 0 as usize;
+}
+
+fn status_path_file_start(path: &ByteList, dir_len: usize) usize {
+    if dir_len == 0 as usize {
+        return 0 as usize;
+    }
+    return dir_len + 1 as usize;
+}
+
+fn status_path_same_dir(path: &ByteList, dir_len: usize, other: &ByteList, other_dir_len: usize) bool {
+    if dir_len != other_dir_len {
+        return false;
+    }
+    var i: usize = 0 as usize;
+    while i < dir_len {
+        if path.ptr[i] != other.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn status_dir_path_from_change(root: &StatusFsPath, path: &ByteList, dir_len: usize) !StatusFsPath {
+    if dir_len == 0 as usize {
+        return root[0];
+    }
+    var dir_path: ByteList = ByteList{ ptr: path.ptr, len: dir_len };
+    return status_direct_path_join(root, &dir_path);
+}
+
+fn status_file_name_from_change(path: &ByteList, file_start: usize, out: &StatusFsPath) !void {
+    if file_start > path.len {
+        return error.StatusPathTooLong;
+    }
+    const file_len: usize = path.len - file_start;
+    if file_len >= REPO_PATH_MAX {
+        return error.StatusPathTooLong;
+    }
+    var i: usize = 0 as usize;
+    while i < file_len {
+        out.bytes[i] = path.ptr[file_start + i];
+        i = i + 1 as usize;
+    }
+    out.bytes[file_len] = 0 as byte;
+    out.len = file_len;
+}
+
+fn status_open_dir_for_change(root_path: &StatusFsPath, path: &ByteList, dir_len: usize) !i32 {
+    const dir_path: StatusFsPath = try status_dir_path_from_change(root_path, path, dir_len);
+    return sys_open(
+        &dir_path.bytes[0] as *const byte,
+        (O_RDONLY | O_DIRECTORY | O_CLOEXEC as i64) as i32,
+        0 as i32,
+    ) catch {
+        return error.StatusWorkspaceReadFailed;
+    };
+}
+
+fn status_stat_change_name_at(change: &LocalChange, dir_fd: i32, file_name: &const byte, st: &Stat) !bool {
+    const flags: i32 = AT_SYMLINK_NOFOLLOW;
+    _ = status_sys_newfstatat(dir_fd, file_name, st, flags) catch |err| {
+        if @error_id(err) == ENOENT as u32 {
+            return false;
+        }
+        return error.StatusWorkspaceReadFailed;
+    };
+    return true;
+}
+
+fn status_tracked_clean_requested_workers() i32 {
+    const detected: i32 = parallel_default_requested_workers(STATUS_TRACKED_CLEAN_PARALLEL_WORKERS_DEFAULT);
+    if detected > STATUS_TRACKED_CLEAN_PARALLEL_MAX_WORKERS as i32 {
+        return STATUS_TRACKED_CLEAN_PARALLEL_MAX_WORKERS as i32;
+    }
+    return detected;
+}
+
+fn status_tracked_clean_task_run(task_ptr: usize) usize {
+    const task: &StatusTrackedCleanTask = task_ptr as &StatusTrackedCleanTask;
+    var i: usize = task.start_index;
+    while i < task.end_index {
+        const change: &LocalChange = &task.changes[i];
+        const fs_path: StatusFsPath = status_fs_path_join(&task.root, &change.path) catch {
+            return STATUS_TRACKED_CLEAN_TASK_PATH_TOO_LONG;
+        };
+        var st: Stat = Stat{};
+        const exists: bool = status_stat_change_path(change, &fs_path, &st) catch {
+            return STATUS_TRACKED_CLEAN_TASK_READ_FAILED;
+        };
+        if !exists {
+            return STATUS_TRACKED_CLEAN_TASK_CHANGED;
+        }
+
+        const worktree_entry: WorkspaceFileEntry = status_workspace_entry_from_change_stat(change, &st) catch {
+            return STATUS_TRACKED_CLEAN_TASK_CHANGED;
+        };
+        if change.last_seen_file_mode != worktree_entry.file_mode ||
+            !status_local_change_metadata_matches(change, &worktree_entry) {
+            return STATUS_TRACKED_CLEAN_TASK_CHANGED;
+        }
+        i = i + 1 as usize;
+    }
+    return STATUS_TRACKED_CLEAN_TASK_OK;
+}
+
+fn status_tracked_clean_status_to_error(status: usize) !bool {
+    if status == STATUS_TRACKED_CLEAN_TASK_OK {
+        return false;
+    }
+    if status == STATUS_TRACKED_CLEAN_TASK_CHANGED {
+        return true;
+    }
+    if status == STATUS_TRACKED_CLEAN_TASK_PATH_TOO_LONG {
+        return error.StatusPathTooLong;
+    }
+    return error.StatusWorkspaceReadFailed;
+}
+
+fn status_has_tracked_changes_from_local_stats_parallel(
+    arena: &Arena,
+    root: &RepoPath,
+    stored_local_changes: &LocalChangeList,
+) !bool {
+    if stored_local_changes.len == 0 as usize {
+        return false;
+    }
+    if stored_local_changes.len < STATUS_TRACKED_CLEAN_PARALLEL_MIN_FILES {
+        const changes: StatusChangeList = try status_collect_tracked_changes_from_local_stats(
+            arena,
+            root,
+            stored_local_changes,
+        );
+        return changes.len > 0 as usize;
+    }
+
+    const requested_workers: i32 = status_tracked_clean_requested_workers();
+    const worker_count: usize = parallel_worker_count(
+        stored_local_changes.len,
+        requested_workers,
+        STATUS_TRACKED_CLEAN_PARALLEL_MAX_WORKERS,
+    );
+    if worker_count <= 1 as usize {
+        const changes: StatusChangeList = try status_collect_tracked_changes_from_local_stats(
+            arena,
+            root,
+            stored_local_changes,
+        );
+        return changes.len > 0 as usize;
+    }
+
+    const tasks: &StatusTrackedCleanTask = arena_alloc(
+        arena,
+        @size_of(StatusTrackedCleanTask) as usize * worker_count,
+    ) as &StatusTrackedCleanTask;
+    if tasks == null {
+        return error.StatusAlloc;
+    }
+
+    var task_index: usize = 0 as usize;
+    while task_index < worker_count {
+        const start_index: usize = (task_index * stored_local_changes.len) / worker_count;
+        const end_index: usize = ((task_index + 1 as usize) * stored_local_changes.len) / worker_count;
+        tasks[task_index] = StatusTrackedCleanTask{
+            root: status_fs_path_from_repo_path(root),
+            changes: stored_local_changes.ptr,
+            start_index: start_index,
+            end_index: end_index,
+        };
+        task_index = task_index + 1 as usize;
+    }
+
+    var pool: ThreadPool = thread_pool_new(worker_count as i32);
+    defer {
+        thread_pool_shutdown(&pool);
+    }
+
+    const futures: &Future<!usize> = arena_alloc(arena, @size_of(Future<!usize>) as usize * worker_count) as &Future<!usize>;
+    if futures == null {
+        return error.StatusAlloc;
+    }
+
+    task_index = 0 as usize;
+    while task_index < worker_count {
+        futures[task_index] = async_compute<usize>(
+            &pool,
+            &status_tracked_clean_task_run as &void,
+            @usize_from_ptr((&tasks[task_index]) as &void),
+        );
+        task_index = task_index + 1 as usize;
+    }
+
+    var has_changed: bool = false;
+    task_index = 0 as usize;
+    while task_index < worker_count {
+        const status: usize = block_on<usize>(futures[task_index]) catch {
+            return error.StatusWorkspaceReadFailed;
+        };
+        const changed: bool = try status_tracked_clean_status_to_error(status);
+        if changed {
+            has_changed = true;
+        }
+        task_index = task_index + 1 as usize;
+    }
+    return has_changed;
+}
+
+fn status_can_expected_inputs_from_local_changes(staged: &StageSnapshot, has_head: bool, stored_local_changes: &LocalChangeList) bool {
+    if !has_head || staged.entries.len != 0 as usize || stored_local_changes.len == 0 as usize {
+        return false;
+    }
+
+    var i: usize = 0 as usize;
+    while i < stored_local_changes.len {
+        const change: &LocalChange = &stored_local_changes.ptr[i];
+        if change.status == ChangeStatus.Virtual ||
+            change.status == ChangeStatus.Added ||
+            change.status == ChangeStatus.Deleted ||
+            change.status == ChangeStatus.Conflict ||
+            change.last_seen_file_mode == 0u32 {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn status_can_new_stage_local_stats_fast(staged: &StageSnapshot, has_head: bool, stored_local_changes: &LocalChangeList) bool {
+    if has_head || staged.entries.len == 0 as usize || staged.entries.len != stored_local_changes.len {
+        return false;
+    }
+
+    var i: usize = 0 as usize;
+    while i < staged.entries.len {
+        const entry: &StageEntry = &staged.entries.ptr[i];
+        const change: &LocalChange = &stored_local_changes.ptr[i];
+        if entry.kind != StageEntryKind.Add || !stage_entry_has_staged_content(entry) {
+            return false;
+        }
+        if manifest_path_compare(&entry.path, &change.path) != 0 {
+            return false;
+        }
+        if change.status == ChangeStatus.Virtual ||
+            change.status == ChangeStatus.Deleted ||
+            change.status == ChangeStatus.Conflict ||
+            change.last_seen_file_mode == 0u32 {
+            return false;
+        }
+        if entry.file_mode != change.last_seen_file_mode ||
+            hash32_compare(&change.working_hash, &entry.staged_object.hash) != 0 {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn status_stage_view_from_new_stage_fast(
+    arena: &Arena,
+    staged: &StageSnapshot,
+    stored_local_changes: &LocalChangeList,
+) !ManifestLeafInputList {
+    if staged.entries.len == 0 {
+        return ManifestLeafInputList{ ptr: null, len: 0 };
+    }
+
+    const raw_inputs: &ManifestLeafInputEntry = arena_alloc(
+        arena,
+        @size_of(ManifestLeafInputEntry) as usize * staged.entries.len,
+    ) as &ManifestLeafInputEntry;
+    if raw_inputs == null {
+        return error.StatusAlloc;
+    }
+
+    var local_change_index: usize = 0;
+    var i: usize = 0;
+    while i < staged.entries.len {
+        const entry: &StageEntry = &staged.entries.ptr[i];
+        if entry.kind != StageEntryKind.Add || !stage_entry_has_staged_content(entry) {
+            return error.StatusFastStageViewUnsupported;
+        }
+
+        const change: &LocalChange = status_local_change_at_or_after(stored_local_changes, &entry.path, &local_change_index);
+        if change == null || hash32_compare(&change.working_hash, &entry.staged_object.hash) != 0 {
+            return error.StatusFastStageViewUnsupported;
+        }
+
+        raw_inputs[i] = ManifestLeafInputEntry{
+            path: ByteList{ ptr: entry.path.ptr, len: entry.path.len },
+            kind: status_stage_entry_kind(entry),
+            mode: entry.file_mode,
+            object_id: ObjectId{ hash: entry.staged_object.hash },
+            logical_size: change.last_seen_logical_size,
+            content_type: ContentType.Unknown,
+            policy_id: entry.policy_id,
+        };
+        i = i + 1 as usize;
+    }
+    return manifest_leaf_input_list_from_slice(raw_inputs[0: staged.entries.len]);
+}
+
+fn status_load_staged_view(
+    arena: &Arena,
+    store: &LooseObjectStore,
+    staged: &StageSnapshot,
+    fallback_base_commit: &CommitId,
+    has_head: bool,
+    stored_local_changes: &LocalChangeList,
+) !ManifestLeafInputList {
+    const zero_commit: CommitId = stage_zero_commit_id();
+    if !has_head && commit_id_compare(&staged.state.base_commit, &zero_commit) == 0 {
+        return status_stage_view_from_new_stage_fast(arena, staged, stored_local_changes) catch |err| {
+            if @error_id(err) != @error_id(error.StatusFastStageViewUnsupported) {
+                return err;
+            }
+            return stage_view_manifest_inputs_from_snapshot(arena, store, staged, fallback_base_commit);
+        };
+    }
+    return stage_view_manifest_inputs_from_snapshot(arena, store, staged, fallback_base_commit);
 }
 
 fn status_append_change(raw: &StatusChange, next_index: &usize, path: &ByteList, kind: StatusChangeKind) void {
@@ -244,6 +1285,15 @@ fn status_load_workspace_files(root: &RepoPath, arena: &Arena) !WorkspaceFileLis
     };
 }
 
+fn status_load_workspace_file_paths(root: &RepoPath, arena: &Arena) !WorkspaceFileList {
+    return workspace_scan_file_paths(arena, repo_path_cstr(root) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.WorkspaceScanPermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        return error.StatusWorkspaceScanFailed;
+    };
+}
+
 fn status_collect_unstaged_changes(
     arena: &Arena,
     root: &RepoPath,
@@ -263,6 +1313,7 @@ fn status_collect_unstaged_changes(
 
     var expected_index: usize = 0;
     var worktree_index: usize = 0;
+    var local_change_index: usize = 0;
     var out_index: usize = 0;
     while expected_index < expected_inputs.len && worktree_index < worktree.len {
         const expected_entry: &ManifestLeafInputEntry = &expected_inputs.ptr[expected_index];
@@ -286,6 +1337,7 @@ fn status_collect_unstaged_changes(
                 root,
                 stored_local_changes,
                 worktree_entry,
+                &local_change_index,
             ) catch |err| {
                 if @error_id(err) == @error_id(error.RepoPermissionDenied) {
                     return error.RepoPermissionDenied;
@@ -312,20 +1364,143 @@ fn status_collect_unstaged_changes(
     return status_change_list_from_slice(raw[0: out_index]);
 }
 
+fn status_collect_unstaged_changes_from_new_stage_local_stats(
+    arena: &Arena,
+    root: &RepoPath,
+    staged_entries: StageEntryList,
+    stored_local_changes: &LocalChangeList,
+    worktree: &WorkspaceFileList,
+) !StatusChangeList {
+    const max_len: usize = staged_entries.len + worktree.len;
+    if max_len == 0 as usize {
+        return status_zero_change_list();
+    }
+
+    const raw: &StatusChange = arena_alloc(arena, @size_of(StatusChange) as usize * max_len) as &StatusChange;
+    if raw == null {
+        return error.StatusAlloc;
+    }
+
+    const root_path: StatusFsPath = status_fs_path_from_repo_path(root);
+    var current_dir_fd: i32 = -1;
+    var current_dir_source: ByteList = ByteList{ ptr: null, len: 0 as usize };
+    var current_dir_len: usize = 0 as usize;
+    defer {
+        if current_dir_fd >= 0 as i32 {
+            _ = sys_close(current_dir_fd) catch {};
+        }
+    }
+
+    var expected_index: usize = 0 as usize;
+    var worktree_index: usize = 0 as usize;
+    var local_change_index: usize = 0 as usize;
+    var out_index: usize = 0 as usize;
+    while expected_index < staged_entries.len && worktree_index < worktree.len {
+        const expected_entry: &StageEntry = &staged_entries.ptr[expected_index];
+        const worktree_entry: &WorkspaceFileEntry = &worktree.ptr[worktree_index];
+        const cmp: i32 = manifest_path_compare(&expected_entry.path, &worktree_entry.path);
+        if cmp < 0 {
+            status_append_change(raw, &out_index, &expected_entry.path, StatusChangeKind.Deleted);
+            expected_index = expected_index + 1 as usize;
+            continue;
+        }
+        if cmp > 0 {
+            status_append_change(raw, &out_index, &worktree_entry.path, StatusChangeKind.NewFile);
+            worktree_index = worktree_index + 1 as usize;
+            continue;
+        }
+
+        const change: &LocalChange = status_local_change_at_or_after(
+            stored_local_changes,
+            &expected_entry.path,
+            &local_change_index,
+        );
+        if change == null {
+            return error.StatusWorkspaceReadFailed;
+        }
+
+        const dir_len: usize = status_path_dir_len(&change.path);
+        if current_dir_fd < 0 as i32 ||
+            !status_path_same_dir(&current_dir_source, current_dir_len, &change.path, dir_len) {
+            if current_dir_fd >= 0 as i32 {
+                _ = sys_close(current_dir_fd) catch {};
+            }
+            current_dir_fd = try status_open_dir_for_change(&root_path, &change.path, dir_len);
+            current_dir_source = ByteList{ ptr: change.path.ptr, len: change.path.len };
+            current_dir_len = dir_len;
+        }
+
+        const file_start: usize = status_path_file_start(&change.path, dir_len);
+        var file_name: StatusFsPath = StatusFsPath{ bytes: [], len: 0 as usize };
+        try status_file_name_from_change(&change.path, file_start, &file_name);
+        var st: Stat = Stat{};
+        const exists: bool = try status_stat_change_name_at(change, current_dir_fd, &file_name.bytes[0] as &const byte, &st);
+        if !exists {
+            status_append_change(raw, &out_index, &expected_entry.path, StatusChangeKind.Deleted);
+            expected_index = expected_index + 1 as usize;
+            worktree_index = worktree_index + 1 as usize;
+            continue;
+        }
+
+        const current_entry: WorkspaceFileEntry = try status_workspace_entry_from_change_stat(change, &st);
+        if expected_entry.file_mode != current_entry.file_mode {
+            status_append_change(raw, &out_index, &expected_entry.path, StatusChangeKind.Modified);
+        } else {
+            const worktree_id: ObjectId = status_worktree_object_id_from_cached_change(
+                root,
+                change,
+                &current_entry,
+            ) catch |err| {
+                if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                    return error.RepoPermissionDenied;
+                }
+                return error.StatusWorkspaceReadFailed;
+            };
+            const staged_id: ObjectId = ObjectId{ hash: expected_entry.staged_object.hash };
+            if object_id_compare(&worktree_id, &staged_id) != 0 {
+                status_append_change(raw, &out_index, &expected_entry.path, StatusChangeKind.Modified);
+            }
+        }
+        expected_index = expected_index + 1 as usize;
+        worktree_index = worktree_index + 1 as usize;
+    }
+
+    while expected_index < staged_entries.len {
+        status_append_change(raw, &out_index, &staged_entries.ptr[expected_index].path, StatusChangeKind.Deleted);
+        expected_index = expected_index + 1 as usize;
+    }
+    while worktree_index < worktree.len {
+        status_append_change(raw, &out_index, &worktree.ptr[worktree_index].path, StatusChangeKind.NewFile);
+        worktree_index = worktree_index + 1 as usize;
+    }
+
+    return status_change_list_from_slice(raw[0: out_index]);
+}
+
 fn status_local_change_metadata_matches(change: &LocalChange, file_entry: &WorkspaceFileEntry) bool {
     return change.last_seen_inode == file_entry.inode &&
         change.last_seen_mtime_ns == file_entry.mtime_ns &&
         change.last_seen_logical_size == file_entry.logical_size;
 }
 
+fn status_local_change_at_or_after(changes: &LocalChangeList, path: &ByteList, index: &usize) &LocalChange {
+    while *index < changes.len && manifest_path_compare(&changes.ptr[*index].path, path) < 0 {
+        *index = *index + 1 as usize;
+    }
+    if *index < changes.len && manifest_path_compare(&changes.ptr[*index].path, path) == 0 {
+        return &changes.ptr[*index];
+    }
+    return null as &LocalChange;
+}
+
 fn status_worktree_object_id(
     root: &RepoPath,
     stored_local_changes: &LocalChangeList,
     worktree_entry: &WorkspaceFileEntry,
+    local_change_index: &usize,
 ) !ObjectId {
-    const local_change_index: isize = workspace_local_view_find_change(stored_local_changes, &worktree_entry.path);
-    if local_change_index >= 0 as isize {
-        const change: &LocalChange = &stored_local_changes.ptr[local_change_index as usize];
+    const change: &LocalChange = status_local_change_at_or_after(stored_local_changes, &worktree_entry.path, local_change_index);
+    if change != null {
         if status_local_change_metadata_matches(change, worktree_entry) &&
             change.status != ChangeStatus.Virtual &&
             change.status != ChangeStatus.Deleted &&
@@ -348,28 +1523,239 @@ fn status_worktree_object_id(
     };
 }
 
-fn status_print_change_line(kind: StatusChangeKind, path: &ByteList) !void {
-    var printable: StatusPrintablePath = StatusPrintablePath{ bytes: [] };
-    const path_cstr: &byte = try status_copy_path_to_cstr(path, &printable);
-    fprintf(stdout, "  %s:   %s\n" as *byte, status_change_label(kind), path_cstr);
+fn status_worktree_object_id_from_cached_change(
+    root: &RepoPath,
+    change: &LocalChange,
+    worktree_entry: &WorkspaceFileEntry,
+) !ObjectId {
+    if status_local_change_metadata_matches(change, worktree_entry) &&
+        change.status != ChangeStatus.Virtual &&
+        change.status != ChangeStatus.Deleted &&
+        change.status != ChangeStatus.Conflict {
+        return ObjectId{ hash: change.working_hash };
+    }
+
+    return add_worktree_object_id(root, worktree_entry) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        if @error_id(err) == @error_id(error.AddPolicyInvalid) {
+            return error.StatusWorkspaceReadFailed;
+        }
+        if @error_id(err) == @error_id(error.AddAlloc) {
+            return error.StatusAlloc;
+        }
+        return error.StatusWorkspaceReadFailed;
+    };
 }
 
-fn status_print_staged_section(staged: StageEntryList) !void {
-    fprintf(stdout, "%s" as *byte, STATUS_STAGED_HEADER_TEXT);
+fn status_collect_unstaged_changes_from_local_changes(
+    arena: &Arena,
+    root: &RepoPath,
+    stored_local_changes: &LocalChangeList,
+    worktree: &WorkspaceFileList,
+) !StatusChangeList {
+    const max_len: usize = stored_local_changes.len + worktree.len;
+    if max_len == 0 as usize {
+        return status_zero_change_list();
+    }
+
+    const raw: &StatusChange = arena_alloc(arena, @size_of(StatusChange) as usize * max_len) as &StatusChange;
+    if raw == null {
+        return error.StatusAlloc;
+    }
+
+    var change_index: usize = 0 as usize;
+    var worktree_index: usize = 0 as usize;
+    var out_index: usize = 0 as usize;
+    while change_index < stored_local_changes.len && worktree_index < worktree.len {
+        const change: &LocalChange = &stored_local_changes.ptr[change_index];
+        const worktree_entry: &WorkspaceFileEntry = &worktree.ptr[worktree_index];
+        const cmp: i32 = manifest_path_compare(&change.path, &worktree_entry.path);
+        if cmp < 0 {
+            status_append_change(raw, &out_index, &change.path, StatusChangeKind.Deleted);
+            change_index = change_index + 1 as usize;
+            continue;
+        }
+        if cmp > 0 {
+            status_append_change(raw, &out_index, &worktree_entry.path, StatusChangeKind.NewFile);
+            worktree_index = worktree_index + 1 as usize;
+            continue;
+        }
+
+        if change.last_seen_file_mode != worktree_entry.file_mode {
+            status_append_change(raw, &out_index, &worktree_entry.path, StatusChangeKind.Modified);
+        } else {
+            const worktree_id: ObjectId = status_worktree_object_id_from_cached_change(
+                root,
+                change,
+                worktree_entry,
+            ) catch |err| {
+                if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                    return error.RepoPermissionDenied;
+                }
+                return error.StatusWorkspaceReadFailed;
+            };
+            if object_id_compare(&worktree_id, &change.base_object) != 0 {
+                status_append_change(raw, &out_index, &worktree_entry.path, StatusChangeKind.Modified);
+            }
+        }
+        change_index = change_index + 1 as usize;
+        worktree_index = worktree_index + 1 as usize;
+    }
+
+    while change_index < stored_local_changes.len {
+        status_append_change(raw, &out_index, &stored_local_changes.ptr[change_index].path, StatusChangeKind.Deleted);
+        change_index = change_index + 1 as usize;
+    }
+    while worktree_index < worktree.len {
+        status_append_change(raw, &out_index, &worktree.ptr[worktree_index].path, StatusChangeKind.NewFile);
+        worktree_index = worktree_index + 1 as usize;
+    }
+
+    return status_change_list_from_slice(raw[0: out_index]);
+}
+
+fn status_collect_tracked_changes_from_local_stats(
+    arena: &Arena,
+    root: &RepoPath,
+    stored_local_changes: &LocalChangeList,
+) !StatusChangeList {
+    if stored_local_changes.len == 0 as usize {
+        return status_zero_change_list();
+    }
+
+    const raw: &StatusChange = arena_alloc(arena, @size_of(StatusChange) as usize * stored_local_changes.len) as &StatusChange;
+    if raw == null {
+        return error.StatusAlloc;
+    }
+
+    const root_path: StatusFsPath = status_fs_path_from_repo_path(root);
+    var out_index: usize = 0 as usize;
+    var current_dir_fd: i32 = -1;
+    var current_dir_source: ByteList = ByteList{ ptr: null, len: 0 as usize };
+    var current_dir_len: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < stored_local_changes.len {
+        const change: &LocalChange = &stored_local_changes.ptr[i];
+        const dir_len: usize = status_path_dir_len(&change.path);
+        if current_dir_fd < 0 as i32 ||
+            !status_path_same_dir(&current_dir_source, current_dir_len, &change.path, dir_len) {
+            if current_dir_fd >= 0 as i32 {
+                _ = sys_close(current_dir_fd) catch {};
+            }
+            current_dir_fd = try status_open_dir_for_change(&root_path, &change.path, dir_len);
+            current_dir_source = ByteList{ ptr: change.path.ptr, len: change.path.len };
+            current_dir_len = dir_len;
+        }
+
+        const file_start: usize = status_path_file_start(&change.path, dir_len);
+        var file_name: StatusFsPath = StatusFsPath{ bytes: [], len: 0 as usize };
+        try status_file_name_from_change(&change.path, file_start, &file_name);
+        var st: Stat = Stat{};
+        const exists: bool = try status_stat_change_name_at(change, current_dir_fd, &file_name.bytes[0] as &const byte, &st);
+        if !exists {
+            status_append_change(raw, &out_index, &change.path, StatusChangeKind.Deleted);
+            i = i + 1 as usize;
+            continue;
+        }
+
+        const worktree_entry: WorkspaceFileEntry = try status_workspace_entry_from_change_stat(change, &st);
+        if change.last_seen_file_mode != worktree_entry.file_mode {
+            status_append_change(raw, &out_index, &change.path, StatusChangeKind.Modified);
+            i = i + 1 as usize;
+            continue;
+        }
+
+        const worktree_id: ObjectId = status_worktree_object_id_from_cached_change(
+            root,
+            change,
+            &worktree_entry,
+        ) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                return error.RepoPermissionDenied;
+            }
+            return error.StatusWorkspaceReadFailed;
+        };
+        if object_id_compare(&worktree_id, &change.base_object) != 0 {
+            status_append_change(raw, &out_index, &change.path, StatusChangeKind.Modified);
+        }
+        i = i + 1 as usize;
+    }
+    if current_dir_fd >= 0 as i32 {
+        _ = sys_close(current_dir_fd) catch {};
+    }
+
+    return status_change_list_from_slice(raw[0: out_index]);
+}
+
+fn status_change_line_len(kind: StatusChangeKind, path: &ByteList) usize {
+    return 2 as usize + status_change_label_len(kind) + 4 as usize + path.len + 1 as usize;
+}
+
+fn status_buffer_append(out: &byte, pos: &usize, bytes: &const byte, len: usize) void {
+    var i: usize = 0 as usize;
+    while i < len {
+        out[*pos + i] = bytes[i];
+        i = i + 1 as usize;
+    }
+    *pos = *pos + len;
+}
+
+fn status_buffer_append_change_line(out: &byte, pos: &usize, kind: StatusChangeKind, path: &ByteList) void {
+    const prefix: [byte: 2] = [' ' as byte, ' ' as byte];
+    const separator: [byte: 4] = [':' as byte, ' ' as byte, ' ' as byte, ' ' as byte];
+    const newline: [byte: 1] = ['\n' as byte];
+    status_buffer_append(out, pos, &prefix[0] as &const byte, 2 as usize);
+    status_buffer_append(out, pos, status_change_label(kind), status_change_label_len(kind));
+    status_buffer_append(out, pos, &separator[0] as &const byte, 4 as usize);
+    status_buffer_append(out, pos, path.ptr as &const byte, path.len);
+    status_buffer_append(out, pos, &newline[0] as &const byte, 1 as usize);
+}
+
+fn status_print_staged_section(arena: &Arena, staged: StageEntryList) !void {
+    var total_len: usize = status_cstr_len(STATUS_STAGED_HEADER_TEXT);
     var i: usize = 0;
     while i < staged.len {
-        try status_print_change_line(status_stage_change_kind(&staged.ptr[i]), &staged.ptr[i].path);
+        total_len = total_len + status_change_line_len(status_stage_change_kind(&staged.ptr[i]), &staged.ptr[i].path);
         i = i + 1 as usize;
     }
+
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.StatusAlloc;
+    }
+    var pos: usize = 0 as usize;
+    status_buffer_append(raw, &pos, STATUS_STAGED_HEADER_TEXT, status_cstr_len(STATUS_STAGED_HEADER_TEXT));
+    i = 0 as usize;
+    while i < staged.len {
+        status_buffer_append_change_line(raw, &pos, status_stage_change_kind(&staged.ptr[i]), &staged.ptr[i].path);
+        i = i + 1 as usize;
+    }
+    _ = write_stdout_bytes(raw as &const byte, total_len);
 }
 
-fn status_print_change_section(header: &const byte, changes: StatusChangeList) !void {
-    fprintf(stdout, "%s" as *byte, header);
+fn status_print_change_section(arena: &Arena, header: &const byte, changes: StatusChangeList) !void {
+    const header_len: usize = status_cstr_len(header);
+    var total_len: usize = header_len;
     var i: usize = 0;
     while i < changes.len {
-        try status_print_change_line(changes.ptr[i].kind, &changes.ptr[i].path);
+        total_len = total_len + status_change_line_len(changes.ptr[i].kind, &changes.ptr[i].path);
         i = i + 1 as usize;
     }
+
+    const raw: &byte = arena_alloc(arena, total_len) as &byte;
+    if raw == null {
+        return error.StatusAlloc;
+    }
+    var pos: usize = 0 as usize;
+    status_buffer_append(raw, &pos, header, header_len);
+    i = 0 as usize;
+    while i < changes.len {
+        status_buffer_append_change_line(raw, &pos, changes.ptr[i].kind, &changes.ptr[i].path);
+        i = i + 1 as usize;
+    }
+    _ = write_stdout_bytes(raw as &const byte, total_len);
 }
 
 export fn run_status() i32 {
@@ -412,6 +1798,9 @@ export fn run_status() i32 {
     var arena: Arena = Arena{ buffer: arena_storage, size: 0, used: 0 };
     arena_init(&arena, arena_storage, STATUS_ARENA_BYTES);
 
+    var profile: StatusProfileState = status_profile_init();
+
+    const stage_read_started_ms: u64 = status_maybe_now_ms(profile.enabled);
     const staged: StageSnapshot = status_load_stage_snapshot(&root, &arena) catch |err| {
         if @error_id(err) == @error_id(error.RepoPermissionDenied) {
             fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
@@ -420,13 +1809,131 @@ export fn run_status() i32 {
         fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
+    status_profile_add_elapsed(&profile.stage_read_ms, stage_read_started_ms);
+    status_profile_trace(&profile, "stage_read", profile.stage_read_ms);
+
+    const local_read_started_ms: u64 = status_maybe_now_ms(profile.enabled);
     const stored_local_changes: LocalChangeList = status_load_local_changes(&root, &arena) catch {
         fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
-    var fallback_base_commit: CommitId = stage_zero_commit_id();
-    if has_head {
-        fallback_base_commit = repo_read_head_commit(&root, &config) catch |err| {
+    status_profile_add_elapsed(&profile.local_read_ms, local_read_started_ms);
+    status_profile_trace(&profile, "local_read", profile.local_read_ms);
+
+    if !has_head && staged.entries.len == 0 as usize && stored_local_changes.len == 0 as usize {
+        fprintf(stdout, STATUS_BRANCH_TEXT as *byte, &config.default_branch[0]);
+        fprintf(stdout, "%s" as *byte, STATUS_NO_COMMITS_TEXT);
+        _ = fflush(stdout);
+
+        const workspace_scan_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        const file_count: usize = status_print_no_head_untracked_direct(&arena, &root) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            if @error_id(err) == @error_id(error.StatusUnsupportedWorkspaceEntry) {
+                fprintf(stderr, "%s" as *byte, STATUS_UNSUPPORTED_WORKSPACE_ENTRY_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        status_profile_add_elapsed(&profile.workspace_scan_ms, workspace_scan_started_ms);
+        status_profile_trace(&profile, "workspace_scan", profile.workspace_scan_ms);
+        status_profile_trace(&profile, "unstaged_collect", profile.unstaged_collect_ms);
+        status_profile_report(&profile, staged.entries.len, stored_local_changes.len, 0 as usize, file_count, file_count);
+        if file_count == 0 as usize {
+            fprintf(stdout, "%s" as *byte, STATUS_NOTHING_TO_COMMIT_TEXT);
+        }
+        return EXIT_OK;
+    }
+
+    var staged_view: ManifestLeafInputList = ManifestLeafInputList{ ptr: null, len: 0 };
+    var expected_inputs: ManifestLeafInputList = ManifestLeafInputList{ ptr: null, len: 0 };
+    var expected_len: usize = 0 as usize;
+    const use_local_expected_fast: bool = status_can_expected_inputs_from_local_changes(&staged, has_head, &stored_local_changes);
+    const use_new_stage_local_stats_fast: bool = status_can_new_stage_local_stats_fast(&staged, has_head, &stored_local_changes);
+    if use_local_expected_fast {
+        const expected_filter_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        expected_len = stored_local_changes.len;
+        status_profile_add_elapsed(&profile.expected_filter_ms, expected_filter_started_ms);
+        status_profile_trace(&profile, "expected_filter", profile.expected_filter_ms);
+    } else if use_new_stage_local_stats_fast {
+        const expected_filter_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        expected_len = staged.entries.len;
+        status_profile_add_elapsed(&profile.expected_filter_ms, expected_filter_started_ms);
+        status_profile_trace(&profile, "expected_filter", profile.expected_filter_ms);
+    } else {
+        var fallback_base_commit: CommitId = stage_zero_commit_id();
+        if has_head {
+            fallback_base_commit = repo_read_head_commit(&root, &config) catch |err| {
+                if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                    fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                    return EXIT_RUNTIME_ERROR;
+                }
+                fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            };
+        }
+        const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch |err| {
+            if @error_id(err) == @error_id(error.StorePermissionDenied) {
+                fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+
+        const staged_view_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        staged_view = status_load_staged_view(
+            &arena,
+            &store,
+            &staged,
+            &fallback_base_commit,
+            has_head,
+            &stored_local_changes,
+        ) catch |err| {
+            if @error_id(err) == @error_id(error.StageViewStoreFailed) {
+                fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        status_profile_add_elapsed(&profile.staged_view_ms, staged_view_started_ms);
+        status_profile_trace(&profile, "staged_view", profile.staged_view_ms);
+
+        const expected_filter_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        expected_inputs = workspace_local_view_filter_expected_inputs(
+            &arena,
+            &staged_view,
+            &stored_local_changes,
+        ) catch {
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+        status_profile_add_elapsed(&profile.expected_filter_ms, expected_filter_started_ms);
+        status_profile_trace(&profile, "expected_filter", profile.expected_filter_ms);
+        expected_len = expected_inputs.len;
+    }
+
+    var unstaged: StatusChangeList = status_zero_change_list();
+    var worktree_len: usize = 0 as usize;
+    var skip_full_workspace_scan: bool = false;
+    const use_untracked_path_scan_fast: bool = !has_head &&
+        staged.entries.len == 0 as usize &&
+        stored_local_changes.len == 0 as usize;
+    if use_local_expected_fast {
+        const workspace_scan_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        const has_tracked_changes: bool = status_has_tracked_changes_from_local_stats_parallel(
+            &arena,
+            &root,
+            &stored_local_changes,
+        ) catch |err| {
             if @error_id(err) == @error_id(error.RepoPermissionDenied) {
                 fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
                 return EXIT_RUNTIME_ERROR;
@@ -434,64 +1941,112 @@ export fn run_status() i32 {
             fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
         };
-    }
-    const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
-        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
-    const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch |err| {
-        if @error_id(err) == @error_id(error.StorePermissionDenied) {
-            fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
-            return EXIT_RUNTIME_ERROR;
+        status_profile_add_elapsed(&profile.workspace_scan_ms, workspace_scan_started_ms);
+        if !has_tracked_changes {
+            unstaged = status_zero_change_list();
+            worktree_len = stored_local_changes.len;
+            skip_full_workspace_scan = true;
+            status_profile_trace(&profile, "workspace_scan", profile.workspace_scan_ms);
+            status_profile_trace(&profile, "unstaged_collect", profile.unstaged_collect_ms);
         }
-        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
-    const staged_view: ManifestLeafInputList = stage_view_manifest_inputs_from_snapshot(
-        &arena,
-        &store,
-        &staged,
-        &fallback_base_commit,
-    ) catch |err| {
-        if @error_id(err) == @error_id(error.StageViewStoreFailed) {
+    }
+
+    if !skip_full_workspace_scan && use_new_stage_local_stats_fast {
+        const workspace_scan_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        const worktree: WorkspaceFileList = status_load_workspace_file_paths(&root, &arena) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
             fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
-        }
-        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
-    const expected_inputs: ManifestLeafInputList = workspace_local_view_filter_expected_inputs(
-        &arena,
-        &staged_view,
-        &stored_local_changes,
-    ) catch {
-        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
+        };
+        status_profile_add_elapsed(&profile.workspace_scan_ms, workspace_scan_started_ms);
+        status_profile_trace(&profile, "workspace_scan", profile.workspace_scan_ms);
+        worktree_len = worktree.len;
 
-    const worktree: WorkspaceFileList = status_load_workspace_files(&root, &arena) catch |err| {
-        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
-            fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+        const unstaged_collect_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        unstaged = status_collect_unstaged_changes_from_new_stage_local_stats(
+            &arena,
+            &root,
+            staged.entries,
+            &stored_local_changes,
+            &worktree,
+        ) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
-        }
-        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
+        };
+        status_profile_add_elapsed(&profile.unstaged_collect_ms, unstaged_collect_started_ms);
+        status_profile_trace(&profile, "unstaged_collect", profile.unstaged_collect_ms);
+        skip_full_workspace_scan = true;
+    }
 
-    const unstaged: StatusChangeList = status_collect_unstaged_changes(
-        &arena,
-        &root,
-        &expected_inputs,
-        &stored_local_changes,
-        &worktree,
-    ) catch |err| {
-        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
-            fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
-            return EXIT_RUNTIME_ERROR;
+    if !skip_full_workspace_scan {
+        const workspace_scan_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        var worktree: WorkspaceFileList = WorkspaceFileList{ ptr: null, len: 0 as usize };
+        if use_untracked_path_scan_fast {
+            worktree = status_load_workspace_file_paths(&root, &arena) catch |err| {
+                if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                    fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                    return EXIT_RUNTIME_ERROR;
+                }
+                fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            };
+        } else {
+            worktree = status_load_workspace_files(&root, &arena) catch |err| {
+                if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                    fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                    return EXIT_RUNTIME_ERROR;
+                }
+                fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            };
         }
-        fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
+        status_profile_add_elapsed(&profile.workspace_scan_ms, workspace_scan_started_ms);
+        status_profile_trace(&profile, "workspace_scan", profile.workspace_scan_ms);
+        worktree_len = worktree.len;
+
+        const unstaged_collect_started_ms: u64 = status_maybe_now_ms(profile.enabled);
+        if use_local_expected_fast {
+            unstaged = status_collect_unstaged_changes_from_local_changes(
+                &arena,
+                &root,
+                &stored_local_changes,
+                &worktree,
+            ) catch |err| {
+                if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                    fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                    return EXIT_RUNTIME_ERROR;
+                }
+                fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            };
+        } else {
+            unstaged = status_collect_unstaged_changes(
+                &arena,
+                &root,
+                &expected_inputs,
+                &stored_local_changes,
+                &worktree,
+            ) catch |err| {
+                if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                    fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                    return EXIT_RUNTIME_ERROR;
+                }
+                fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            };
+        }
+        status_profile_add_elapsed(&profile.unstaged_collect_ms, unstaged_collect_started_ms);
+        status_profile_trace(&profile, "unstaged_collect", profile.unstaged_collect_ms);
+    }
+
+    status_profile_report(&profile, staged.entries.len, stored_local_changes.len, expected_len, worktree_len, unstaged.len);
 
     fprintf(stdout, STATUS_BRANCH_TEXT as *byte, &config.default_branch[0]);
     if !has_head {
@@ -506,7 +2061,7 @@ export fn run_status() i32 {
     fprintf(stdout, "\n" as *byte);
     var printed_section: bool = false;
     if staged.entries.len > 0 {
-        status_print_staged_section(staged.entries) catch {
+        status_print_staged_section(&arena, staged.entries) catch {
             fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
         };
@@ -516,7 +2071,7 @@ export fn run_status() i32 {
         if printed_section {
             fprintf(stdout, "\n" as *byte);
         }
-        status_print_change_section(STATUS_UNSTAGED_HEADER_TEXT, unstaged) catch {
+        status_print_change_section(&arena, STATUS_UNSTAGED_HEADER_TEXT, unstaged) catch {
             fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
             return EXIT_RUNTIME_ERROR;
         };

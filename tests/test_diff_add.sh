@@ -48,3 +48,33 @@ grep -F "+++ b/notes.txt" "$stdout_file" >/dev/null
 grep -F "+hello" "$stdout_file" >/dev/null
 grep -F "+world" "$stdout_file" >/dev/null
 grep -F "1 file changed, 2 insertion(+), 0 deletion(-)" "$stdout_file" >/dev/null
+
+(
+    cd "$REPO_DIR"
+    printf 'changed\n' >base.txt
+)
+
+set +e
+(
+    cd "$REPO_DIR"
+    "$TMP_DIR/hgx" diff
+) >"$stdout_file" 2>"$stderr_file"
+status=$?
+set -e
+
+if [ "$status" -ne 0 ]; then
+    echo "unexpected exit code for mixed diff add: got $status want 0" >&2
+    cat "$stderr_file" >&2
+    exit 1
+fi
+
+if [ -s "$stderr_file" ]; then
+    echo "unexpected stderr for mixed diff add" >&2
+    cat "$stderr_file" >&2
+    exit 1
+fi
+
+grep -F "diff --hgx a/base.txt b/base.txt" "$stdout_file" >/dev/null
+grep -F "diff --hgx /dev/null b/notes.txt" "$stdout_file" >/dev/null
+grep -F "+changed" "$stdout_file" >/dev/null
+grep -F "+hello" "$stdout_file" >/dev/null

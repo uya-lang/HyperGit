@@ -1,17 +1,28 @@
+use std.async.Future;
+use std.async.block_on;
 use std.mem.arena.Arena;
 use std.mem.arena.arena_alloc;
+use std.mem.arena.arena_init;
 use std.string.strlen;
+use std.thread.ThreadPool;
+use std.thread.async_compute;
+use std.thread.thread_pool_new;
+use std.thread.thread_pool_shutdown;
 
 use libc.DIR;
 use libc.Dirent;
 use libc.Stat;
 use libc.closedir;
 use libc.errno;
+use libc.free;
+use libc.malloc;
 use libc.opendir;
 use libc.readdir;
 use libc.EACCES;
 use libc.ENOENT;
 use libc.EPERM;
+use core.parallel.parallel_default_requested_workers;
+use core.parallel.parallel_worker_count;
 use manifest.query.ManifestPathspecList;
 use manifest.path.manifest_path_compare;
 use manifest.path.manifest_path_normalize;
@@ -27,7 +38,20 @@ const WORKSPACE_SCAN_STAT_EXEC_BITS: u32 = 73u32;
 const WORKSPACE_SCAN_MODE_FILE: u32 = 0o100644u32;
 const WORKSPACE_SCAN_MODE_EXECUTABLE: u32 = 0o100755u32;
 const WORKSPACE_SCAN_MODE_SYMLINK: u32 = 0o120000u32;
+const WORKSPACE_SCAN_DT_UNKNOWN: i8 = 0i8;
+const WORKSPACE_SCAN_DT_DIR: i8 = 4i8;
+const WORKSPACE_SCAN_DT_REG: i8 = 8i8;
+const WORKSPACE_SCAN_DT_LNK: i8 = 10i8;
 const WORKSPACE_SCAN_ENTRY_CHUNK_LEN: usize = 256 as usize;
+const WORKSPACE_SCAN_PARALLEL_WORKERS_DEFAULT: i32 = 4;
+const WORKSPACE_SCAN_PARALLEL_MAX_WORKERS: usize = 16 as usize;
+const WORKSPACE_SCAN_PARALLEL_MIN_SHARDS: usize = 4 as usize;
+const WORKSPACE_SCAN_PATH_PARALLEL_MIN_SHARDS: usize = 512 as usize;
+const WORKSPACE_SCAN_PARALLEL_SHARD_ARENA_BYTES: usize = 8388608 as usize;
+const WORKSPACE_SCAN_PARALLEL_TASK_ARENA_BYTES: usize = 33554432 as usize;
+const WORKSPACE_SCAN_PARALLEL_STATUS_OK: usize = 0 as usize;
+const WORKSPACE_SCAN_PARALLEL_STATUS_ALLOC: usize = 1 as usize;
+const WORKSPACE_SCAN_PARALLEL_STATUS_SCAN: usize = 2 as usize;
 
 error WorkspaceScanAlloc;
 error WorkspaceScanRootInvalid;
@@ -75,6 +99,42 @@ struct WorkspaceScanCollector {
     total_count: usize = 0,
 }
 
+struct WorkspaceScanDirItem {
+    name: ByteList,
+    mode: u32,
+    mode_type: u32,
+    logical_size: u64,
+    inode: u64,
+    mtime_ns: i64
+}
+
+struct WorkspaceScanDirItemBuffer {
+    ptr: &WorkspaceScanDirItem,
+    len: usize,
+    cap: usize
+}
+
+struct WorkspaceScanShard {
+    relative: WorkspaceScanPath,
+    is_dir: bool,
+    item: WorkspaceScanDirItem
+}
+
+struct WorkspaceScanShardList {
+    ptr: &WorkspaceScanShard,
+    len: usize
+}
+
+struct WorkspaceScanParallelTask {
+    root: WorkspaceScanPath,
+    shards: &WorkspaceScanShard,
+    start_index: usize,
+    end_index: usize,
+    scratch: &byte,
+    result: WorkspaceFileList,
+    path_only: bool
+}
+
 export fn workspace_file_list_from_slice(slice: &[WorkspaceFileEntry]) WorkspaceFileList {
     return WorkspaceFileList{ ptr: slice.ptr, len: slice.len };
 }
@@ -117,6 +177,15 @@ fn workspace_scan_path_from_byte_list(text: &ByteList) !WorkspaceScanPath {
     out.bytes[text.len] = 0 as byte;
     out.len = text.len;
     return out;
+}
+
+fn workspace_scan_path_copy_into(out: &WorkspaceScanPath, source: &WorkspaceScanPath) void {
+    var i: usize = 0 as usize;
+    while i <= source.len {
+        out.bytes[i] = source.bytes[i];
+        i = i + 1 as usize;
+    }
+    out.len = source.len;
 }
 
 fn workspace_scan_path_join(base: &WorkspaceScanPath, suffix: &[byte]) !WorkspaceScanPath {
@@ -276,6 +345,28 @@ fn workspace_scan_dirent_is_repo_metadata(entry: &Dirent) bool {
         workspace_scan_dirent_equals(entry, ".repo");
 }
 
+fn workspace_scan_dirent_should_skip(entry: &Dirent) bool {
+    return workspace_scan_dirent_is_dot(entry) || workspace_scan_dirent_is_repo_metadata(entry);
+}
+
+fn workspace_scan_name_copy(arena: &Arena, entry: &Dirent, len: usize) !ByteList {
+    var want: usize = len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const out: &byte = arena_alloc(arena, want) as &byte;
+    if out == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var i: usize = 0 as usize;
+    while i < len {
+        out[i] = entry.d_name[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: out, len: len };
+}
+
 fn workspace_scan_kind_from_mode(mode: u32) !WorkspaceFileKind {
     const kind: u32 = workspace_scan_mode_type(mode);
     if kind == WORKSPACE_SCAN_STAT_S_IFREG {
@@ -328,6 +419,303 @@ fn workspace_scan_entry_from_stat(arena: &Arena, relative: &WorkspaceScanPath, s
     };
 }
 
+fn workspace_scan_path_byte_list_copy(arena: &Arena, relative: &WorkspaceScanPath) !ByteList {
+    var want: usize = relative.len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw: &byte = arena_alloc(arena, want) as &byte;
+    if raw == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var i: usize = 0 as usize;
+    while i < relative.len {
+        raw[i] = relative.bytes[i];
+        i = i + 1 as usize;
+    }
+    return ByteList{ ptr: raw, len: relative.len };
+}
+
+fn workspace_scan_entry_from_dir_item(arena: &Arena, relative: &WorkspaceScanPath, item: &WorkspaceScanDirItem) !WorkspaceFileEntry {
+    const normalized_path: ByteList = try manifest_path_normalize(arena, relative.bytes[0: relative.len]);
+    return WorkspaceFileEntry{
+        path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
+        kind: try workspace_scan_kind_from_mode(item.mode),
+        file_mode: workspace_scan_canonical_mode(item.mode),
+        logical_size: item.logical_size,
+        inode: item.inode,
+        mtime_ns: item.mtime_ns,
+    };
+}
+
+fn workspace_scan_entry_path_only(arena: &Arena, relative: &WorkspaceScanPath, item: &WorkspaceScanDirItem) !WorkspaceFileEntry {
+    const path: ByteList = try workspace_scan_path_byte_list_copy(arena, relative);
+    return WorkspaceFileEntry{
+        path: ByteList{ ptr: path.ptr, len: path.len },
+        kind: try workspace_scan_kind_from_mode(item.mode),
+        file_mode: workspace_scan_canonical_mode(item.mode),
+        logical_size: 0u64,
+        inode: 0u64,
+        mtime_ns: 0i64,
+    };
+}
+
+fn workspace_scan_dir_item_buffer_init() WorkspaceScanDirItemBuffer {
+    return WorkspaceScanDirItemBuffer{ ptr: null, len: 0 as usize, cap: 0 as usize };
+}
+
+fn workspace_scan_dir_item_buffer_reserve(arena: &Arena, buffer: &WorkspaceScanDirItemBuffer, additional: usize) !void {
+    if additional == 0 as usize {
+        return;
+    }
+    const needed: usize = buffer.len + additional;
+    if needed <= buffer.cap {
+        return;
+    }
+
+    var next_cap: usize = 32 as usize;
+    if buffer.cap > 0 as usize {
+        next_cap = buffer.cap * 2 as usize;
+    }
+    while next_cap < needed {
+        next_cap = next_cap * 2 as usize;
+    }
+
+    const raw: &WorkspaceScanDirItem = arena_alloc(
+        arena,
+        @size_of(WorkspaceScanDirItem) as usize * next_cap,
+    ) as &WorkspaceScanDirItem;
+    if raw == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var i: usize = 0 as usize;
+    while i < buffer.len {
+        raw[i] = buffer.ptr[i];
+        i = i + 1 as usize;
+    }
+    buffer.ptr = raw;
+    buffer.cap = next_cap;
+}
+
+fn workspace_scan_dir_item_buffer_append(arena: &Arena, buffer: &WorkspaceScanDirItemBuffer, item: &WorkspaceScanDirItem) !void {
+    try workspace_scan_dir_item_buffer_reserve(arena, buffer, 1 as usize);
+    buffer.ptr[buffer.len] = item[0];
+    buffer.len = buffer.len + 1 as usize;
+}
+
+fn workspace_scan_count_dir_items(current_path: &WorkspaceScanPath) !usize {
+    const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
+    if dir == null {
+        if workspace_scan_errno_permission() {
+            return error.WorkspaceScanPermissionDenied;
+        }
+        return error.WorkspaceScanOpenFailed;
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    var total: usize = 0 as usize;
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            return total;
+        }
+        if workspace_scan_dirent_should_skip(entry) {
+            continue;
+        }
+        total = total + 1 as usize;
+    }
+    return total;
+}
+
+fn workspace_scan_load_dir_items(arena: &Arena, current_path: &WorkspaceScanPath, items: &WorkspaceScanDirItem, expected_count: usize) !usize {
+    const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
+    if dir == null {
+        if workspace_scan_errno_permission() {
+            return error.WorkspaceScanPermissionDenied;
+        }
+        return error.WorkspaceScanOpenFailed;
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    var out_len: usize = 0 as usize;
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            return out_len;
+        }
+        if workspace_scan_dirent_should_skip(entry) {
+            continue;
+        }
+        if out_len >= expected_count {
+            return error.WorkspaceScanCountMismatch;
+        }
+
+        const name_len: usize = workspace_scan_dirent_name_len(entry);
+        const name: ByteList = try workspace_scan_name_copy(arena, entry, name_len);
+        const child_path: WorkspaceScanPath = try workspace_scan_path_join(current_path, name.ptr[0: name.len]);
+
+        var st: Stat = Stat{};
+        _ = sys_lstat(&child_path.bytes[0] as &const byte, &st) catch {
+            return error.WorkspaceScanStatFailed;
+        };
+
+        const mode: u32 = st.st_mode as u32;
+        items[out_len] = WorkspaceScanDirItem{
+            name: ByteList{ ptr: name.ptr, len: name.len },
+            mode: mode,
+            mode_type: workspace_scan_mode_type(mode),
+            logical_size: workspace_scan_logical_size(&st),
+            inode: workspace_scan_inode(&st),
+            mtime_ns: workspace_scan_mtime_ns(&st),
+        };
+        out_len = out_len + 1 as usize;
+    }
+    return out_len;
+}
+
+fn workspace_scan_read_dir_items(arena: &Arena, current_path: &WorkspaceScanPath) !WorkspaceScanDirItemBuffer {
+    const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
+    if dir == null {
+        if workspace_scan_errno_permission() {
+            return error.WorkspaceScanPermissionDenied;
+        }
+        return error.WorkspaceScanOpenFailed;
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    var buffer: WorkspaceScanDirItemBuffer = workspace_scan_dir_item_buffer_init();
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            return buffer;
+        }
+        if workspace_scan_dirent_should_skip(entry) {
+            continue;
+        }
+
+        const name_len: usize = workspace_scan_dirent_name_len(entry);
+        const name: ByteList = try workspace_scan_name_copy(arena, entry, name_len);
+        const child_path: WorkspaceScanPath = try workspace_scan_path_join(current_path, name.ptr[0: name.len]);
+
+        var st: Stat = Stat{};
+        _ = sys_lstat(&child_path.bytes[0] as &const byte, &st) catch {
+            return error.WorkspaceScanStatFailed;
+        };
+
+        const mode: u32 = st.st_mode as u32;
+        const item: WorkspaceScanDirItem = WorkspaceScanDirItem{
+            name: ByteList{ ptr: name.ptr, len: name.len },
+            mode: mode,
+            mode_type: workspace_scan_mode_type(mode),
+            logical_size: workspace_scan_logical_size(&st),
+            inode: workspace_scan_inode(&st),
+            mtime_ns: workspace_scan_mtime_ns(&st),
+        };
+        try workspace_scan_dir_item_buffer_append(arena, &buffer, &item);
+    }
+    return buffer;
+}
+
+fn workspace_scan_dir_item_from_dirent_path_only(
+    arena: &Arena,
+    current_path: &WorkspaceScanPath,
+    entry: &Dirent,
+    name_len: usize,
+) !WorkspaceScanDirItem {
+    const name: ByteList = try workspace_scan_name_copy(arena, entry, name_len);
+    if entry.d_type == WORKSPACE_SCAN_DT_REG {
+        return WorkspaceScanDirItem{
+            name: ByteList{ ptr: name.ptr, len: name.len },
+            mode: WORKSPACE_SCAN_MODE_FILE,
+            mode_type: WORKSPACE_SCAN_STAT_S_IFREG,
+            logical_size: 0u64,
+            inode: 0u64,
+            mtime_ns: 0i64,
+        };
+    }
+    if entry.d_type == WORKSPACE_SCAN_DT_DIR {
+        return WorkspaceScanDirItem{
+            name: ByteList{ ptr: name.ptr, len: name.len },
+            mode: WORKSPACE_SCAN_STAT_S_IFDIR,
+            mode_type: WORKSPACE_SCAN_STAT_S_IFDIR,
+            logical_size: 0u64,
+            inode: 0u64,
+            mtime_ns: 0i64,
+        };
+    }
+    if entry.d_type == WORKSPACE_SCAN_DT_LNK {
+        return WorkspaceScanDirItem{
+            name: ByteList{ ptr: name.ptr, len: name.len },
+            mode: WORKSPACE_SCAN_MODE_SYMLINK,
+            mode_type: WORKSPACE_SCAN_STAT_S_IFLNK,
+            logical_size: 0u64,
+            inode: 0u64,
+            mtime_ns: 0i64,
+        };
+    }
+    if entry.d_type != WORKSPACE_SCAN_DT_UNKNOWN {
+        return error.WorkspaceScanUnsupportedFileType;
+    }
+
+    const child_path: WorkspaceScanPath = try workspace_scan_path_join(current_path, name.ptr[0: name.len]);
+    var st: Stat = Stat{};
+    _ = sys_lstat(&child_path.bytes[0] as &const byte, &st) catch {
+        return error.WorkspaceScanStatFailed;
+    };
+
+    const mode: u32 = st.st_mode as u32;
+    return WorkspaceScanDirItem{
+        name: ByteList{ ptr: name.ptr, len: name.len },
+        mode: mode,
+        mode_type: workspace_scan_mode_type(mode),
+        logical_size: 0u64,
+        inode: 0u64,
+        mtime_ns: 0i64,
+    };
+}
+
+fn workspace_scan_read_dir_path_items(arena: &Arena, current_path: &WorkspaceScanPath) !WorkspaceScanDirItemBuffer {
+    const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
+    if dir == null {
+        if workspace_scan_errno_permission() {
+            return error.WorkspaceScanPermissionDenied;
+        }
+        return error.WorkspaceScanOpenFailed;
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    var buffer: WorkspaceScanDirItemBuffer = workspace_scan_dir_item_buffer_init();
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            return buffer;
+        }
+        if workspace_scan_dirent_should_skip(entry) {
+            continue;
+        }
+
+        const name_len: usize = workspace_scan_dirent_name_len(entry);
+        const item: WorkspaceScanDirItem = try workspace_scan_dir_item_from_dirent_path_only(
+            arena,
+            current_path,
+            entry,
+            name_len,
+        );
+        try workspace_scan_dir_item_buffer_append(arena, &buffer, &item);
+    }
+    return buffer;
+}
+
 fn workspace_scan_count_files(root: &WorkspaceScanPath, relative: &WorkspaceScanPath) !usize {
     const current_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
     const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
@@ -375,6 +763,87 @@ fn workspace_scan_count_files(root: &WorkspaceScanPath, relative: &WorkspaceScan
     return total;
 }
 
+fn workspace_scan_byte_list_compare(left: &ByteList, right: &ByteList) i32 {
+    var i: usize = 0 as usize;
+    while i < left.len && i < right.len {
+        const left_byte: byte = left.ptr[i];
+        const right_byte: byte = right.ptr[i];
+        if left_byte < right_byte {
+            return -1;
+        }
+        if left_byte > right_byte {
+            return 1;
+        }
+        i = i + 1 as usize;
+    }
+    if left.len < right.len {
+        return -1;
+    }
+    if left.len > right.len {
+        return 1;
+    }
+    return 0;
+}
+
+fn workspace_scan_dir_item_compare(left: &WorkspaceScanDirItem, right: &WorkspaceScanDirItem) i32 {
+    return workspace_scan_byte_list_compare(&left.name, &right.name);
+}
+
+fn workspace_scan_sort_dir_items(arena: &Arena, items: &WorkspaceScanDirItem, len: usize) !void {
+    if len <= 1 as usize {
+        return;
+    }
+
+    const scratch: &WorkspaceScanDirItem = arena_alloc(
+        arena,
+        @size_of(WorkspaceScanDirItem) as usize * len,
+    ) as &WorkspaceScanDirItem;
+    if scratch == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var width: usize = 1 as usize;
+    while width < len {
+        var start: usize = 0 as usize;
+        while start < len {
+            const mid: usize = min_usize(start + width, len);
+            const end: usize = min_usize(mid + width, len);
+
+            var left: usize = start;
+            var right: usize = mid;
+            var out: usize = start;
+            while left < mid && right < end {
+                if workspace_scan_dir_item_compare(&items[left], &items[right]) <= 0 {
+                    scratch[out] = items[left];
+                    left = left + 1 as usize;
+                } else {
+                    scratch[out] = items[right];
+                    right = right + 1 as usize;
+                }
+                out = out + 1 as usize;
+            }
+            while left < mid {
+                scratch[out] = items[left];
+                left = left + 1 as usize;
+                out = out + 1 as usize;
+            }
+            while right < end {
+                scratch[out] = items[right];
+                right = right + 1 as usize;
+                out = out + 1 as usize;
+            }
+
+            var i: usize = start;
+            while i < end {
+                items[i] = scratch[i];
+                i = i + 1 as usize;
+            }
+            start = end;
+        }
+        width = width * 2 as usize;
+    }
+}
+
 fn workspace_scan_collect_files(
     arena: &Arena,
     root: &WorkspaceScanPath,
@@ -382,48 +851,386 @@ fn workspace_scan_collect_files(
     collector: &WorkspaceScanCollector,
 ) !void {
     const current_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
-    const dir: &DIR = opendir(&current_path.bytes[0] as &const byte);
-    if dir == null {
-        if workspace_scan_errno_permission() {
-            return error.WorkspaceScanPermissionDenied;
-        }
-        return error.WorkspaceScanOpenFailed;
-    }
-    defer {
-        _ = closedir(dir);
+    const items: WorkspaceScanDirItemBuffer = try workspace_scan_read_dir_items(arena, &current_path);
+    if items.len == 0 as usize {
+        return;
     }
 
-    while true {
-        const entry: &Dirent = readdir(dir);
-        if entry == null {
-            return;
-        }
-        if workspace_scan_dirent_is_dot(entry) {
-            continue;
-        }
-        if workspace_scan_dirent_is_repo_metadata(entry) {
-            continue;
-        }
+    try workspace_scan_sort_dir_items(arena, items.ptr, items.len);
 
-        const name_len: usize = workspace_scan_dirent_name_len(entry);
-        const child_relative: WorkspaceScanPath = try workspace_scan_path_join(relative, entry.d_name[0: name_len]);
-        const child_path: WorkspaceScanPath = try workspace_scan_path_join(root, child_relative.bytes[0: child_relative.len]);
-
-        var st: Stat = Stat{};
-        _ = sys_lstat(&child_path.bytes[0] as &const byte, &st) catch {
-            return error.WorkspaceScanStatFailed;
-        };
-
-        const mode_type: u32 = workspace_scan_mode_type(st.st_mode as u32);
-        if mode_type == WORKSPACE_SCAN_STAT_S_IFDIR {
+    var i: usize = 0 as usize;
+    while i < items.len {
+        const child_relative: WorkspaceScanPath = try workspace_scan_path_join(
+            relative,
+            items.ptr[i].name.ptr[0: items.ptr[i].name.len],
+        );
+        if items.ptr[i].mode_type == WORKSPACE_SCAN_STAT_S_IFDIR {
             try workspace_scan_collect_files(arena, root, &child_relative, collector);
+            i = i + 1 as usize;
             continue;
         }
 
-        const file_entry: WorkspaceFileEntry = try workspace_scan_entry_from_stat(arena, &child_relative, &st);
+        const file_entry: WorkspaceFileEntry = try workspace_scan_entry_from_dir_item(arena, &child_relative, &items.ptr[i]);
         try workspace_scan_collector_append(arena, collector, &file_entry);
+        i = i + 1 as usize;
     }
     return;
+}
+
+fn workspace_scan_collect_file_paths(
+    arena: &Arena,
+    root: &WorkspaceScanPath,
+    relative: &WorkspaceScanPath,
+    collector: &WorkspaceScanCollector,
+) !void {
+    const current_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
+    const items: WorkspaceScanDirItemBuffer = try workspace_scan_read_dir_path_items(arena, &current_path);
+    if items.len == 0 as usize {
+        return;
+    }
+
+    try workspace_scan_sort_dir_items(arena, items.ptr, items.len);
+
+    var i: usize = 0 as usize;
+    while i < items.len {
+        const child_relative: WorkspaceScanPath = try workspace_scan_path_join(
+            relative,
+            items.ptr[i].name.ptr[0: items.ptr[i].name.len],
+        );
+        if items.ptr[i].mode_type == WORKSPACE_SCAN_STAT_S_IFDIR {
+            try workspace_scan_collect_file_paths(arena, root, &child_relative, collector);
+            i = i + 1 as usize;
+            continue;
+        }
+
+        const file_entry: WorkspaceFileEntry = try workspace_scan_entry_path_only(arena, &child_relative, &items.ptr[i]);
+        try workspace_scan_collector_append(arena, collector, &file_entry);
+        i = i + 1 as usize;
+    }
+    return;
+}
+
+fn workspace_scan_zero_shard_list() WorkspaceScanShardList {
+    return WorkspaceScanShardList{ ptr: null, len: 0 as usize };
+}
+
+fn workspace_scan_parallel_requested_workers() i32 {
+    const detected: i32 = parallel_default_requested_workers(WORKSPACE_SCAN_PARALLEL_WORKERS_DEFAULT);
+    if detected > WORKSPACE_SCAN_PARALLEL_MAX_WORKERS as i32 {
+        return WORKSPACE_SCAN_PARALLEL_MAX_WORKERS as i32;
+    }
+    return detected;
+}
+
+fn workspace_scan_shard_list_from_items(
+    arena: &Arena,
+    relative: &WorkspaceScanPath,
+    items: &WorkspaceScanDirItemBuffer,
+) !WorkspaceScanShardList {
+    if items.len == 0 as usize {
+        return workspace_scan_zero_shard_list();
+    }
+
+    const raw: &WorkspaceScanShard = arena_alloc(arena, @size_of(WorkspaceScanShard) as usize * items.len) as &WorkspaceScanShard;
+    if raw == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var i: usize = 0 as usize;
+    while i < items.len {
+        const child_relative: WorkspaceScanPath = try workspace_scan_path_join(
+            relative,
+            items.ptr[i].name.ptr[0: items.ptr[i].name.len],
+        );
+        raw[i].relative = workspace_scan_path_empty();
+        workspace_scan_path_copy_into(&raw[i].relative, &child_relative);
+        raw[i].is_dir = items.ptr[i].mode_type == WORKSPACE_SCAN_STAT_S_IFDIR;
+        raw[i].item = items.ptr[i];
+        i = i + 1 as usize;
+    }
+    return WorkspaceScanShardList{ ptr: raw, len: items.len };
+}
+
+fn workspace_scan_collect_parallel_shards(
+    arena: &Arena,
+    root: &WorkspaceScanPath,
+    relative: &WorkspaceScanPath,
+    depth: usize,
+) !WorkspaceScanShardList {
+    const current_path: WorkspaceScanPath = try workspace_scan_path_join(root, relative.bytes[0: relative.len]);
+    const items: WorkspaceScanDirItemBuffer = try workspace_scan_read_dir_items(arena, &current_path);
+    if items.len == 0 as usize {
+        return workspace_scan_zero_shard_list();
+    }
+
+    try workspace_scan_sort_dir_items(arena, items.ptr, items.len);
+
+    if items.len == 1 as usize && items.ptr[0].mode_type == WORKSPACE_SCAN_STAT_S_IFDIR && depth < 8 as usize {
+        const child_relative: WorkspaceScanPath = try workspace_scan_path_join(
+            relative,
+            items.ptr[0].name.ptr[0: items.ptr[0].name.len],
+        );
+        return workspace_scan_collect_parallel_shards(arena, root, &child_relative, depth + 1 as usize);
+    }
+
+    return workspace_scan_shard_list_from_items(arena, relative, &items);
+}
+
+fn workspace_scan_shard_dir_count(shards: &WorkspaceScanShardList) usize {
+    var count: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < shards.len {
+        if shards.ptr[i].is_dir {
+            count = count + 1 as usize;
+        }
+        i = i + 1 as usize;
+    }
+    return count;
+}
+
+fn workspace_scan_should_use_parallel(shards: &WorkspaceScanShardList) bool {
+    if shards.len < WORKSPACE_SCAN_PARALLEL_MIN_SHARDS {
+        return false;
+    }
+    if workspace_scan_shard_dir_count(shards) < WORKSPACE_SCAN_PARALLEL_MIN_SHARDS {
+        return false;
+    }
+    return workspace_scan_parallel_requested_workers() > 1 as i32;
+}
+
+fn workspace_scan_parallel_task_run(task_ptr: usize) usize {
+    const task: &WorkspaceScanParallelTask = task_ptr as &WorkspaceScanParallelTask;
+    task.scratch = malloc(WORKSPACE_SCAN_PARALLEL_TASK_ARENA_BYTES) as &byte;
+    if task.scratch == null {
+        return WORKSPACE_SCAN_PARALLEL_STATUS_ALLOC;
+    }
+
+    var local_arena: Arena = Arena{ buffer: task.scratch, size: 0, used: 0 };
+    arena_init(&local_arena, task.scratch, WORKSPACE_SCAN_PARALLEL_TASK_ARENA_BYTES);
+
+    var collector: WorkspaceScanCollector = workspace_scan_collector_init();
+    var shard_index: usize = task.start_index;
+    while shard_index < task.end_index {
+        const shard: &WorkspaceScanShard = &task.shards[shard_index];
+        if shard.is_dir {
+            if task.path_only {
+                workspace_scan_collect_file_paths(&local_arena, &task.root, &shard.relative, &collector) catch {
+                    return WORKSPACE_SCAN_PARALLEL_STATUS_SCAN;
+                };
+            } else {
+                workspace_scan_collect_files(&local_arena, &task.root, &shard.relative, &collector) catch {
+                    return WORKSPACE_SCAN_PARALLEL_STATUS_SCAN;
+                };
+            }
+        } else {
+            var file_entry: WorkspaceFileEntry = WorkspaceFileEntry{
+                path: ByteList{ ptr: null, len: 0 as usize },
+                kind: WorkspaceFileKind.Regular,
+                file_mode: 0u32,
+                logical_size: 0u64,
+                inode: 0u64,
+                mtime_ns: 0i64,
+            };
+            if task.path_only {
+                file_entry = workspace_scan_entry_path_only(
+                    &local_arena,
+                    &shard.relative,
+                    &shard.item,
+                ) catch {
+                    return WORKSPACE_SCAN_PARALLEL_STATUS_SCAN;
+                };
+            } else {
+                file_entry = workspace_scan_entry_from_dir_item(
+                    &local_arena,
+                    &shard.relative,
+                    &shard.item,
+                ) catch {
+                    return WORKSPACE_SCAN_PARALLEL_STATUS_SCAN;
+                };
+            }
+            workspace_scan_collector_append(&local_arena, &collector, &file_entry) catch {
+                return WORKSPACE_SCAN_PARALLEL_STATUS_SCAN;
+            };
+        }
+        shard_index = shard_index + 1 as usize;
+    }
+
+    task.result = workspace_scan_collector_flatten(&local_arena, &collector) catch {
+        return WORKSPACE_SCAN_PARALLEL_STATUS_SCAN;
+    };
+    return WORKSPACE_SCAN_PARALLEL_STATUS_OK;
+}
+
+fn workspace_scan_parallel_status_to_error(status: usize) !void {
+    if status == WORKSPACE_SCAN_PARALLEL_STATUS_OK {
+        return;
+    }
+    if status == WORKSPACE_SCAN_PARALLEL_STATUS_ALLOC {
+        return error.WorkspaceScanAlloc;
+    }
+    return error.WorkspaceScanStatFailed;
+}
+
+fn workspace_scan_copy_entry_to_arena(arena: &Arena, entry: &WorkspaceFileEntry) !WorkspaceFileEntry {
+    const normalized_path: ByteList = try manifest_path_normalize(arena, entry.path.ptr[0: entry.path.len]);
+    return WorkspaceFileEntry{
+        path: ByteList{ ptr: normalized_path.ptr, len: normalized_path.len },
+        kind: entry.kind,
+        file_mode: entry.file_mode,
+        logical_size: entry.logical_size,
+        inode: entry.inode,
+        mtime_ns: entry.mtime_ns,
+    };
+}
+
+fn workspace_scan_copy_entry_path_only_to_arena(arena: &Arena, entry: &WorkspaceFileEntry) !WorkspaceFileEntry {
+    var want: usize = entry.path.len;
+    if want == 0 as usize {
+        want = 1 as usize;
+    }
+    const raw_path: &byte = arena_alloc(arena, want) as &byte;
+    if raw_path == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var i: usize = 0 as usize;
+    while i < entry.path.len {
+        raw_path[i] = entry.path.ptr[i];
+        i = i + 1 as usize;
+    }
+    return WorkspaceFileEntry{
+        path: ByteList{ ptr: raw_path, len: entry.path.len },
+        kind: entry.kind,
+        file_mode: entry.file_mode,
+        logical_size: entry.logical_size,
+        inode: entry.inode,
+        mtime_ns: entry.mtime_ns,
+    };
+}
+
+fn workspace_scan_free_parallel_task_scratch(tasks: &WorkspaceScanParallelTask, len: usize) void {
+    var i: usize = 0 as usize;
+    while i < len {
+        if tasks[i].scratch != null {
+            free(tasks[i].scratch as &void);
+            tasks[i].scratch = null as &byte;
+        }
+        i = i + 1 as usize;
+    }
+}
+
+fn workspace_scan_merge_parallel_results(
+    arena: &Arena,
+    tasks: &WorkspaceScanParallelTask,
+    task_count: usize,
+    path_only: bool,
+) !WorkspaceFileList {
+    var total_len: usize = 0 as usize;
+    var task_index: usize = 0 as usize;
+    while task_index < task_count {
+        total_len = total_len + tasks[task_index].result.len;
+        task_index = task_index + 1 as usize;
+    }
+    if total_len == 0 as usize {
+        return WorkspaceFileList{ ptr: null, len: 0 as usize };
+    }
+
+    const raw_entries: &WorkspaceFileEntry = arena_alloc(arena, @size_of(WorkspaceFileEntry) as usize * total_len) as &WorkspaceFileEntry;
+    if raw_entries == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var out_index: usize = 0 as usize;
+    task_index = 0 as usize;
+    while task_index < task_count {
+        var entry_index: usize = 0 as usize;
+        while entry_index < tasks[task_index].result.len {
+            if path_only {
+                raw_entries[out_index] = try workspace_scan_copy_entry_path_only_to_arena(
+                    arena,
+                    &tasks[task_index].result.ptr[entry_index],
+                );
+            } else {
+                raw_entries[out_index] = try workspace_scan_copy_entry_to_arena(
+                    arena,
+                    &tasks[task_index].result.ptr[entry_index],
+                );
+            }
+            out_index = out_index + 1 as usize;
+            entry_index = entry_index + 1 as usize;
+        }
+        task_index = task_index + 1 as usize;
+    }
+    return workspace_file_list_from_slice(raw_entries[0: out_index]);
+}
+
+fn workspace_scan_files_parallel(
+    arena: &Arena,
+    root: &WorkspaceScanPath,
+    shards: &WorkspaceScanShardList,
+    path_only: bool,
+) !WorkspaceFileList {
+    const requested_workers: i32 = workspace_scan_parallel_requested_workers();
+    const worker_count: usize = parallel_worker_count(shards.len, requested_workers, WORKSPACE_SCAN_PARALLEL_MAX_WORKERS);
+    if worker_count <= 1 as usize {
+        return error.WorkspaceScanOpenFailed;
+    }
+
+    const tasks: &WorkspaceScanParallelTask = arena_alloc(
+        arena,
+        @size_of(WorkspaceScanParallelTask) as usize * worker_count,
+    ) as &WorkspaceScanParallelTask;
+    if tasks == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    var task_index: usize = 0 as usize;
+    while task_index < worker_count {
+        const start_index: usize = (task_index * shards.len) / worker_count;
+        const end_index: usize = ((task_index + 1 as usize) * shards.len) / worker_count;
+        tasks[task_index] = WorkspaceScanParallelTask{
+            root: *root,
+            shards: shards.ptr,
+            start_index: start_index,
+            end_index: end_index,
+            scratch: null as &byte,
+            result: WorkspaceFileList{ ptr: null, len: 0 as usize },
+            path_only: path_only,
+        };
+        task_index = task_index + 1 as usize;
+    }
+
+    var pool: ThreadPool = thread_pool_new(worker_count as i32);
+    defer {
+        thread_pool_shutdown(&pool);
+        workspace_scan_free_parallel_task_scratch(tasks, worker_count);
+    }
+
+    const futures: &Future<!usize> = arena_alloc(arena, @size_of(Future<!usize>) as usize * worker_count) as &Future<!usize>;
+    if futures == null {
+        return error.WorkspaceScanAlloc;
+    }
+
+    task_index = 0 as usize;
+    while task_index < worker_count {
+        futures[task_index] = async_compute<usize>(
+            &pool,
+            &workspace_scan_parallel_task_run as &void,
+            @usize_from_ptr((&tasks[task_index]) as &void),
+        );
+        task_index = task_index + 1 as usize;
+    }
+
+    task_index = 0 as usize;
+    while task_index < worker_count {
+        const status: usize = block_on<usize>(futures[task_index]) catch {
+            return error.WorkspaceScanOpenFailed;
+        };
+        try workspace_scan_parallel_status_to_error(status);
+        task_index = task_index + 1 as usize;
+    }
+
+    return workspace_scan_merge_parallel_results(arena, tasks, worker_count, path_only);
 }
 
 fn min_usize(left: usize, right: usize) usize {
@@ -589,6 +1396,32 @@ fn workspace_scan_compact_unique_entries(entries: &WorkspaceFileEntry, len: usiz
 export fn workspace_scan_files(arena: &Arena, root_path: &const byte) !WorkspaceFileList {
     const root: WorkspaceScanPath = try workspace_scan_path_from_cstr(root_path);
     const empty_relative: WorkspaceScanPath = workspace_scan_path_empty();
+
+    const shard_storage: &byte = malloc(WORKSPACE_SCAN_PARALLEL_SHARD_ARENA_BYTES) as &byte;
+    if shard_storage != null {
+        defer {
+            free(shard_storage as &void);
+        }
+        var shard_arena: Arena = Arena{ buffer: shard_storage, size: 0, used: 0 };
+        arena_init(&shard_arena, shard_storage, WORKSPACE_SCAN_PARALLEL_SHARD_ARENA_BYTES);
+        const shards: WorkspaceScanShardList = workspace_scan_collect_parallel_shards(
+            &shard_arena,
+            &root,
+            &empty_relative,
+            0 as usize,
+        ) catch {
+            return error.WorkspaceScanOpenFailed;
+        };
+        if workspace_scan_should_use_parallel(&shards) {
+            const parallel_files: WorkspaceFileList = try workspace_scan_files_parallel(arena, &root, &shards, false);
+            if parallel_files.len == 0 as usize {
+                return parallel_files;
+            }
+            try workspace_scan_validate_unique_paths(parallel_files.ptr, parallel_files.len);
+            return parallel_files;
+        }
+    }
+
     var collector: WorkspaceScanCollector = workspace_scan_collector_init();
     try workspace_scan_collect_files(arena, &root, &empty_relative, &collector);
     const files: WorkspaceFileList = try workspace_scan_collector_flatten(arena, &collector);
@@ -596,7 +1429,46 @@ export fn workspace_scan_files(arena: &Arena, root_path: &const byte) !Workspace
         return files;
     }
 
-    try workspace_scan_sort_entries(arena, files.ptr, files.len);
+    try workspace_scan_validate_unique_paths(files.ptr, files.len);
+    return files;
+}
+
+export fn workspace_scan_file_paths(arena: &Arena, root_path: &const byte) !WorkspaceFileList {
+    const root: WorkspaceScanPath = try workspace_scan_path_from_cstr(root_path);
+    const empty_relative: WorkspaceScanPath = workspace_scan_path_empty();
+
+    const shard_storage: &byte = malloc(WORKSPACE_SCAN_PARALLEL_SHARD_ARENA_BYTES) as &byte;
+    if shard_storage != null {
+        defer {
+            free(shard_storage as &void);
+        }
+        var shard_arena: Arena = Arena{ buffer: shard_storage, size: 0, used: 0 };
+        arena_init(&shard_arena, shard_storage, WORKSPACE_SCAN_PARALLEL_SHARD_ARENA_BYTES);
+        const shards: WorkspaceScanShardList = workspace_scan_collect_parallel_shards(
+            &shard_arena,
+            &root,
+            &empty_relative,
+            0 as usize,
+        ) catch {
+            return error.WorkspaceScanOpenFailed;
+        };
+        if shards.len >= WORKSPACE_SCAN_PATH_PARALLEL_MIN_SHARDS && workspace_scan_should_use_parallel(&shards) {
+            const parallel_files: WorkspaceFileList = try workspace_scan_files_parallel(arena, &root, &shards, true);
+            if parallel_files.len == 0 as usize {
+                return parallel_files;
+            }
+            try workspace_scan_validate_unique_paths(parallel_files.ptr, parallel_files.len);
+            return parallel_files;
+        }
+    }
+
+    var collector: WorkspaceScanCollector = workspace_scan_collector_init();
+    try workspace_scan_collect_file_paths(arena, &root, &empty_relative, &collector);
+    const files: WorkspaceFileList = try workspace_scan_collector_flatten(arena, &collector);
+    if files.len == 0 as usize {
+        return files;
+    }
+
     try workspace_scan_validate_unique_paths(files.ptr, files.len);
     return files;
 }

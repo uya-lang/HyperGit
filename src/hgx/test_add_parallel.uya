@@ -37,6 +37,19 @@ fn test_add_parallel_worker_count_serializes_many_tiny_small_blobs_by_default() 
     ) == 1 as usize);
 }
 
+// Realistic source-tree case from bench_million_files_repo: many ~2KB text files.
+// These are allocation/metadata-bound, where multi-worker loose-object stores
+// contend on the allocator instead of scaling, so the default must stay serial.
+fn test_add_parallel_worker_count_serializes_many_small_text_files_by_default() !void {
+    try expect(add_parallel_worker_count_for_inputs_for_test(
+        200000 as usize,
+        409600000u64,
+        true,
+        44,
+        false,
+    ) == 1 as usize);
+}
+
 fn test_add_parallel_worker_count_honors_explicit_tiny_override() !void {
     try expect(add_parallel_worker_count_for_inputs_for_test(
         200000 as usize,
@@ -47,10 +60,12 @@ fn test_add_parallel_worker_count_honors_explicit_tiny_override() !void {
     ) == 8 as usize);
 }
 
+// Once average file size crosses into the tens-of-KB range hashing dominates the
+// per-file cost again, so large small-blobs should keep parallelism.
 fn test_add_parallel_worker_count_keeps_parallelism_for_larger_inputs() !void {
     try expect(add_parallel_worker_count_for_inputs_for_test(
         4096 as usize,
-        266240u64,
+        4294967296u64,
         true,
         8,
         false,
@@ -75,6 +90,7 @@ export fn main() i32 {
     run_test("parallelism is capped by task count", test_add_parallel_worker_count_caps_to_available_tasks);
     run_test("parallelism is capped by hard limit", test_add_parallel_worker_count_caps_to_hard_limit);
     run_test("many tiny small blobs default to serial", test_add_parallel_worker_count_serializes_many_tiny_small_blobs_by_default);
+    run_test("many small text files default to serial", test_add_parallel_worker_count_serializes_many_small_text_files_by_default);
     run_test("explicit tiny override is honored", test_add_parallel_worker_count_honors_explicit_tiny_override);
     run_test("larger small blobs keep parallelism", test_add_parallel_worker_count_keeps_parallelism_for_larger_inputs);
     run_test("mixed inputs keep parallelism", test_add_parallel_worker_count_keeps_parallelism_for_mixed_inputs);
