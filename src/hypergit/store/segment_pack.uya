@@ -929,6 +929,59 @@ fn segment_pack_index_read_internal(path: &const byte, arena: &Arena, verify_pac
     };
 }
 
+fn segment_pack_order_less(records: &[SegmentPackWriteInput], a: usize, b: usize) bool {
+    return object_id_compare(&records.ptr[a].object_id, &records.ptr[b].object_id) < 0;
+}
+
+// Stable bottom-up merge sort of an index permutation `order` by record object
+// id. Replaces the previous O(n^2) "find next sorted" scan in the index build.
+fn segment_pack_sort_order_by_id(records: &[SegmentPackWriteInput], order: &usize, scratch: &usize, n: usize) void {
+    var width: usize = 1 as usize;
+    while width < n {
+        var start: usize = 0 as usize;
+        while start < n {
+            var mid: usize = start + width;
+            if mid > n {
+                mid = n;
+            }
+            var end: usize = mid + width;
+            if end > n {
+                end = n;
+            }
+            var l: usize = start;
+            var r: usize = mid;
+            var o: usize = start;
+            while l < mid && r < end {
+                if !segment_pack_order_less(records, order[r], order[l]) {
+                    scratch[o] = order[l];
+                    l = l + 1 as usize;
+                } else {
+                    scratch[o] = order[r];
+                    r = r + 1 as usize;
+                }
+                o = o + 1 as usize;
+            }
+            while l < mid {
+                scratch[o] = order[l];
+                l = l + 1 as usize;
+                o = o + 1 as usize;
+            }
+            while r < end {
+                scratch[o] = order[r];
+                r = r + 1 as usize;
+                o = o + 1 as usize;
+            }
+            start = end;
+        }
+        var k: usize = 0 as usize;
+        while k < n {
+            order[k] = scratch[k];
+            k = k + 1 as usize;
+        }
+        width = width * 2 as usize;
+    }
+}
+
 export fn segment_pack_write(pack_path: &const byte, index_path: &const byte, segment_seq: u64, created_at_ms: i64, base_generation: u64, records: &[SegmentPackWriteInput]) !SegmentPackWriteResult {
     try segment_pack_validate_unique_inputs(records);
 
@@ -1013,6 +1066,38 @@ export fn segment_pack_write(pack_path: &const byte, index_path: &const byte, se
     }
     const index_output: &[byte] = index_raw[0: index_total_len];
 
+    // Precompute record offsets (prefix sums) and a sorted index order once, so
+    // the index build below is O(n log n) instead of O(n^2). Allocate at least
+    // one element so the arrays are unconditionally non-null.
+    const sort_n: usize = records.len;
+    var alloc_n: usize = sort_n;
+    if alloc_n == 0 as usize {
+        alloc_n = 1 as usize;
+    }
+    const pack_offsets: &u64 = malloc(@size_of(u64) as usize * alloc_n) as &u64;
+    const sort_order: &usize = malloc(@size_of(usize) as usize * alloc_n) as &usize;
+    const sort_scratch: &usize = malloc(@size_of(usize) as usize * alloc_n) as &usize;
+    if pack_offsets == null || sort_order == null || sort_scratch == null {
+        if pack_offsets != null { free(pack_offsets as &void); }
+        if sort_order != null { free(sort_order as &void); }
+        if sort_scratch != null { free(sort_scratch as &void); }
+        return error.SegmentPackAlloc;
+    }
+    defer {
+        free(pack_offsets as &void);
+        free(sort_order as &void);
+        free(sort_scratch as &void);
+    }
+    var acc: u64 = SEGMENT_PACK_HEADER_BYTES as u64;
+    var pi: usize = 0 as usize;
+    while pi < sort_n {
+        pack_offsets[pi] = acc;
+        acc = acc + (try segment_pack_record_total_bytes(&records.ptr[pi])) as u64;
+        sort_order[pi] = pi;
+        pi = pi + 1 as usize;
+    }
+    segment_pack_sort_order_by_id(records, sort_order, sort_scratch, sort_n);
+
     var index_offset: usize = 0 as usize;
     try codec_encode_u32(index_output, &index_offset, PACK_INDEX_MAGIC);
     try codec_encode_u16(index_output, &index_offset, PACK_INDEX_VERSION);
@@ -1025,23 +1110,19 @@ export fn segment_pack_write(pack_path: &const byte, index_path: &const byte, se
     try codec_encode_u32(index_output, &index_offset, 0u32);
     try segment_pack_store_u32(index_output, PACK_INDEX_HEADER_CRC_OFFSET, crc32_compute(index_output[0: PACK_INDEX_HEADER_CRC_OFFSET]));
 
-    var has_last_id: bool = false;
-    var last_id: ObjectId = ObjectId{ hash: segment_pack_zero_hash() };
     i = 0 as usize;
     while i < records.len {
-        const next_index: usize = try segment_pack_find_next_sorted_index(records, has_last_id, &last_id);
+        const next_index: usize = sort_order[i];
         const record: &SegmentPackWriteInput = &records.ptr[next_index];
         const entry_start: usize = index_offset;
         try codec_encode_hash32(index_output, &index_offset, &record.object_id.hash);
-        try codec_encode_u64(index_output, &index_offset, try segment_pack_record_offset_for_index(records, next_index));
+        try codec_encode_u64(index_output, &index_offset, pack_offsets[next_index]);
         try codec_encode_u32(index_output, &index_offset, try segment_pack_record_total_bytes(record));
         try codec_encode_u16(index_output, &index_offset, object_kind_to_u16(record.kind));
         try codec_encode_u16(index_output, &index_offset, record.flags);
         try codec_encode_u64(index_output, &index_offset, record.logical_size);
         try codec_encode_u32(index_output, &index_offset, 0u32);
         try codec_encode_u32(index_output, &index_offset, crc32_compute(index_output.ptr[entry_start: index_offset - entry_start]));
-        last_id = ObjectId{ hash: record.object_id.hash };
-        has_last_id = true;
         i = i + 1 as usize;
     }
 
