@@ -54,7 +54,7 @@ use object.types.ContentType;
 use object.types.EntryKind;
 use object.types.ByteList;
 use store.loose_store.LooseObjectStore;
-use store.loose_store.loose_store_open;
+use store.repo_layout.repo_object_store_open_packed;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
 use store.repo_layout.HGIT_REFS_HEADS_REL;
 use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
@@ -1875,11 +1875,7 @@ export fn run_status() i32 {
                 return EXIT_RUNTIME_ERROR;
             };
         }
-        const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
-            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
-            return EXIT_RUNTIME_ERROR;
-        };
-        const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch |err| {
+        const store: LooseObjectStore = repo_object_store_open_packed(&root) catch |err| {
             if @error_id(err) == @error_id(error.StorePermissionDenied) {
                 fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
                 return EXIT_RUNTIME_ERROR;

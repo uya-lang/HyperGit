@@ -75,8 +75,9 @@ use store.head_ref.repo_head_ref_exists;
 use store.head_ref.repo_read_head_commit;
 use store.head_ref.repo_write_head_commit;
 use store.loose_store.LooseObjectStore;
-use store.loose_store.loose_store_open;
+use store.repo_layout.repo_object_store_open_packed;
 use store.loose_store.loose_store_object_path;
+use store.loose_store.loose_store_pack_logical_size;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_INDEXES_COMMIT_GRAPH_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
@@ -524,6 +525,10 @@ fn commit_load_stage_snapshot(stage_path: &RepoPath, arena: &Arena) !StageSnapsh
 }
 
 fn commit_stage_entry_logical_size(store: &LooseObjectStore, object_id: &ObjectId) !u64 {
+    var packed_logical_size: u64 = 0u64;
+    if try loose_store_pack_logical_size(store, object_id, &packed_logical_size) {
+        return packed_logical_size;
+    }
     var object_path: [byte: COMMIT_OBJECT_PATH_BYTES] = [];
     _ = loose_store_object_path(store, object_id, object_path[0: COMMIT_OBJECT_PATH_BYTES]) catch {
         return error.CommitStoreFailed;
@@ -1862,11 +1867,7 @@ export fn run_commit() i32 {
     const zero_commit: CommitId = stage_zero_commit_id();
     const has_base_commit: bool = commit_id_compare(&snapshot.state.base_commit, &zero_commit) != 0;
 
-    const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
-        fprintf(stderr, "%s" as *byte, COMMIT_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
-    const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch |err| {
+    const store: LooseObjectStore = repo_object_store_open_packed(&root) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
             fprintf(stderr, "%s" as *byte, COMMIT_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;

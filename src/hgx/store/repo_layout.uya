@@ -22,6 +22,8 @@ use std.json.value.JsonObject;
 use std.json.value.JsonStrView;
 use std.json.value.JsonValue;
 use std.string.strlen;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open_packed;
 
 export const REPO_PATH_MAX: usize = 4096;
 const REPO_CONFIG_BYTES_MAX: usize = 512;
@@ -151,6 +153,16 @@ export fn repo_path_join_literal(base: &RepoPath, literal: &const byte) !RepoPat
     out.bytes[pos] = 0 as byte;
     out.len = pos;
     return out;
+}
+
+// Open the repo object store for READS, serving objects from both the loose
+// directory and any segment packs `hgx add` wrote under objects/packs. Writes
+// (put) still land in the loose layer. Open this once per command (it parses
+// every pack index); never inside a per-object loop.
+export fn repo_object_store_open_packed(root: &RepoPath) !LooseObjectStore {
+    const loose_dir: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
+    const packs_dir: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_PACKS_REL);
+    return try loose_store_open_packed(repo_path_cstr(&loose_dir), repo_path_cstr(&packs_dir));
 }
 
 fn repo_path_parent(path: &RepoPath) !RepoPath {

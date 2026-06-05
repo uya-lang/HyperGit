@@ -26,6 +26,10 @@ use libc.readdir;
 use libc.closedir;
 use libc.stat;
 use libc.ENOENT;
+use libc.sys_open;
+use libc.sys_read;
+use libc.sys_lseek;
+use libc.sys_close;
 use crypto.blake3.hypergit_blake3_digest;
 use core.codec.DecodedObject;
 use core.codec.codec_hash_payload;
@@ -800,7 +804,79 @@ export fn segment_pack_index_lookup(path: &const byte, id: ObjectId, arena: &Are
     return try segment_pack_index_lookup_snapshot(&snapshot, id);
 }
 
+// Read a single object record's encoded bytes from a pack at a known offset
+// (from an index entry), without parsing the whole pack. Returns the encoded
+// object envelope bytes (same shape as what the loose store returns for get).
+export fn segment_pack_read_record_at(
+    pack_path: &const byte,
+    expected_id: &ObjectId,
+    record_offset: u64,
+    record_bytes: u32,
+    arena: &Arena,
+) !ByteList {
+    if record_bytes < (SEGMENT_PACK_RECORD_HEADER_BYTES + SEGMENT_PACK_RECORD_TRAILER_BYTES) as u32 {
+        return error.SegmentPackInvalid;
+    }
+    const total: usize = record_bytes as usize;
+    const buf: &byte = arena_alloc(arena, total) as &byte;
+    if buf == null {
+        return error.SegmentPackAlloc;
+    }
+
+    const fd: i32 = sys_open(pack_path, 0i32, 0i32) catch {
+        return error.SegmentPackOpenFailed;
+    };
+    const seeked: i64 = sys_lseek(fd, record_offset as i64, 0i32) catch {
+        _ = sys_close(fd);
+        return error.SegmentPackReadFailed;
+    };
+    if seeked != record_offset as i64 {
+        _ = sys_close(fd);
+        return error.SegmentPackReadFailed;
+    }
+    var got: usize = 0 as usize;
+    while got < total {
+        const dst: &byte = @ptr_from_usize(@usize_from_ptr(buf as &void) + got) as &byte;
+        const n: isize = sys_read(fd, dst, total - got) catch {
+            _ = sys_close(fd);
+            return error.SegmentPackReadFailed;
+        };
+        if n <= 0 as isize {
+            _ = sys_close(fd);
+            return error.SegmentPackReadFailed;
+        }
+        got = got + n as usize;
+    }
+    _ = sys_close(fd);
+
+    const input: &[byte] = buf[0: total];
+    var offset: usize = 0 as usize;
+    const stored_record_bytes: u32 = try codec_decode_u32(input, &offset);
+    if stored_record_bytes != record_bytes {
+        return error.SegmentPackInvalid;
+    }
+    offset = offset + 4 as usize;
+    const object_id: ObjectId = ObjectId{ hash: try codec_decode_hash32(input, &offset) };
+    if object_id_compare(&object_id, expected_id) != 0 {
+        return error.SegmentPackInvalid;
+    }
+    const object_len: usize = total - SEGMENT_PACK_RECORD_HEADER_BYTES - SEGMENT_PACK_RECORD_TRAILER_BYTES;
+    return ByteList{ ptr: &buf[SEGMENT_PACK_RECORD_HEADER_BYTES], len: object_len };
+}
+
 export fn segment_pack_index_read(path: &const byte, arena: &Arena) !SegmentPackIndexSnapshot {
+    return try segment_pack_index_read_internal(path, arena, true);
+}
+
+// Index-only read: validates the .hgi (header/footer/entries CRC + entries hash)
+// but does NOT cross-reference the .hgp pack hash. Use this when caching index
+// snapshots for fast repeated lookups, so opening a packs dir does not read every
+// (multi-MB) pack file. Per-record reads still validate the requested object id.
+export fn segment_pack_index_read_only(path: &const byte, arena: &Arena) !SegmentPackIndexSnapshot {
+    return try segment_pack_index_read_internal(path, arena, false);
+}
+
+fn segment_pack_index_read_internal(path: &const byte, arena: &Arena, verify_pack: bool) !SegmentPackIndexSnapshot {
     const raw_bytes: ByteList = try segment_pack_read_file_bytes(path, arena);
     const file_size: usize = raw_bytes.len;
     if file_size < PACK_INDEX_HEADER_BYTES + PACK_INDEX_FOOTER_BYTES {
@@ -833,14 +909,16 @@ export fn segment_pack_index_read(path: &const byte, arena: &Arena) !SegmentPack
     if hash32_compare(&entries_hash, &footer.entries_hash) != 0 {
         return error.SegmentPackInvalid;
     }
-    const pack_path: ByteList = try segment_pack_sidecar_path(path, 'i' as byte, 'p' as byte, arena);
-    const pack_bytes: ByteList = try segment_pack_read_file_bytes(pack_path.ptr as &const byte, arena);
-    const pack_hash: Hash32 = try segment_pack_hash_footer_cross_ref(
-        pack_bytes.ptr[0: pack_bytes.len],
-        pack_bytes.len - SEGMENT_PACK_FOOTER_BYTES + SEGMENT_PACK_FOOTER_INDEX_HASH_OFFSET,
-    );
-    if hash32_compare(&pack_hash, &footer.pack_hash) != 0 {
-        return error.SegmentPackInvalid;
+    if verify_pack {
+        const pack_path: ByteList = try segment_pack_sidecar_path(path, 'i' as byte, 'p' as byte, arena);
+        const pack_bytes: ByteList = try segment_pack_read_file_bytes(pack_path.ptr as &const byte, arena);
+        const pack_hash: Hash32 = try segment_pack_hash_footer_cross_ref(
+            pack_bytes.ptr[0: pack_bytes.len],
+            pack_bytes.len - SEGMENT_PACK_FOOTER_BYTES + SEGMENT_PACK_FOOTER_INDEX_HASH_OFFSET,
+        );
+        if hash32_compare(&pack_hash, &footer.pack_hash) != 0 {
+            return error.SegmentPackInvalid;
+        }
     }
 
     return SegmentPackIndexSnapshot{

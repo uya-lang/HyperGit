@@ -68,6 +68,7 @@ test:
 	$(UYA) test src/hypergit/test_loose_store.uya
 	$(UYA) test src/hypergit/test_segment_pack.uya
 	$(UYA) test src/hypergit/test_composite_store.uya
+	$(UYA) test src/hypergit/test_loose_store_packed.uya
 	$(UYA) test src/hypergit/test_checkout_plan.uya
 	$(UYA) test src/hgx/test_repo_layout.uya
 	$(UYA) test src/hgx/test_head_ref.uya

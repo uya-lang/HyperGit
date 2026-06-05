@@ -21,7 +21,7 @@ use object.types.CommitPayload;
 use store.head_ref.repo_head_ref_exists;
 use store.head_ref.repo_read_head_commit;
 use store.loose_store.LooseObjectStore;
-use store.loose_store.loose_store_open;
+use store.repo_layout.repo_object_store_open_packed;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
 use store.repo_layout.RepoConfig;
@@ -121,11 +121,7 @@ export fn run_log() i32 {
         return EXIT_RUNTIME_ERROR;
     }
 
-    const objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
-        fprintf(stderr, "%s" as *byte, LOG_FAILURE_TEXT);
-        return EXIT_RUNTIME_ERROR;
-    };
-    const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch |err| {
+    const store: LooseObjectStore = repo_object_store_open_packed(&root) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
             fprintf(stderr, "%s" as *byte, LOG_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;

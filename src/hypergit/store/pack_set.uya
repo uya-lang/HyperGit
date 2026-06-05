@@ -1,0 +1,290 @@
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+use std.string.strlen;
+
+use libc.Stat;
+use libc.DIR;
+use libc.Dirent;
+use libc.free;
+use libc.malloc;
+use libc.opendir;
+use libc.readdir;
+use libc.closedir;
+use libc.stat;
+
+use core.ids.ObjectId;
+use object.types.ByteList;
+use store.segment_pack.SegmentPackIndexSnapshot;
+use store.segment_pack.SegmentPackIndexEntry;
+use store.segment_pack.segment_pack_index_read_only;
+use store.segment_pack.segment_pack_index_lookup_snapshot;
+use store.segment_pack.segment_pack_read_record_at;
+
+const PACK_SET_PATH_MAX: usize = 4096 as usize;
+const PACK_SET_MAX_PACKS: usize = 4096 as usize;
+const PACK_SET_SUFFIX_LEN: usize = 4 as usize;
+
+error PackSetAlloc;
+error PackSetTooManyPacks;
+
+// One cached pack: the parsed .hgi index snapshot (binary-search lookups kept
+// entirely in memory) plus the .hgp path (for single-record reads on a hit).
+struct PackEntry {
+    pack_path: &byte,        // malloc'd nul-terminated cstr for the .hgp file
+    index_buffer: &byte,     // malloc backing for snapshot.raw_bytes
+    snapshot: SegmentPackIndexSnapshot
+}
+
+// A read-only view over all packs in an objects/packs directory. Lookups binary
+// search each cached index; a hit reads just that record from the pack.
+export struct PackSet {
+    packs: &PackEntry,
+    pack_count: usize
+}
+
+export fn pack_set_empty() PackSet {
+    return PackSet{ packs: null, pack_count: 0 as usize };
+}
+
+fn pack_entry_find(entry: &PackEntry, id: ObjectId, out: &SegmentPackIndexEntry) !bool {
+    const found: SegmentPackIndexEntry = segment_pack_index_lookup_snapshot(&entry.snapshot, id) catch |err| {
+        if @error_id(err) == @error_id(error.SegmentPackObjectNotFound) {
+            return false;
+        }
+        return err;
+    };
+    out[0] = found;
+    return true;
+}
+
+export fn pack_set_has(self: &PackSet, id: ObjectId) !bool {
+    var i: usize = 0 as usize;
+    while i < self.pack_count {
+        var entry: SegmentPackIndexEntry = SegmentPackIndexEntry{};
+        if try pack_entry_find(&self.packs[i], ObjectId{ hash: id.hash }, &entry) {
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+// Read a packed object's encoded bytes. Sets *found=false (and returns an empty
+// list) when the id is not in any pack, so callers can fall back to loose.
+export fn pack_set_get(self: &PackSet, id: ObjectId, arena: &Arena, found: &bool) !ByteList {
+    var i: usize = 0 as usize;
+    while i < self.pack_count {
+        var entry: SegmentPackIndexEntry = SegmentPackIndexEntry{};
+        if try pack_entry_find(&self.packs[i], ObjectId{ hash: id.hash }, &entry) {
+            const bytes: ByteList = try segment_pack_read_record_at(
+                self.packs[i].pack_path as &const byte,
+                &id,
+                entry.record_offset,
+                entry.record_bytes,
+                arena,
+            );
+            found[0] = true;
+            return bytes;
+        }
+        i = i + 1 as usize;
+    }
+    found[0] = false;
+    return ByteList{ ptr: null, len: 0 as usize };
+}
+
+// Look up an object's logical size from the indexes without reading the object.
+export fn pack_set_logical_size(self: &PackSet, id: ObjectId, out: &u64) !bool {
+    var i: usize = 0 as usize;
+    while i < self.pack_count {
+        var entry: SegmentPackIndexEntry = SegmentPackIndexEntry{};
+        if try pack_entry_find(&self.packs[i], ObjectId{ hash: id.hash }, &entry) {
+            out[0] = entry.logical_size;
+            return true;
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn pack_set_name_len(entry: &Dirent) usize {
+    var i: usize = 0 as usize;
+    while i < 255 as usize {
+        if entry.d_name[i] == 0 as byte {
+            return i;
+        }
+        i = i + 1 as usize;
+    }
+    return 255 as usize;
+}
+
+fn pack_set_name_has_hgp_suffix(entry: &Dirent, name_len: usize) bool {
+    if name_len <= PACK_SET_SUFFIX_LEN {
+        return false;
+    }
+    // Sliding window over the last four bytes; indices stay bounded by the fixed
+    // d_name size (256) so the array-index safety proof holds.
+    var c0: byte = 0 as byte;
+    var c1: byte = 0 as byte;
+    var c2: byte = 0 as byte;
+    var c3: byte = 0 as byte;
+    var i: usize = 0 as usize;
+    while i < name_len && i < 256 as usize {
+        c0 = c1;
+        c1 = c2;
+        c2 = c3;
+        c3 = entry.d_name[i];
+        i = i + 1 as usize;
+    }
+    return c0 == '.' as byte && c1 == 'h' as byte && c2 == 'g' as byte && c3 == 'p' as byte;
+}
+
+// Build "<dir>/<name>" into a fresh malloc'd cstr; when index_suffix is true the
+// ".hgp" tail is rewritten to ".hgi". Returns null on alloc/length failure.
+fn pack_set_build_path(dir: &const byte, dir_len: usize, entry: &Dirent, name_len: usize, index_suffix: bool) &byte {
+    const total: usize = dir_len + 1 as usize + name_len;
+    if total + 1 as usize > PACK_SET_PATH_MAX {
+        return null;
+    }
+    const out: &byte = malloc(total + 1 as usize) as &byte;
+    if out == null {
+        return null;
+    }
+    var pos: usize = 0 as usize;
+    var i: usize = 0 as usize;
+    while i < dir_len {
+        out[pos] = dir[i];
+        pos = pos + 1 as usize;
+        i = i + 1 as usize;
+    }
+    out[pos] = '/' as byte;
+    pos = pos + 1 as usize;
+    i = 0 as usize;
+    while i < name_len && i < 256 as usize {
+        out[pos] = entry.d_name[i];
+        pos = pos + 1 as usize;
+        i = i + 1 as usize;
+    }
+    if index_suffix {
+        out[pos - 1 as usize] = 'i' as byte;
+    }
+    out[pos] = 0 as byte;
+    return out;
+}
+
+fn pack_entry_load(dir: &const byte, dir_len: usize, entry: &Dirent, name_len: usize, out: &PackEntry) !bool {
+    const index_path: &byte = pack_set_build_path(dir, dir_len, entry, name_len, true);
+    if index_path == null {
+        return error.PackSetAlloc;
+    }
+    defer {
+        free(index_path as &void);
+    }
+
+    var st: Stat = Stat{};
+    if stat(index_path as &const byte, &st) != 0 {
+        // No sibling .hgi: skip this pack (half-written or stray).
+        return false;
+    }
+
+    var index_size: usize = st.st_size as usize;
+    if index_size == 0 as usize {
+        index_size = 1 as usize;
+    }
+    const index_buffer: &byte = malloc(index_size + 64 as usize) as &byte;
+    if index_buffer == null {
+        return error.PackSetAlloc;
+    }
+    var index_arena: Arena = Arena{ buffer: index_buffer, size: 0, used: 0 };
+    arena_init(&index_arena, index_buffer, index_size + 64 as usize);
+    const snapshot: SegmentPackIndexSnapshot = segment_pack_index_read_only(index_path as &const byte, &index_arena) catch {
+        free(index_buffer as &void);
+        return false;
+    };
+
+    const pack_path: &byte = pack_set_build_path(dir, dir_len, entry, name_len, false);
+    if pack_path == null {
+        free(index_buffer as &void);
+        return error.PackSetAlloc;
+    }
+
+    out[0] = PackEntry{
+        pack_path: pack_path,
+        index_buffer: index_buffer,
+        snapshot: snapshot,
+    };
+    return true;
+}
+
+fn pack_set_free_entries(packs: &PackEntry, count: usize) void {
+    var i: usize = 0 as usize;
+    while i < count {
+        if packs[i].index_buffer != null {
+            free(packs[i].index_buffer as &void);
+        }
+        if packs[i].pack_path != null {
+            free(packs[i].pack_path as &void);
+        }
+        i = i + 1 as usize;
+    }
+}
+
+export fn pack_set_open(packs_dir: &const byte) !PackSet {
+    const dir: &DIR = opendir(packs_dir);
+    if dir == null {
+        // No packs directory yet: empty set.
+        return pack_set_empty();
+    }
+    defer {
+        _ = closedir(dir);
+    }
+
+    const packs: &PackEntry = malloc(@size_of(PackEntry) as usize * PACK_SET_MAX_PACKS) as &PackEntry;
+    if packs == null {
+        return error.PackSetAlloc;
+    }
+
+    const dir_len: usize = strlen(packs_dir);
+    var count: usize = 0 as usize;
+    while true {
+        const entry: &Dirent = readdir(dir);
+        if entry == null {
+            break;
+        }
+        if entry.d_name[0] == '.' as byte {
+            if entry.d_name[1] == 0 as byte {
+                continue;
+            }
+            if entry.d_name[1] == '.' as byte && entry.d_name[2] == 0 as byte {
+                continue;
+            }
+        }
+        const name_len: usize = pack_set_name_len(entry);
+        if !pack_set_name_has_hgp_suffix(entry, name_len) {
+            continue;
+        }
+        if count >= PACK_SET_MAX_PACKS {
+            pack_set_free_entries(packs, count);
+            free(packs as &void);
+            return error.PackSetTooManyPacks;
+        }
+        const loaded: bool = pack_entry_load(packs_dir, dir_len, entry, name_len, &packs[count]) catch |err| {
+            pack_set_free_entries(packs, count);
+            free(packs as &void);
+            return err;
+        };
+        if loaded {
+            count = count + 1 as usize;
+        }
+    }
+
+    return PackSet{ packs: packs, pack_count: count };
+}
+
+export fn pack_set_close(self: &PackSet) void {
+    if self.packs != null {
+        pack_set_free_entries(self.packs, self.pack_count);
+        free(self.packs as &void);
+        self.packs = null;
+        self.pack_count = 0 as usize;
+    }
+}

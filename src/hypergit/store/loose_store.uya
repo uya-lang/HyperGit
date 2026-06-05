@@ -46,6 +46,12 @@ use object.types.object_kind_to_u16;
 use store.object_store.ObjectBytes;
 use store.object_store.ObjectReader;
 use store.object_store.ObjectStore;
+use store.pack_set.PackSet;
+use store.pack_set.pack_set_empty;
+use store.pack_set.pack_set_open;
+use store.pack_set.pack_set_has;
+use store.pack_set.pack_set_get;
+use store.pack_set.pack_set_logical_size;
 
 const STORE_PATH_MAX: usize = 4096;
 const LOOSE_STORE_STAT_S_IFMT: u32 = 61440u32;
@@ -405,21 +411,33 @@ fn loose_store_put_with_id(self: &LooseObjectStore, id: &ObjectId, kind: ObjectK
 export struct LooseObjectStore : ObjectStore {
     root: StorePath,
     fanout_prepared: bool,
+    packs: PackSet,
 
     fn has(self: &Self, id: ObjectId) !bool {
         var dir_path: StorePath = store_path_empty();
         var file_path: StorePath = store_path_empty();
         try build_loose_object_paths(&self.root, &id, &dir_path, &file_path);
-        return store_path_exists(&file_path);
+        if store_path_exists(&file_path) {
+            return true;
+        }
+        return try pack_set_has(&self.packs, ObjectId{ hash: id.hash });
     },
 
     fn get(self: &Self, id: ObjectId, arena: &Arena) !ObjectBytes {
         var dir_path: StorePath = store_path_empty();
         var file_path: StorePath = store_path_empty();
         try build_loose_object_paths(&self.root, &id, &dir_path, &file_path);
-        const data: ByteList = try load_file_bytes(arena, &file_path);
-        try verify_object_bytes(&id, data);
-        return ObjectBytes{ bytes: data };
+        if store_path_exists(&file_path) {
+            const data: ByteList = try load_file_bytes(arena, &file_path);
+            try verify_object_bytes(&id, data);
+            return ObjectBytes{ bytes: data };
+        }
+        var found: bool = false;
+        const packed: ByteList = try pack_set_get(&self.packs, ObjectId{ hash: id.hash }, arena, &found);
+        if found {
+            return ObjectBytes{ bytes: packed };
+        }
+        return error.StoreNotFound;
     },
 
     fn put(self: &Self, kind: ObjectKind, payload: &[byte]) !ObjectId {
@@ -442,7 +460,26 @@ export fn loose_store_open(root_path: &byte) !LooseObjectStore {
     return LooseObjectStore{
         root: try store_path_from_cstr(root_path),
         fanout_prepared: false,
+        packs: pack_set_empty(),
     };
+}
+
+// Open a loose store that also serves objects from segment packs in packs_dir.
+// Reads check the loose object first, then fall back to the packs (index lookup
+// + single-record read). Writes/put still go to the loose layer. Use this for
+// read paths that must see objects `hgx add` placed into packs.
+export fn loose_store_open_packed(root_path: &byte, packs_dir: &const byte) !LooseObjectStore {
+    return LooseObjectStore{
+        root: try store_path_from_cstr(root_path),
+        fanout_prepared: false,
+        packs: try pack_set_open(packs_dir),
+    };
+}
+
+// Resolve an object's logical size from the pack index without reading bytes.
+// Returns false when the id is not packed (caller should decode the loose object).
+export fn loose_store_pack_logical_size(store: &LooseObjectStore, id: &ObjectId, out: &u64) !bool {
+    return try pack_set_logical_size(&store.packs, ObjectId{ hash: id[0].hash }, out);
 }
 
 export fn loose_store_prepare_fanout_dirs(store: &LooseObjectStore) !void {

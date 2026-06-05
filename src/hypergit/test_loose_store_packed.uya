@@ -1,0 +1,121 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use libc.system;
+use core.ids.ObjectId;
+use core.ids.Hash32;
+use core.ids.object_id_compare;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_open_packed;
+use store.loose_store.loose_store_pack_logical_size;
+use store.object_store.ObjectBytes;
+use store.segment_pack.SegmentPackWriteInput;
+use store.segment_pack.segment_pack_write;
+
+const LSP_LOOSE: &const byte = "build/loose-store-packed-test/objects/loose";
+const LSP_PACKS: &const byte = "build/loose-store-packed-test/objects/packs";
+
+fn lsp_bytes_equal(a: ByteList, b: ByteList) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0 as usize;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn lsp_input(id: ObjectId, bytes: ByteList) SegmentPackWriteInput {
+    return SegmentPackWriteInput{
+        object_id: ObjectId{ hash: id.hash },
+        kind: ObjectKind.Commit,
+        flags: 0u16,
+        logical_size: bytes.len as u64,
+        object_bytes: ByteList{ ptr: bytes.ptr, len: bytes.len },
+    };
+}
+
+fn test_loose_store_packed_reads_packs_and_loose() !void {
+    try expect(system("rm -rf build/loose-store-packed-test && mkdir -p build/loose-store-packed-test/objects/loose build/loose-store-packed-test/objects/packs") == 0);
+
+    var store: LooseObjectStore = try loose_store_open(LSP_LOOSE as &byte);
+    var pa: [byte: 6] = ['a' as byte, 'l' as byte, 'p' as byte, 'h' as byte, 'a' as byte, '1' as byte];
+    var pb: [byte: 5] = ['b' as byte, 'e' as byte, 't' as byte, 'a' as byte, '2' as byte];
+    var pc: [byte: 7] = ['g' as byte, 'a' as byte, 'm' as byte, 'm' as byte, 'a' as byte, '3' as byte, '3' as byte];
+    var pd: [byte: 4] = ['d' as byte, 'e' as byte, 'l' as byte, 't' as byte];
+    const id_a: ObjectId = try store.put(ObjectKind.Commit, pa[0: 6]);
+    const id_b: ObjectId = try store.put(ObjectKind.Commit, pb[0: 5]);
+    const id_c: ObjectId = try store.put(ObjectKind.Commit, pc[0: 7]);
+    const id_d: ObjectId = try store.put(ObjectKind.Commit, pd[0: 4]);
+
+    var save_buf: [byte: 16384] = [];
+    var save_arena: Arena = Arena{ buffer: &save_buf[0], size: 0, used: 0 };
+    arena_init(&save_arena, &save_buf[0], 16384 as usize);
+    const bytes_a: ObjectBytes = try store.get(ObjectId{ hash: id_a.hash }, &save_arena);
+    const bytes_b: ObjectBytes = try store.get(ObjectId{ hash: id_b.hash }, &save_arena);
+    const bytes_c: ObjectBytes = try store.get(ObjectId{ hash: id_c.hash }, &save_arena);
+    const bytes_d: ObjectBytes = try store.get(ObjectId{ hash: id_d.hash }, &save_arena);
+
+    var pack1: [SegmentPackWriteInput: 1] = [lsp_input(id_a, bytes_a.bytes)];
+    _ = try segment_pack_write("build/loose-store-packed-test/objects/packs/seg-1.hgp", "build/loose-store-packed-test/objects/packs/seg-1.hgi", 1u64, 100i64, 0u64, pack1[0: 1]);
+    var pack2: [SegmentPackWriteInput: 2] = [lsp_input(id_b, bytes_b.bytes), lsp_input(id_c, bytes_c.bytes)];
+    if object_id_compare(&id_b, &id_c) > 0 {
+        pack2[0] = lsp_input(id_c, bytes_c.bytes);
+        pack2[1] = lsp_input(id_b, bytes_b.bytes);
+    }
+    _ = try segment_pack_write("build/loose-store-packed-test/objects/packs/seg-2.hgp", "build/loose-store-packed-test/objects/packs/seg-2.hgi", 2u64, 200i64, 0u64, pack2[0: 2]);
+
+    // Keep only D loose; A/B/C must be served from the packs.
+    try expect(system("rm -rf build/loose-store-packed-test/objects/loose && mkdir -p build/loose-store-packed-test/objects/loose") == 0);
+    var store_d: LooseObjectStore = try loose_store_open(LSP_LOOSE as &byte);
+    _ = try store_d.put(ObjectKind.Commit, pd[0: 4]);
+
+    var packed: LooseObjectStore = try loose_store_open_packed(LSP_LOOSE as &byte, LSP_PACKS);
+
+    try expect(try packed.has(ObjectId{ hash: id_a.hash }));
+    try expect(try packed.has(ObjectId{ hash: id_b.hash }));
+    try expect(try packed.has(ObjectId{ hash: id_c.hash }));
+    try expect(try packed.has(ObjectId{ hash: id_d.hash }));
+
+    var missing: ObjectId = ObjectId{ hash: Hash32{ bytes: [] } };
+    var i: usize = 0 as usize;
+    while i < 32 as usize {
+        missing.hash.bytes[i] = 0xEE as byte;
+        i = i + 1 as usize;
+    }
+    try expect(!(try packed.has(ObjectId{ hash: missing.hash })));
+
+    var get_buf: [byte: 16384] = [];
+    var get_arena: Arena = Arena{ buffer: &get_buf[0], size: 0, used: 0 };
+    arena_init(&get_arena, &get_buf[0], 16384 as usize);
+    const got_a: ObjectBytes = try packed.get(ObjectId{ hash: id_a.hash }, &get_arena);
+    try expect(lsp_bytes_equal(got_a.bytes, bytes_a.bytes));
+    const got_c: ObjectBytes = try packed.get(ObjectId{ hash: id_c.hash }, &get_arena);
+    try expect(lsp_bytes_equal(got_c.bytes, bytes_c.bytes));
+    const got_d: ObjectBytes = try packed.get(ObjectId{ hash: id_d.hash }, &get_arena);
+    try expect(lsp_bytes_equal(got_d.bytes, bytes_d.bytes));
+
+    var size_a: u64 = 0u64;
+    try expect(try loose_store_pack_logical_size(&packed, &id_a, &size_a));
+    try expect(size_a == bytes_a.bytes.len as u64);
+    var size_d: u64 = 0u64;
+    try expect(!(try loose_store_pack_logical_size(&packed, &id_d, &size_d)));
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Loose Store Packed Tests");
+    run_test("reads packs and loose", test_loose_store_packed_reads_packs_and_loose);
+    return test_suite_end();
+}
