@@ -1,0 +1,509 @@
+use std.string.strlen;
+
+use libc.free;
+use libc.malloc;
+use libc.unlink;
+use libc.sys_open;
+use libc.sys_read;
+use libc.sys_write;
+use libc.sys_close;
+
+use core.ids.ObjectId;
+use core.ids.Hash32;
+use core.ids.HASH32_BYTES;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use object.types.object_kind_to_u16;
+use object.types.object_kind_from_u16;
+use store.segment_pack.SegmentPackWriteInput;
+use store.segment_pack.segment_pack_write;
+
+// Streaming pack writer for bulk `hgx add`. Each encoded object is appended to an
+// on-disk objects temp file and a fixed-size metadata record to a meta temp file.
+// Nothing large is held in memory during the per-file loop (which is what made the
+// in-memory buffering version starve the Uya allocator). When a pending pack
+// reaches the size/count cap it is assembled into a real .hgp/.hgi (via the now
+// O(n log n) segment_pack_write) and a fresh pack is started; finish assembles the
+// last one. Appending objects to one file is ~8x cheaper per object than creating
+// one loose file each.
+
+const PACK_STREAM_META_BYTES: usize = 64 as usize;          // id(32)+kind(2)+rsv(6)+logical(8)+offset(8)+length(8)
+const PACK_STREAM_PATH_MAX: usize = 4096 as usize;
+const PACK_STREAM_MAX_PACK_BYTES: u64 = 58720256u64;        // ~56 MiB of object bytes per pack (< 64MiB read cap)
+const PACK_STREAM_MAX_RECORDS: usize = 200000 as usize;
+const PACK_STREAM_O_RDONLY: i32 = 0i32;
+const PACK_STREAM_O_WRONLY_CREAT_TRUNC: i32 = 577i32;       // O_WRONLY|O_CREAT|O_TRUNC
+const PACK_STREAM_MODE: i32 = 384i32;                       // 0600
+
+error PackStreamAlloc;
+error PackStreamIo;
+
+export struct PackStream {
+    packs_dir: &byte,
+    pid: i32,
+    created_at_ms: i64,
+    current_seq: u64,
+    total: usize,
+    objects_fd: i32,
+    meta_fd: i32,
+    objects_path: &byte,
+    meta_path: &byte,
+    count: usize,
+    objects_bytes: u64
+}
+
+fn pack_stream_put_byte(buf: &byte, idx: usize, value: byte) void {
+    const p: &byte = @ptr_from_usize(@usize_from_ptr(buf as &void) + idx) as &byte;
+    p[0] = value;
+}
+
+fn pack_stream_get_byte(buf: &byte, idx: usize) byte {
+    const p: &byte = @ptr_from_usize(@usize_from_ptr(buf as &void) + idx) as &byte;
+    return p[0];
+}
+
+fn pack_stream_append_decimal(buf: &byte, pos: &usize, value: u64) void {
+    var digits: [byte: 20] = [];
+    var n: u64 = value;
+    var c: usize = 0 as usize;
+    var idx: usize = pos[0];
+    if n == 0u64 {
+        pack_stream_put_byte(buf, idx, '0' as byte);
+        pos[0] = idx + 1 as usize;
+        return;
+    }
+    while n > 0u64 && c < 20 as usize {
+        digits[c] = ('0' as byte) + (n % 10u64) as byte;
+        n = n / 10u64;
+        c = c + 1 as usize;
+    }
+    while c > 0 as usize {
+        c = c - 1 as usize;
+        if c < 20 as usize {
+            pack_stream_put_byte(buf, idx, digits[c]);
+            idx = idx + 1 as usize;
+        }
+    }
+    pos[0] = idx;
+}
+
+fn pack_stream_append_cstr(buf: &byte, pos: &usize, text: &const byte) void {
+    var idx: usize = pos[0];
+    var i: usize = 0 as usize;
+    while text[i] != 0 as byte {
+        pack_stream_put_byte(buf, idx, text[i]);
+        idx = idx + 1 as usize;
+        i = i + 1 as usize;
+    }
+    pos[0] = idx;
+}
+
+// Build "<packs_dir>/pack-<pid>-<ts>-<seq>.<ext>" into a fresh malloc'd cstr.
+fn pack_stream_make_name(packs_dir: &const byte, pid: i32, ts: i64, seq: u64, ext: &const byte) &byte {
+    const out: &byte = malloc(PACK_STREAM_PATH_MAX) as &byte;
+    if out == null {
+        return null;
+    }
+    var p: usize = 0 as usize;
+    pack_stream_append_cstr(out, &p, packs_dir);
+    pack_stream_append_cstr(out, &p, "/pack-" as &const byte);
+    pack_stream_append_decimal(out, &p, pid as u64);
+    out[p] = '-' as byte; p = p + 1 as usize;
+    pack_stream_append_decimal(out, &p, ts as u64);
+    out[p] = '-' as byte; p = p + 1 as usize;
+    pack_stream_append_decimal(out, &p, seq);
+    pack_stream_append_cstr(out, &p, ext);
+    out[p] = 0 as byte;
+    return out;
+}
+
+fn pack_stream_make_temp(packs_dir: &const byte, pid: i32, seq: u64, ext: &const byte) &byte {
+    const out: &byte = malloc(PACK_STREAM_PATH_MAX) as &byte;
+    if out == null {
+        return null;
+    }
+    var p: usize = 0 as usize;
+    pack_stream_append_cstr(out, &p, packs_dir);
+    pack_stream_append_cstr(out, &p, "/.stream-" as &const byte);
+    pack_stream_append_decimal(out, &p, pid as u64);
+    out[p] = '-' as byte; p = p + 1 as usize;
+    pack_stream_append_decimal(out, &p, seq);
+    pack_stream_append_cstr(out, &p, ext);
+    out[p] = 0 as byte;
+    return out;
+}
+
+fn pack_stream_dup_cstr(src: &const byte) &byte {
+    const len: usize = strlen(src);
+    const out: &byte = malloc(len + 1 as usize) as &byte;
+    if out == null {
+        return null;
+    }
+    var i: usize = 0 as usize;
+    while i < len {
+        out[i] = src[i];
+        i = i + 1 as usize;
+    }
+    out[i] = 0 as byte;
+    return out;
+}
+
+fn pack_stream_write_all(fd: i32, data: &byte, len: usize) !void {
+    var written: usize = 0 as usize;
+    while written < len {
+        const ptr: &byte = @ptr_from_usize(@usize_from_ptr(data as &void) + written) as &byte;
+        const n: isize = sys_write(fd, ptr, len - written) catch {
+            return error.PackStreamIo;
+        };
+        if n <= 0 as isize {
+            return error.PackStreamIo;
+        }
+        written = written + n as usize;
+    }
+}
+
+fn pack_stream_read_all(fd: i32, buf: &byte, len: usize) !void {
+    var got: usize = 0 as usize;
+    while got < len {
+        const ptr: &byte = @ptr_from_usize(@usize_from_ptr(buf as &void) + got) as &byte;
+        const n: isize = sys_read(fd, ptr, len - got) catch {
+            return error.PackStreamIo;
+        };
+        if n <= 0 as isize {
+            return error.PackStreamIo;
+        }
+        got = got + n as usize;
+    }
+}
+
+fn pack_stream_store_u64(buf: &byte, offset: usize, value: u64) void {
+    var v: u64 = value;
+    var i: usize = 0 as usize;
+    while i < 8 as usize {
+        pack_stream_put_byte(buf, offset + i, (v & 255u64) as byte);
+        v = v >> 8;
+        i = i + 1 as usize;
+    }
+}
+
+fn pack_stream_load_u64(buf: &byte, offset: usize) u64 {
+    var v: u64 = 0u64;
+    var i: usize = 0 as usize;
+    while i < 8 as usize {
+        v = v | ((pack_stream_get_byte(buf, offset + i) as u64) << ((8 as i32) * (i as i32)));
+        i = i + 1 as usize;
+    }
+    return v;
+}
+
+fn pack_stream_open_temps(self: &PackStream) !void {
+    const objects_path: &byte = pack_stream_make_temp(self.packs_dir as &const byte, self.pid, self.current_seq, ".obj" as &const byte);
+    const meta_path: &byte = pack_stream_make_temp(self.packs_dir as &const byte, self.pid, self.current_seq, ".meta" as &const byte);
+    if objects_path == null || meta_path == null {
+        if objects_path != null { free(objects_path as &void); }
+        if meta_path != null { free(meta_path as &void); }
+        return error.PackStreamAlloc;
+    }
+    const objects_fd: i32 = sys_open(objects_path as &const byte, PACK_STREAM_O_WRONLY_CREAT_TRUNC, PACK_STREAM_MODE) catch {
+        free(objects_path as &void); free(meta_path as &void);
+        return error.PackStreamIo;
+    };
+    const meta_fd: i32 = sys_open(meta_path as &const byte, PACK_STREAM_O_WRONLY_CREAT_TRUNC, PACK_STREAM_MODE) catch {
+        _ = sys_close(objects_fd);
+        free(objects_path as &void); free(meta_path as &void);
+        return error.PackStreamIo;
+    };
+    self.objects_fd = objects_fd;
+    self.meta_fd = meta_fd;
+    self.objects_path = objects_path;
+    self.meta_path = meta_path;
+    self.count = 0 as usize;
+    self.objects_bytes = 0u64;
+}
+
+export fn pack_stream_open(packs_dir: &const byte, pid: i32, created_at_ms: i64) !PackStream {
+    const dir_copy: &byte = pack_stream_dup_cstr(packs_dir);
+    if dir_copy == null {
+        return error.PackStreamAlloc;
+    }
+    var self: PackStream = PackStream{
+        packs_dir: dir_copy,
+        pid: pid,
+        created_at_ms: created_at_ms,
+        current_seq: 0u64,
+        total: 0 as usize,
+        objects_fd: -1i32,
+        meta_fd: -1i32,
+        objects_path: null,
+        meta_path: null,
+        count: 0 as usize,
+        objects_bytes: 0u64,
+    };
+    pack_stream_open_temps(&self) catch |err| {
+        free(dir_copy as &void);
+        return err;
+    };
+    return self;
+}
+
+export fn pack_stream_add(self: &PackStream, id: &ObjectId, kind: ObjectKind, logical_size: u64, object_bytes: &[byte]) !void {
+    if self.count > 0 as usize &&
+        (self.count >= PACK_STREAM_MAX_RECORDS ||
+         self.objects_bytes + object_bytes.len as u64 > PACK_STREAM_MAX_PACK_BYTES) {
+        try pack_stream_assemble_current(self);
+        self.current_seq = self.current_seq + 1u64;
+        try pack_stream_open_temps(self);
+    }
+
+    try pack_stream_write_all(self.objects_fd, object_bytes.ptr, object_bytes.len);
+
+    var meta: [byte: PACK_STREAM_META_BYTES] = [];
+    var i: usize = 0 as usize;
+    while i < HASH32_BYTES {
+        meta[i] = id[0].hash.bytes[i];
+        i = i + 1 as usize;
+    }
+    const kind_u16: u16 = object_kind_to_u16(kind);
+    meta[32] = (kind_u16 & 255u16) as byte;
+    meta[33] = ((kind_u16 >> 8) & 255u16) as byte;
+    pack_stream_store_u64(&meta[0], 40 as usize, logical_size);
+    pack_stream_store_u64(&meta[0], 48 as usize, self.objects_bytes);
+    pack_stream_store_u64(&meta[0], 56 as usize, object_bytes.len as u64);
+    try pack_stream_write_all(self.meta_fd, &meta[0], PACK_STREAM_META_BYTES);
+
+    self.objects_bytes = self.objects_bytes + object_bytes.len as u64;
+    self.count = self.count + 1 as usize;
+}
+
+fn pack_stream_free_temp_paths(self: &PackStream) void {
+    if self.objects_path != null {
+        _ = unlink(self.objects_path as &const byte);
+        free(self.objects_path as &void);
+        self.objects_path = null;
+    }
+    if self.meta_path != null {
+        _ = unlink(self.meta_path as &const byte);
+        free(self.meta_path as &void);
+        self.meta_path = null;
+    }
+}
+
+fn pack_stream_meta_id_equal(meta_buf: &byte, a: usize, b: usize) bool {
+    var i: usize = 0 as usize;
+    while i < HASH32_BYTES {
+        if pack_stream_get_byte(meta_buf, a + i) != pack_stream_get_byte(meta_buf, b + i) {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn pack_stream_meta_id_less(meta_buf: &byte, a: usize, b: usize) bool {
+    const ba: usize = a * PACK_STREAM_META_BYTES;
+    const bb: usize = b * PACK_STREAM_META_BYTES;
+    var i: usize = 0 as usize;
+    while i < HASH32_BYTES {
+        if pack_stream_get_byte(meta_buf, ba + i) != pack_stream_get_byte(meta_buf, bb + i) {
+            return pack_stream_get_byte(meta_buf, ba + i) < pack_stream_get_byte(meta_buf, bb + i);
+        }
+        i = i + 1 as usize;
+    }
+    return false;
+}
+
+fn pack_stream_sort_meta(meta_buf: &byte, order: &usize, scratch: &usize, n: usize) void {
+    var width: usize = 1 as usize;
+    while width < n {
+        var start: usize = 0 as usize;
+        while start < n {
+            var mid: usize = start + width;
+            if mid > n { mid = n; }
+            var end: usize = mid + width;
+            if end > n { end = n; }
+            var l: usize = start;
+            var r: usize = mid;
+            var o: usize = start;
+            while l < mid && r < end {
+                if !pack_stream_meta_id_less(meta_buf, order[r], order[l]) {
+                    scratch[o] = order[l];
+                    l = l + 1 as usize;
+                } else {
+                    scratch[o] = order[r];
+                    r = r + 1 as usize;
+                }
+                o = o + 1 as usize;
+            }
+            while l < mid { scratch[o] = order[l]; l = l + 1 as usize; o = o + 1 as usize; }
+            while r < end { scratch[o] = order[r]; r = r + 1 as usize; o = o + 1 as usize; }
+            start = end;
+        }
+        var c: usize = 0 as usize;
+        while c < n { order[c] = scratch[c]; c = c + 1 as usize; }
+        width = width * 2 as usize;
+    }
+}
+
+// Read back the current temps, dedup, write one real .hgp/.hgi, remove temps,
+// and add the unique count to self.total.
+fn pack_stream_assemble_current(self: &PackStream) !void {
+    _ = sys_close(self.objects_fd) catch {};
+    _ = sys_close(self.meta_fd) catch {};
+    self.objects_fd = -1i32;
+    self.meta_fd = -1i32;
+
+    if self.count == 0 as usize {
+        pack_stream_free_temp_paths(self);
+        return;
+    }
+
+    const count: usize = self.count;
+    const meta_total: usize = count * PACK_STREAM_META_BYTES;
+    var objects_alloc: usize = self.objects_bytes as usize;
+    if objects_alloc == 0 as usize { objects_alloc = 1 as usize; }
+
+    const meta_buf: &byte = malloc(meta_total) as &byte;
+    const objects_buf: &byte = malloc(objects_alloc) as &byte;
+    const inputs: &SegmentPackWriteInput = malloc(@size_of(SegmentPackWriteInput) as usize * count) as &SegmentPackWriteInput;
+    const order: &usize = malloc(@size_of(usize) as usize * count) as &usize;
+    const scratch: &usize = malloc(@size_of(usize) as usize * count) as &usize;
+    if meta_buf == null || objects_buf == null || inputs == null || order == null || scratch == null {
+        if meta_buf != null { free(meta_buf as &void); }
+        if objects_buf != null { free(objects_buf as &void); }
+        if inputs != null { free(inputs as &void); }
+        if order != null { free(order as &void); }
+        if scratch != null { free(scratch as &void); }
+        pack_stream_free_temp_paths(self);
+        return error.PackStreamAlloc;
+    }
+    defer {
+        free(meta_buf as &void);
+        free(objects_buf as &void);
+        free(inputs as &void);
+        free(order as &void);
+        free(scratch as &void);
+    }
+
+    const mfd: i32 = sys_open(self.meta_path as &const byte, PACK_STREAM_O_RDONLY, 0i32) catch {
+        pack_stream_free_temp_paths(self);
+        return error.PackStreamIo;
+    };
+    pack_stream_read_all(mfd, meta_buf, meta_total) catch {
+        _ = sys_close(mfd);
+        pack_stream_free_temp_paths(self);
+        return error.PackStreamIo;
+    };
+    _ = sys_close(mfd);
+
+    const ofd: i32 = sys_open(self.objects_path as &const byte, PACK_STREAM_O_RDONLY, 0i32) catch {
+        pack_stream_free_temp_paths(self);
+        return error.PackStreamIo;
+    };
+    pack_stream_read_all(ofd, objects_buf, self.objects_bytes as usize) catch {
+        _ = sys_close(ofd);
+        pack_stream_free_temp_paths(self);
+        return error.PackStreamIo;
+    };
+    _ = sys_close(ofd);
+
+    var k: usize = 0 as usize;
+    while k < count {
+        order[k] = k;
+        k = k + 1 as usize;
+    }
+    pack_stream_sort_meta(meta_buf, order, scratch, count);
+
+    var unique_count: usize = 0 as usize;
+    var prev_valid: bool = false;
+    var prev_base: usize = 0 as usize;
+    var j: usize = 0 as usize;
+    while j < count {
+        const base: usize = order[j] * PACK_STREAM_META_BYTES;
+        if prev_valid && pack_stream_meta_id_equal(meta_buf, prev_base, base) {
+            j = j + 1 as usize;
+            continue;
+        }
+        prev_valid = true;
+        prev_base = base;
+
+        var hash: Hash32 = Hash32{ bytes: [] };
+        var hi: usize = 0 as usize;
+        while hi < HASH32_BYTES {
+            hash.bytes[hi] = pack_stream_get_byte(meta_buf, base + hi);
+            hi = hi + 1 as usize;
+        }
+        const kind_u16: u16 = (pack_stream_get_byte(meta_buf, base + 32 as usize) as u16) | ((pack_stream_get_byte(meta_buf, base + 33 as usize) as u16) << 8);
+        const kind: ObjectKind = object_kind_from_u16(kind_u16) catch {
+            pack_stream_free_temp_paths(self);
+            return error.PackStreamIo;
+        };
+        const logical_size: u64 = pack_stream_load_u64(meta_buf, base + 40 as usize);
+        const obj_offset: u64 = pack_stream_load_u64(meta_buf, base + 48 as usize);
+        const obj_len: u64 = pack_stream_load_u64(meta_buf, base + 56 as usize);
+        const obj_ptr: &byte = @ptr_from_usize(@usize_from_ptr(objects_buf as &void) + obj_offset as usize) as &byte;
+        inputs[unique_count] = SegmentPackWriteInput{
+            object_id: ObjectId{ hash: hash },
+            kind: kind,
+            flags: 0u16,
+            logical_size: logical_size,
+            object_bytes: ByteList{ ptr: obj_ptr, len: obj_len as usize },
+        };
+        unique_count = unique_count + 1 as usize;
+        j = j + 1 as usize;
+    }
+
+    const pack_path: &byte = pack_stream_make_name(self.packs_dir as &const byte, self.pid, self.created_at_ms, self.current_seq, ".hgp" as &const byte);
+    const index_path: &byte = pack_stream_make_name(self.packs_dir as &const byte, self.pid, self.created_at_ms, self.current_seq, ".hgi" as &const byte);
+    if pack_path == null || index_path == null {
+        if pack_path != null { free(pack_path as &void); }
+        if index_path != null { free(index_path as &void); }
+        pack_stream_free_temp_paths(self);
+        return error.PackStreamAlloc;
+    }
+    const write_result: bool = (segment_pack_write(
+        pack_path as &const byte,
+        index_path as &const byte,
+        self.current_seq,
+        self.created_at_ms,
+        0u64,
+        inputs[0: unique_count],
+    ) catch {
+        free(pack_path as &void);
+        free(index_path as &void);
+        pack_stream_free_temp_paths(self);
+        return error.PackStreamIo;
+    }).object_count > 0u64 || unique_count == 0 as usize;
+    _ = write_result;
+    free(pack_path as &void);
+    free(index_path as &void);
+
+    self.total = self.total + unique_count;
+    pack_stream_free_temp_paths(self);
+}
+
+// Assemble any pending pack and tear down. Returns total unique objects written.
+export fn pack_stream_finish(self: &PackStream) !usize {
+    if self.count > 0 as usize {
+        try pack_stream_assemble_current(self);
+    } else {
+        _ = sys_close(self.objects_fd) catch {};
+        _ = sys_close(self.meta_fd) catch {};
+        pack_stream_free_temp_paths(self);
+    }
+    if self.packs_dir != null {
+        free(self.packs_dir as &void);
+        self.packs_dir = null;
+    }
+    return self.total;
+}
+
+// Best-effort teardown on the error path (no pack assembled).
+export fn pack_stream_abort(self: &PackStream) void {
+    _ = sys_close(self.objects_fd) catch {};
+    _ = sys_close(self.meta_fd) catch {};
+    pack_stream_free_temp_paths(self);
+    if self.packs_dir != null {
+        free(self.packs_dir as &void);
+        self.packs_dir = null;
+    }
+}

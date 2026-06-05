@@ -1,0 +1,111 @@
+use std.runtime.entry;
+use std.testing.expect;
+use std.testing.test_suite_begin;
+use std.testing.test_suite_end;
+use std.testing.run_test;
+use std.mem.arena.Arena;
+use std.mem.arena.arena_init;
+
+use libc.system;
+use core.ids.ObjectId;
+use object.types.ByteList;
+use object.types.ObjectKind;
+use store.loose_store.LooseObjectStore;
+use store.loose_store.loose_store_open;
+use store.object_store.ObjectBytes;
+use store.pack_stream.PackStream;
+use store.pack_stream.pack_stream_open;
+use store.pack_stream.pack_stream_add;
+use store.pack_stream.pack_stream_finish;
+use store.pack_set.PackSet;
+use store.pack_set.pack_set_open;
+use store.pack_set.pack_set_has;
+use store.pack_set.pack_set_get;
+use store.pack_set.pack_set_close;
+
+const PS_LOOSE: &const byte = "build/pack-stream-test/objects/loose";
+const PS_PACKS: &const byte = "build/pack-stream-test/objects/packs";
+
+fn ps_bytes_eq(a: ByteList, b: ByteList) bool {
+    if a.len != b.len {
+        return false;
+    }
+    var i: usize = 0 as usize;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1 as usize;
+    }
+    return true;
+}
+
+fn test_pack_stream_roundtrip() !void {
+    try expect(system("rm -rf build/pack-stream-test && mkdir -p build/pack-stream-test/objects/loose build/pack-stream-test/objects/packs") == 0);
+
+    var store: LooseObjectStore = try loose_store_open(PS_LOOSE as &byte);
+    const total: usize = 200 as usize;
+
+    var save_raw: [byte: 65536] = [];
+    var save_arena: Arena = Arena{ buffer: &save_raw[0], size: 0, used: 0 };
+    arena_init(&save_arena, &save_raw[0], 65536 as usize);
+
+    var ids: [ObjectId: 200] = [];
+    var blobs: [ByteList: 200] = [];
+
+    var i: usize = 0 as usize;
+    while i < total {
+        var payload: [byte: 16] = [];
+        // Encode i into the first bytes so every object is unique.
+        payload[0] = (i & 255 as usize) as byte;
+        payload[1] = ((i >> 4) & 255 as usize) as byte;
+        payload[2] = ((i >> 8) & 255 as usize) as byte;
+        var j: usize = 3 as usize;
+        while j < 16 as usize {
+            payload[j] = (('a' as byte) + ((i + j) % 26 as usize) as byte);
+            j = j + 1 as usize;
+        }
+        const id: ObjectId = try store.put(ObjectKind.Commit, payload[0: 16]);
+        ids[i] = ObjectId{ hash: id.hash };
+        blobs[i] = (try store.get(ObjectId{ hash: id.hash }, &save_arena)).bytes;
+        i = i + 1 as usize;
+    }
+
+    var stream: PackStream = try pack_stream_open(PS_PACKS, 4242i32, 123i64);
+    i = 0 as usize;
+    while i < total {
+        try pack_stream_add(&stream, &ids[i], ObjectKind.Commit, blobs[i].len as u64, blobs[i].ptr[0: blobs[i].len]);
+        i = i + 1 as usize;
+    }
+    // add a duplicate of the first id to exercise dedup
+    try pack_stream_add(&stream, &ids[0], ObjectKind.Commit, blobs[0].len as u64, blobs[0].ptr[0: blobs[0].len]);
+    const written: usize = try pack_stream_finish(&stream);
+    try expect(written == total);
+
+    // drop loose copies so reads must come from the pack
+    try expect(system("rm -rf build/pack-stream-test/objects/loose && mkdir -p build/pack-stream-test/objects/loose") == 0);
+
+    var packs: PackSet = try pack_set_open(PS_PACKS);
+    defer {
+        pack_set_close(&packs);
+    }
+
+    var get_raw: [byte: 4096] = [];
+    i = 0 as usize;
+    while i < total {
+        try expect(try pack_set_has(&packs, ObjectId{ hash: ids[i].hash }));
+        var get_arena: Arena = Arena{ buffer: &get_raw[0], size: 0, used: 0 };
+        arena_init(&get_arena, &get_raw[0], 4096 as usize);
+        var found: bool = false;
+        const got: ByteList = try pack_set_get(&packs, ObjectId{ hash: ids[i].hash }, &get_arena, &found);
+        try expect(found);
+        try expect(ps_bytes_eq(got, blobs[i]));
+        i = i + 1 as usize;
+    }
+}
+
+export fn main() i32 {
+    test_suite_begin("HyperGit Pack Stream Tests");
+    run_test("stream write + pack read roundtrip", test_pack_stream_roundtrip);
+    return test_suite_end();
+}
