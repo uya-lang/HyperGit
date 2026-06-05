@@ -266,9 +266,21 @@ export fn pack_stream_add(self: &PackStream, id: &ObjectId, kind: ObjectKind, lo
     const kind_u16: u16 = object_kind_to_u16(kind);
     meta[32] = (kind_u16 & 255u16) as byte;
     meta[33] = ((kind_u16 >> 8) & 255u16) as byte;
-    pack_stream_store_u64(&meta[0], 40 as usize, logical_size);
-    pack_stream_store_u64(&meta[0], 48 as usize, self.objects_bytes);
-    pack_stream_store_u64(&meta[0], 56 as usize, object_bytes.len as u64);
+    // Write the three u64 fields directly into the stack meta array (fast),
+    // rather than through the pointer-arithmetic byte helpers.
+    var v_logical: u64 = logical_size;
+    var v_offset: u64 = self.objects_bytes;
+    var v_length: u64 = object_bytes.len as u64;
+    var b: usize = 0 as usize;
+    while b < 8 as usize {
+        meta[40 as usize + b] = (v_logical & 255u64) as byte;
+        meta[48 as usize + b] = (v_offset & 255u64) as byte;
+        meta[56 as usize + b] = (v_length & 255u64) as byte;
+        v_logical = v_logical >> 8;
+        v_offset = v_offset >> 8;
+        v_length = v_length >> 8;
+        b = b + 1 as usize;
+    }
     try pack_stream_write_all(self.meta_fd, &meta[0], PACK_STREAM_META_BYTES);
 
     self.objects_bytes = self.objects_bytes + object_bytes.len as u64;
