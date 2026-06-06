@@ -986,6 +986,16 @@ fn status_open_dir_for_change(root_path: &StatusFsPath, path: &ByteList, dir_len
     };
 }
 
+// Like status_open_dir_for_change but returns -1 instead of failing when the
+// directory cannot be opened (e.g. it was removed). Callers fall back to a
+// full-path lstat so a vanished directory reads as a deletion rather than
+// aborting the whole status.
+fn status_open_dir_for_change_or_neg(root_path: &StatusFsPath, path: &ByteList, dir_len: usize) i32 {
+    return status_open_dir_for_change(root_path, path, dir_len) catch {
+        return -1;
+    };
+}
+
 fn status_stat_change_name_at(change: &LocalChange, dir_fd: i32, file_name: &const byte, st: &Stat) !bool {
     const flags: i32 = AT_SYMLINK_NOFOLLOW;
     _ = status_sys_newfstatat(dir_fd, file_name, st, flags) catch |err| {
@@ -1425,7 +1435,7 @@ fn status_collect_unstaged_changes_from_new_stage_local_stats(
             if current_dir_fd >= 0 as i32 {
                 _ = sys_close(current_dir_fd) catch {};
             }
-            current_dir_fd = try status_open_dir_for_change(&root_path, &change.path, dir_len);
+            current_dir_fd = status_open_dir_for_change_or_neg(&root_path, &change.path, dir_len);
             current_dir_source = ByteList{ ptr: change.path.ptr, len: change.path.len };
             current_dir_len = dir_len;
         }
@@ -1434,7 +1444,15 @@ fn status_collect_unstaged_changes_from_new_stage_local_stats(
         var file_name: StatusFsPath = StatusFsPath{ bytes: [], len: 0 as usize };
         try status_file_name_from_change(&change.path, file_start, &file_name);
         var st: Stat = Stat{};
-        const exists: bool = try status_stat_change_name_at(change, current_dir_fd, &file_name.bytes[0] as &const byte, &st);
+        var exists: bool = false;
+        if current_dir_fd >= 0 as i32 {
+            exists = try status_stat_change_name_at(change, current_dir_fd, &file_name.bytes[0] as &const byte, &st);
+        } else {
+            // Parent directory could not be opened (e.g. removed); fall back to a
+            // full-path lstat so a vanished directory reads as a deletion.
+            const fs_path: StatusFsPath = try status_fs_path_join(&root_path, &change.path);
+            exists = try status_stat_change_path(change, &fs_path, &st);
+        }
         if !exists {
             status_append_change(raw, &out_index, &expected_entry.path, StatusChangeKind.Deleted);
             expected_index = expected_index + 1 as usize;
@@ -1644,7 +1662,7 @@ fn status_collect_tracked_changes_from_local_stats(
             if current_dir_fd >= 0 as i32 {
                 _ = sys_close(current_dir_fd) catch {};
             }
-            current_dir_fd = try status_open_dir_for_change(&root_path, &change.path, dir_len);
+            current_dir_fd = status_open_dir_for_change_or_neg(&root_path, &change.path, dir_len);
             current_dir_source = ByteList{ ptr: change.path.ptr, len: change.path.len };
             current_dir_len = dir_len;
         }
@@ -1653,7 +1671,15 @@ fn status_collect_tracked_changes_from_local_stats(
         var file_name: StatusFsPath = StatusFsPath{ bytes: [], len: 0 as usize };
         try status_file_name_from_change(&change.path, file_start, &file_name);
         var st: Stat = Stat{};
-        const exists: bool = try status_stat_change_name_at(change, current_dir_fd, &file_name.bytes[0] as &const byte, &st);
+        var exists: bool = false;
+        if current_dir_fd >= 0 as i32 {
+            exists = try status_stat_change_name_at(change, current_dir_fd, &file_name.bytes[0] as &const byte, &st);
+        } else {
+            // Parent directory could not be opened (e.g. removed); fall back to a
+            // full-path lstat so a vanished directory reads as a deletion.
+            const fs_path: StatusFsPath = try status_fs_path_join(&root_path, &change.path);
+            exists = try status_stat_change_path(change, &fs_path, &st);
+        }
         if !exists {
             status_append_change(raw, &out_index, &change.path, StatusChangeKind.Deleted);
             i = i + 1 as usize;

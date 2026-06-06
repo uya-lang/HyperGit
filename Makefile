@@ -133,6 +133,7 @@ test:
 	./tests/test_status_large_staged.sh
 	./tests/test_status_reserved_name_error.sh
 	./tests/test_status_split.sh
+	./tests/test_status_missing_dir.sh
 	./tests/test_loose_store_concurrent.sh
 
 experimental-test:
