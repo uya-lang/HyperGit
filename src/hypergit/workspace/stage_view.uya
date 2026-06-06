@@ -28,6 +28,7 @@ use object.types.ObjectKind;
 use object.types.SmallBlobPayload;
 use store.loose_store.LooseObjectStore;
 use store.loose_store.loose_store_object_path;
+use store.loose_store.loose_store_pack_logical_size;
 use store.object_store.ObjectBytes;
 use workspace.stage.StageEntry;
 use workspace.stage.StageEntryKind;
@@ -122,6 +123,13 @@ fn stage_view_base_inputs(
 
 fn stage_view_entry_logical_size(arena: &Arena, store: &LooseObjectStore, object_id: &ObjectId) !u64 {
     _ = arena;
+
+    // Packed objects have no loose file to stat; read the logical size straight
+    // from the segment-pack index (matches commit_stage_entry_logical_size).
+    var packed_logical_size: u64 = 0u64;
+    if try loose_store_pack_logical_size(store, object_id, &packed_logical_size) {
+        return packed_logical_size;
+    }
 
     var object_path: [byte: STAGE_VIEW_OBJECT_PATH_BYTES] = [];
     _ = loose_store_object_path(

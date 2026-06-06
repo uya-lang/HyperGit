@@ -68,11 +68,12 @@ use store.head_ref.repo_head_ref_exists;
 use store.head_ref.repo_read_head_commit;
 use store.head_ref.repo_write_head_commit;
 use store.loose_store.LooseObjectStore;
-use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_open_packed;
 use store.loose_store.loose_store_object_path;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_OBJECTS_PACKS_REL;
 use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
 use store.repo_layout.RepoConfig;
 use store.repo_layout.RepoPath;
@@ -547,7 +548,15 @@ export fn run_fetch() i32 {
         fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
+    const remote_packs_root: RepoPath = repo_path_join_literal(&remote.repo_root, HGIT_OBJECTS_PACKS_REL) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
     const local_objects_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_LOOSE_REL) catch {
+        fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const local_packs_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_PACKS_REL) catch {
         fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
@@ -560,7 +569,7 @@ export fn run_fetch() i32 {
         return EXIT_RUNTIME_ERROR;
     };
 
-    const remote_store: LooseObjectStore = loose_store_open(repo_path_cstr(&remote_objects_root)) catch |err| {
+    const remote_store: LooseObjectStore = loose_store_open_packed(repo_path_cstr(&remote_objects_root), repo_path_cstr(&remote_packs_root) as &const byte) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
             fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;
@@ -568,7 +577,7 @@ export fn run_fetch() i32 {
         fprintf(stderr, "%s" as *byte, FETCH_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
-    const local_store: LooseObjectStore = loose_store_open(repo_path_cstr(&local_objects_root)) catch |err| {
+    const local_store: LooseObjectStore = loose_store_open_packed(repo_path_cstr(&local_objects_root), repo_path_cstr(&local_packs_root) as &const byte) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
             fprintf(stderr, "%s" as *byte, FETCH_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;

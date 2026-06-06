@@ -28,8 +28,9 @@ use manifest.trie.ManifestLeafInputList;
 use manifest.query.ManifestPathspecList;
 use object.types.ByteList;
 use store.loose_store.LooseObjectStore;
-use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_open_packed;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_OBJECTS_PACKS_REL;
 use store.repo_layout.HGIT_WORKSPACE_SPARSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STATE_REL;
 use store.repo_layout.RepoConfig;
@@ -188,7 +189,11 @@ export fn run_sparse() i32 {
         fprintf(stderr, "%s" as *byte, SPARSE_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
-    const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch |err| {
+    const packs_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_PACKS_REL) catch {
+        fprintf(stderr, "%s" as *byte, SPARSE_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const store: LooseObjectStore = loose_store_open_packed(repo_path_cstr(&objects_root), repo_path_cstr(&packs_root) as &const byte) catch |err| {
         if @error_id(err) == @error_id(error.StorePermissionDenied) {
             fprintf(stderr, "%s" as *byte, CHECKOUT_PERMISSION_TEXT);
             return EXIT_RUNTIME_ERROR;

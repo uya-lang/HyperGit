@@ -439,5 +439,8 @@
 
 - [x] 建立百万文件端到端基准脚本，覆盖 init/status/add/commit/log/diff，记录每步 hgx/git 耗时与加速比。
 - [x] 修复 `hgx add` 在大量小文件首次 add 时的并行回归：定位为 Uya 分配器多线程争用（20 worker 比串行慢约 9x），将存储受限的小 blob 批量默认转为串行（`ADD_PARALLEL_TINY_SMALL_BLOB_AVG_BYTES` 64→65536），add_initial 从 0.095x 提升到约 1.4–1.5x。
-- [ ] **（另立项）`hgx add` 首次大批量达到 2x git**：当前受限于 Uya 分配器无法多线程扩展。需二选一：(a) 无 malloc 的并行 prepare —— worker 用栈缓冲读+编码，写入预分配批缓冲的各自槽位，再串行写盘；或 (b) add 直接顺序写 pack 而非百万 loose 对象。
+- [x] **`hgx add` 首次大批量 pack-on-add 流水线（(a)+(b) 二合一）**：实现"N 个无 malloc 并行 prepare worker → 单个串行 pack 消费者"流水线。bulk 小 blob add（≥1024 文件全为小 blob，或 `HGX_ADD_PACK=1`）时，worker 用栈/预分配槽位缓冲读+编码+哈希（热路径零堆分配，绕开分配器全局锁），单个串行消费者把整批对象顺序追加进一个 streaming segment pack（`pack_stream`），用少量顺序 pack 写替代百万次 loose `create`+`rename`。小 add 默认仍走 loose。对象与 loose 路径字节一致（object-id 等价 + checkout 字节级回放，见 `tests/test_add_pack_bulk_roundtrip.sh`）。配套：所有对象读路径（add 自身、checkout/hydrate/dehydrate/sparse/doctor/fetch/push）改为 packed-aware；修复 `stage_view_entry_logical_size` 对 packed 对象误 stat loose 路径导致第二次 commit 失败的 bug。
+- [x] **checkout 共享 store**：`checkout_apply_plan` 的 per-task worker 不再各自 `loose_store_open_packed`（packed repo 下会让每个 worker 重复解析整份 pack 索引，O(任务数×索引条目)），改为共享命令级已打开的 store（只读并发 get 安全：索引快照只读、每次 get 自开 fd）。
+- [ ] **后续**：pack-on-add 性能基准（百万文件 add 对比 git，验证 2x 目标）；多 pack 累积时的周期性 compaction。
+- [ ] **（既有问题，与本次无关）**`test_checkout_restore_workspace` 的 9000 文件 checkout 在 base HEAD 上即已超时（每文件 ~0.4s，疑似 per-task 32MB arena mmap + 仅 2 worker），需单独优化 checkout 写出吞吐；本次共享 store 改动已使其更快但未根治。
 - [ ] status / diff 工作区扫描超过 git 2x：当前受 lstat 逐文件成本限制与 git 持平，需引入 watcher / stat-cache 增量层。

@@ -140,6 +140,17 @@ use workspace.stage_file.stage_file_lock_acquire;
 use workspace.stage_file.stage_file_lock_release;
 use workspace.stage_file.stage_file_read;
 use workspace.stage_file.stage_file_write;
+use store.pack_stream.PackStream;
+use store.pack_stream.pack_stream_open;
+use store.pack_stream.pack_stream_add;
+use store.pack_stream.pack_stream_finish;
+use store.pack_stream.pack_stream_abort;
+use store.loose_store.loose_store_open_packed;
+use store.repo_layout.HGIT_OBJECTS_PACKS_REL;
+use core.codec.CODEC_ENVELOPE_BYTES;
+use core.codec.codec_encode_object;
+use object.types.object_kind_to_u16;
+use libc.getpid;
 
 const ADD_ARENA_BYTES: usize = 1073741824 as usize;
 const ADD_PATHSPEC_ARENA_BYTES: usize = 65536 as usize;
@@ -2745,6 +2756,455 @@ fn add_replace_single_local_change(arena: &Arena, local_change_path: &RepoPath, 
     }
 }
 
+// --- pack-on-add pipeline (二合一: parallel malloc-free prepare + serial pack consume) ---
+//
+// For a bulk add whose entries are all small-blob candidates, hashing/encoding is
+// done by N worker threads writing each result into a preallocated per-task slot
+// (no malloc/free in the hot loop, so the process allocator is never the shared
+// bottleneck), and a single serial consumer appends every prepared object to one
+// streaming segment pack. This replaces a million loose-object create+rename pairs
+// with a handful of sequential pack writes while keeping prepare fully parallel.
+const ADD_PACK_MIN_FILES: usize = 1024 as usize;
+const ADD_PACK_BATCH_MAX_FILES: usize = 8192 as usize;
+const ADD_PACK_INLINE_BYTES: usize = CODEC_ENVELOPE_BYTES + ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES;
+const ADD_PACK_SLOT_PENDING: usize = 0 as usize;
+const ADD_PACK_SLOT_READY: usize = 1 as usize;
+const ADD_PACK_SLOT_SKIP_PERMISSION: usize = 2 as usize;
+const ADD_PACK_SLOT_SKIP_UNPROCESSABLE: usize = 3 as usize;
+const ADD_PACK_SLOT_FATAL: usize = 4 as usize;
+
+struct AddPackSlot {
+    status: usize,
+    object_id: ObjectId,
+    logical_size: u64,
+    heap_ptr: &byte,
+    encoded_len: usize,
+    inline_buf: [byte: ADD_PACK_INLINE_BYTES] = []
+}
+
+struct AddPackPrepareTask {
+    root_fs_path: &AddFsPath,
+    file_entry: &WorkspaceFileEntry,
+    result_index: usize,
+    policy_id: PolicyId,
+    audit_enabled: bool
+}
+
+struct AddPackPrepareWorker {
+    thread: pthread_t,
+    tasks: &AddPackPrepareTask,
+    slots: &AddPackSlot,
+    task_count: usize,
+    worker_index: usize,
+    worker_count: usize,
+    started: i32
+}
+
+fn add_pack_path_enabled(matched_count: usize, files: &WorkspaceFileList) bool {
+    if matched_count == 0 as usize {
+        return false;
+    }
+    if !add_all_files_are_parallel_small_blob_candidates(files) {
+        return false;
+    }
+    const raw: &byte = getenv("HGX_ADD_PACK");
+    if raw != null && raw[0] != 0 as byte {
+        return !(raw[0] == '0' as byte && raw[1] == 0 as byte);
+    }
+    return matched_count >= ADD_PACK_MIN_FILES;
+}
+
+fn add_pack_worker_count(task_count: usize) usize {
+    var requested: i32 = add_parallel_env_requested_workers();
+    if requested <= 0 as i32 {
+        requested = add_parallel_default_requested_workers();
+    }
+    return add_parallel_worker_count(task_count, requested);
+}
+
+fn add_pack_batch_capacity(total: usize) usize {
+    if total == 0 as usize {
+        return 1 as usize;
+    }
+    if total > ADD_PACK_BATCH_MAX_FILES {
+        return ADD_PACK_BATCH_MAX_FILES;
+    }
+    return total;
+}
+
+// Serialize a small-blob's full encoded object (codec envelope + small-blob payload)
+// straight into the slot's inline buffer with zero heap allocation. Used for regular
+// files up to the fast threshold; this is the malloc-free hot path.
+fn add_pack_fill_slot_inline(slot: &AddPackSlot, content: &[byte], logical_size: u64) !void {
+    const payload_len: usize = add_small_blob_fast_payload_len(content.len);
+    if payload_len > ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES {
+        return error.AddFastPathUnavailable;
+    }
+    var payload_buf: [byte: ADD_SMALL_BLOB_FAST_PAYLOAD_BYTES] = [];
+    const payload: SmallBlobPayload = add_small_blob_payload_from_bytes(content);
+    var off: usize = 0 as usize;
+    try encode_small_blob_payload(payload_buf[0: payload_len], &off, &payload);
+    if off != payload_len {
+        return error.AddStoreFailed;
+    }
+    const object_id: ObjectId = try add_hash_small_blob_encoded_fast(payload_buf[0: payload_len]);
+    const full_len: usize = CODEC_ENVELOPE_BYTES + payload_len;
+    if full_len > ADD_PACK_INLINE_BYTES {
+        return error.AddFastPathUnavailable;
+    }
+    var foff: usize = 0 as usize;
+    try codec_encode_object(slot.inline_buf[0: full_len], &foff, object_kind_to_u16(ObjectKind.SmallBlob), 0u16, payload_buf[0: payload_len]);
+    slot.object_id = object_id;
+    slot.logical_size = logical_size;
+    slot.heap_ptr = null as &byte;
+    slot.encoded_len = full_len;
+    slot.status = ADD_PACK_SLOT_READY;
+}
+
+// Heap fallback for symlinks and larger small-blobs whose encoded object does not
+// fit the inline buffer. Rare in the bulk-of-tiny-files workload, so the occasional
+// malloc here does not meaningfully contend the allocator.
+fn add_pack_fill_slot_heap(slot: &AddPackSlot, content: &[byte], logical_size: u64) !void {
+    const payload: SmallBlobPayload = add_small_blob_payload_from_bytes(content);
+    const encoded: AddOwnedBytes = try add_encode_small_blob_payload(&payload);
+    defer {
+        add_owned_bytes_free(&encoded);
+    }
+    const object_id: ObjectId = try add_hash_small_blob_encoded(add_owned_bytes_slice(&encoded));
+    const payload_slice: &[byte] = add_owned_bytes_slice(&encoded);
+    const full_len: usize = CODEC_ENVELOPE_BYTES + payload_slice.len;
+    if full_len <= ADD_PACK_INLINE_BYTES {
+        var foff: usize = 0 as usize;
+        try codec_encode_object(slot.inline_buf[0: full_len], &foff, object_kind_to_u16(ObjectKind.SmallBlob), 0u16, payload_slice);
+        slot.heap_ptr = null as &byte;
+    } else {
+        const raw: &byte = malloc(full_len) as &byte;
+        if raw == null {
+            return error.AddAlloc;
+        }
+        var foff: usize = 0 as usize;
+        codec_encode_object(raw[0: full_len], &foff, object_kind_to_u16(ObjectKind.SmallBlob), 0u16, payload_slice) catch {
+            free(raw as &void);
+            return error.AddStoreFailed;
+        };
+        slot.heap_ptr = raw;
+    }
+    slot.object_id = object_id;
+    slot.logical_size = logical_size;
+    slot.encoded_len = full_len;
+    slot.status = ADD_PACK_SLOT_READY;
+}
+
+fn add_pack_prepare_one(task: &AddPackPrepareTask, slot: &AddPackSlot) void {
+    const file_entry: &WorkspaceFileEntry = task.file_entry;
+    if add_can_fast_regular_small_blob(file_entry) {
+        const size: usize = file_entry.logical_size as usize;
+        var content_buf: [byte: ADD_SMALL_BLOB_FAST_MAX_BYTES] = [];
+        const fs_path: AddFsPath = add_fs_path_join(task.root_fs_path, file_entry.path.ptr[0: file_entry.path.len]) catch {
+            slot.status = ADD_PACK_SLOT_FATAL;
+            return;
+        };
+        add_read_file_bytes_into(&fs_path, content_buf[0: size]) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                slot.status = ADD_PACK_SLOT_SKIP_PERMISSION;
+                return;
+            }
+            slot.status = ADD_PACK_SLOT_SKIP_UNPROCESSABLE;
+            return;
+        };
+        add_pack_fill_slot_inline(slot, content_buf[0: size], file_entry.logical_size) catch {
+            slot.status = ADD_PACK_SLOT_FATAL;
+            return;
+        };
+        return;
+    }
+
+    const file_bytes: AddOwnedBytes = add_read_workspace_entry_bytes(task.root_fs_path, file_entry) catch |err| {
+        if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+            slot.status = ADD_PACK_SLOT_SKIP_PERMISSION;
+            return;
+        }
+        slot.status = ADD_PACK_SLOT_SKIP_UNPROCESSABLE;
+        return;
+    };
+    defer {
+        add_owned_bytes_free(&file_bytes);
+    }
+    add_pack_fill_slot_heap(slot, add_owned_bytes_slice(&file_bytes), file_entry.logical_size) catch {
+        slot.status = ADD_PACK_SLOT_FATAL;
+        return;
+    };
+}
+
+fn add_pack_prepare_worker_main(arg: &void) &void {
+    const worker: &AddPackPrepareWorker = arg as &AddPackPrepareWorker;
+    if worker == null || worker.tasks == null || worker.slots == null {
+        return null;
+    }
+    var task_index: usize = worker.worker_index;
+    while task_index < worker.task_count {
+        add_pack_prepare_one(&worker.tasks[task_index], &worker.slots[task_index]);
+        task_index = task_index + worker.worker_count;
+    }
+    return null;
+}
+
+fn add_pack_prepare_batch(tasks: &AddPackPrepareTask, slots: &AddPackSlot, task_count: usize, worker_count: usize) !void {
+    if task_count == 0 as usize {
+        return;
+    }
+    var wc: usize = worker_count;
+    if wc > task_count {
+        wc = task_count;
+    }
+    if wc <= 1 as usize {
+        var i: usize = 0 as usize;
+        while i < task_count {
+            add_pack_prepare_one(&tasks[i], &slots[i]);
+            i = i + 1 as usize;
+        }
+        return;
+    }
+
+    const workers: &AddPackPrepareWorker = malloc(@size_of(AddPackPrepareWorker) as usize * wc) as &AddPackPrepareWorker;
+    if workers == null {
+        return error.AddAlloc;
+    }
+    defer {
+        free(workers as &void);
+    }
+
+    var worker_index: usize = 0 as usize;
+    while worker_index < wc {
+        workers[worker_index] = AddPackPrepareWorker{
+            thread: pthread_t{
+                tid: 0i64,
+                stack: null,
+                stack_size: 0 as usize,
+                detached: 0,
+                exited: 0,
+                result: null,
+                start_routine: null,
+                arg: null,
+            },
+            tasks: tasks,
+            slots: slots,
+            task_count: task_count,
+            worker_index: worker_index,
+            worker_count: wc,
+            started: 0,
+        };
+        const create_result: i32 = pthread_create(
+            &workers[worker_index].thread,
+            null as &const pthread_attr_t,
+            &add_pack_prepare_worker_main as &void,
+            (&workers[worker_index]) as &void,
+        );
+        if create_result != 0 {
+            var cleanup_index: usize = 0 as usize;
+            while cleanup_index < worker_index {
+                if workers[cleanup_index].started != 0 {
+                    _ = pthread_join(&workers[cleanup_index].thread, null as & &void);
+                }
+                cleanup_index = cleanup_index + 1 as usize;
+            }
+            return error.AddStoreFailed;
+        }
+        workers[worker_index].started = 1;
+        worker_index = worker_index + 1 as usize;
+    }
+
+    worker_index = 0 as usize;
+    while worker_index < wc {
+        if workers[worker_index].started != 0 {
+            _ = pthread_join(&workers[worker_index].thread, null as & &void);
+        }
+        worker_index = worker_index + 1 as usize;
+    }
+}
+
+fn add_pack_flush_batch(
+    stream: &PackStream,
+    tasks: &AddPackPrepareTask,
+    slots: &AddPackSlot,
+    task_count: usize,
+    worker_count: usize,
+    processed_results: &AddFileProcessResult,
+    skipped_count: &usize,
+    progress: &AddProgressState,
+    profile: &AddProfileState,
+) !void {
+    if task_count == 0 as usize {
+        return;
+    }
+    try add_pack_prepare_batch(tasks, slots, task_count, worker_count);
+    if profile.enabled {
+        profile.parallel_batches = profile.parallel_batches + 1 as usize;
+    }
+
+    var k: usize = 0 as usize;
+    while k < task_count {
+        const task: &AddPackPrepareTask = &tasks[k];
+        const slot: &AddPackSlot = &slots[k];
+        const file_entry: &WorkspaceFileEntry = task.file_entry;
+        if slot.status == ADD_PACK_SLOT_READY {
+            var ptr: &byte = &slot.inline_buf[0];
+            if slot.heap_ptr != null {
+                ptr = slot.heap_ptr;
+            }
+            pack_stream_add(stream, &slot.object_id, ObjectKind.SmallBlob, slot.logical_size, ptr[0: slot.encoded_len]) catch {
+                if slot.heap_ptr != null {
+                    free(slot.heap_ptr as &void);
+                }
+                return error.AddStoreFailed;
+            };
+            if slot.heap_ptr != null {
+                free(slot.heap_ptr as &void);
+            }
+            processed_results[task.result_index] = add_file_process_result_stored(
+                &slot.object_id,
+                0u64,
+                0u64,
+                &task.policy_id,
+                task.audit_enabled,
+            );
+        } else if slot.status == ADD_PACK_SLOT_SKIP_PERMISSION {
+            processed_results[task.result_index] = add_file_process_result_skipped(ADD_FILE_PROCESS_SKIP_PERMISSION);
+            add_warn_skipped_path(&file_entry.path, ADD_SKIP_PERMISSION_TEXT);
+            *skipped_count = *skipped_count + 1 as usize;
+        } else if slot.status == ADD_PACK_SLOT_SKIP_UNPROCESSABLE {
+            processed_results[task.result_index] = add_file_process_result_skipped(ADD_FILE_PROCESS_SKIP_UNPROCESSABLE);
+            add_warn_skipped_path(&file_entry.path, ADD_SKIP_UNPROCESSABLE_TEXT);
+            *skipped_count = *skipped_count + 1 as usize;
+        } else {
+            return error.AddStoreFailed;
+        }
+        add_progress_mark_file(progress, file_entry);
+        k = k + 1 as usize;
+    }
+}
+
+fn add_pack_consume_all(
+    stream: &PackStream,
+    tasks: &AddPackPrepareTask,
+    slots: &AddPackSlot,
+    batch_cap: usize,
+    root_fs_path: &AddFsPath,
+    scanned_files: &WorkspaceFileList,
+    path_policy: &PathPolicyProfile,
+    store: &LooseObjectStore,
+    cached_local_changes: &LocalChangeList,
+    worker_count: usize,
+    processed_results: &AddFileProcessResult,
+    skipped_count: &usize,
+    progress: &AddProgressState,
+    profile: &AddProfileState,
+) !void {
+    var batch_count: usize = 0 as usize;
+    var file_index: usize = 0 as usize;
+    while file_index < scanned_files.len {
+        const file_entry: &WorkspaceFileEntry = &scanned_files.ptr[file_index];
+        const applied_policy: AddAppliedPolicy = add_applied_policy_for_path(path_policy, &file_entry.path);
+        add_progress_print_current_file(progress, file_entry);
+        const cache_lookup_started_ms: u64 = add_maybe_now_ms(profile.enabled);
+        const cached_object: AddCachedObjectResult = try add_try_reuse_cached_object(store, cached_local_changes, file_entry);
+        add_profile_add_elapsed(&profile.cache_lookup_elapsed_ms, cache_lookup_started_ms);
+        if cached_object.hit {
+            profile.cache_hits = profile.cache_hits + 1 as usize;
+            processed_results[file_index] = add_file_process_result_stored(
+                &cached_object.object_id,
+                0u64,
+                0u64,
+                &applied_policy.policy_id,
+                applied_policy.audit_enabled,
+            );
+            add_progress_mark_file(progress, file_entry);
+            file_index = file_index + 1 as usize;
+            continue;
+        }
+
+        profile.cache_misses = profile.cache_misses + 1 as usize;
+        profile.small_blob_misses = profile.small_blob_misses + 1 as usize;
+        tasks[batch_count] = AddPackPrepareTask{
+            root_fs_path: root_fs_path,
+            file_entry: file_entry,
+            result_index: file_index,
+            policy_id: applied_policy.policy_id,
+            audit_enabled: applied_policy.audit_enabled,
+        };
+        batch_count = batch_count + 1 as usize;
+        file_index = file_index + 1 as usize;
+        if batch_count == batch_cap {
+            try add_pack_flush_batch(stream, tasks, slots, batch_count, worker_count, processed_results, skipped_count, progress, profile);
+            batch_count = 0 as usize;
+        }
+    }
+    if batch_count > 0 as usize {
+        try add_pack_flush_batch(stream, tasks, slots, batch_count, worker_count, processed_results, skipped_count, progress, profile);
+    }
+}
+
+fn add_process_bulk_pack(
+    root: &RepoPath,
+    root_fs_path: &AddFsPath,
+    scanned_files: &WorkspaceFileList,
+    path_policy: &PathPolicyProfile,
+    store: &LooseObjectStore,
+    cached_local_changes: &LocalChangeList,
+    worker_count: usize,
+    processed_results: &AddFileProcessResult,
+    skipped_count: &usize,
+    progress: &AddProgressState,
+    profile: &AddProfileState,
+) !void {
+    const packs_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_PACKS_REL);
+    const created_ms: u64 = now_ms() catch {
+        return error.AddTimeFailed;
+    };
+    var stream: PackStream = try pack_stream_open(repo_path_cstr(&packs_root) as &const byte, getpid(), created_ms as i64);
+
+    const batch_cap: usize = add_pack_batch_capacity(scanned_files.len);
+    const tasks: &AddPackPrepareTask = malloc(@size_of(AddPackPrepareTask) as usize * batch_cap) as &AddPackPrepareTask;
+    if tasks == null {
+        pack_stream_abort(&stream);
+        return error.AddAlloc;
+    }
+    defer {
+        free(tasks as &void);
+    }
+    const slots: &AddPackSlot = malloc(@size_of(AddPackSlot) as usize * batch_cap) as &AddPackSlot;
+    if slots == null {
+        pack_stream_abort(&stream);
+        return error.AddAlloc;
+    }
+    defer {
+        free(slots as &void);
+    }
+
+    add_pack_consume_all(
+        &stream,
+        tasks,
+        slots,
+        batch_cap,
+        root_fs_path,
+        scanned_files,
+        path_policy,
+        store,
+        cached_local_changes,
+        worker_count,
+        processed_results,
+        skipped_count,
+        progress,
+        profile,
+    ) catch |err| {
+        pack_stream_abort(&stream);
+        return err;
+    };
+    _ = pack_stream_finish(&stream) catch {
+        return error.AddStoreFailed;
+    };
+}
+
 export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) !AddStageResult {
     var profile: AddProfileState = add_profile_init();
     const arena_storage: &byte = malloc(ADD_ARENA_BYTES) as &byte;
@@ -2787,8 +3247,13 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
     var progress: AddProgressState = add_progress_init(&scanned_files);
 
     const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
-    var store: LooseObjectStore = try loose_store_open(repo_path_cstr(&objects_root));
-    if matched_count >= ADD_PREPARE_FANOUT_MIN_FILES &&
+    const objects_packs_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_PACKS_REL);
+    var store: LooseObjectStore = try loose_store_open_packed(
+        repo_path_cstr(&objects_root),
+        repo_path_cstr(&objects_packs_root) as &const byte,
+    );
+    if !add_pack_path_enabled(matched_count, &scanned_files) &&
+        matched_count >= ADD_PREPARE_FANOUT_MIN_FILES &&
         add_all_files_are_parallel_small_blob_candidates(&scanned_files) {
         loose_store_prepare_fanout_dirs(&store) catch {
             return error.AddStoreFailed;
@@ -2871,7 +3336,24 @@ export fn add_stage_pathspecs(root: &RepoPath, pathspecs: ManifestPathspecList) 
 
     var skipped_count: usize = 0;
     const process_files_started_ms: u64 = add_maybe_now_ms(profile.enabled);
-    if effective_parallel_workers > 1 as usize {
+    const use_pack_path: bool = add_pack_path_enabled(matched_count, &scanned_files);
+    if use_pack_path {
+        const pack_workers: usize = add_pack_worker_count(matched_count);
+        profile.workers = pack_workers;
+        try add_process_bulk_pack(
+            root,
+            &root_fs_path,
+            &scanned_files,
+            &path_policy,
+            &store,
+            &cached_local_changes,
+            pack_workers,
+            processed_results,
+            &skipped_count,
+            &progress,
+            &profile,
+        );
+    } else if effective_parallel_workers > 1 as usize {
         var batch_task_capacity: usize = matched_count;
         if batch_task_capacity > ADD_PARALLEL_BATCH_MAX_FILES {
             batch_task_capacity = ADD_PARALLEL_BATCH_MAX_FILES;

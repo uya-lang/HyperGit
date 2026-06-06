@@ -66,10 +66,11 @@ use object.types.SmallBlobPayload;
 use store.head_ref.repo_head_ref_exists;
 use store.head_ref.repo_read_head_commit;
 use store.loose_store.LooseObjectStore;
-use store.loose_store.loose_store_open;
+use store.loose_store.loose_store_open_packed;
 use store.object_store.ObjectBytes;
 use store.repo_layout.HGIT_CACHE_CHUNKS_REL;
 use store.repo_layout.HGIT_OBJECTS_LOOSE_REL;
+use store.repo_layout.HGIT_OBJECTS_PACKS_REL;
 use store.repo_layout.HGIT_WORKSPACE_LOCAL_CHANGE_REL;
 use store.repo_layout.HGIT_WORKSPACE_SPARSE_REL;
 use store.repo_layout.HGIT_WORKSPACE_STAGE_REL;
@@ -146,7 +147,7 @@ struct CheckoutFsPath {
 }
 
 struct CheckoutApplyTask {
-    objects_root: &RepoPath,
+    store: &LooseObjectStore,
     chunk_store_root: &RepoPath,
     fs_path: CheckoutFsPath,
     kind: CheckoutActionKind,
@@ -699,12 +700,6 @@ fn checkout_apply_task_run(task_bits: usize) usize {
         return CHECKOUT_TASK_OK;
     }
 
-    const store: LooseObjectStore = loose_store_open(repo_path_cstr(task.objects_root)) catch |err| {
-        if @error_id(err) == @error_id(error.StorePermissionDenied) {
-            return CHECKOUT_TASK_PERMISSION;
-        }
-        return CHECKOUT_TASK_FAILURE;
-    };
     const chunk_store: ChunkStore = chunk_store_open(repo_path_cstr(task.chunk_store_root)) catch |err| {
         if @error_id(err) == @error_id(error.ChunkStorePermissionDenied) {
             return CHECKOUT_TASK_PERMISSION;
@@ -728,7 +723,7 @@ fn checkout_apply_task_run(task_bits: usize) usize {
         object_id: task.object_id,
         file_mode: task.file_mode,
     };
-    checkout_write_blob_to_path(&arena, &store, &chunk_store, &task.fs_path, &action) catch |err| {
+    checkout_write_blob_to_path(&arena, task.store, &chunk_store, &task.fs_path, &action) catch |err| {
         return checkout_apply_task_error_code(@error_id(err));
     };
     return CHECKOUT_TASK_OK;
@@ -737,7 +732,6 @@ fn checkout_apply_task_run(task_bits: usize) usize {
 export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &RepoPath, plan: &CheckoutPlan) !void {
     const root_path: CheckoutFsPath = checkout_fs_path_from_repo_path(root);
     const chunk_store_root: RepoPath = try repo_path_join_literal(root, HGIT_CACHE_CHUNKS_REL);
-    const objects_root: RepoPath = try repo_path_join_literal(root, HGIT_OBJECTS_LOOSE_REL);
 
     var write_count: usize = 0;
     var i: usize = 0;
@@ -799,7 +793,7 @@ export fn checkout_apply_plan(arena: &Arena, store: &LooseObjectStore, root: &Re
         const action: &CheckoutAction = &plan.actions.ptr[i];
         if action.kind == CheckoutActionKind.WriteFile {
             tasks[write_index] = CheckoutApplyTask{
-                objects_root: &objects_root,
+                store: store,
                 chunk_store_root: &chunk_store_root,
                 fs_path: try checkout_fs_path_join(&root_path, &action.path),
                 kind: action.kind,
@@ -1072,7 +1066,11 @@ export fn run_checkout() i32 {
         fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
-    const store: LooseObjectStore = loose_store_open(repo_path_cstr(&objects_root)) catch {
+    const packs_root: RepoPath = repo_path_join_literal(&root, HGIT_OBJECTS_PACKS_REL) catch {
+        fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
+        return EXIT_RUNTIME_ERROR;
+    };
+    const store: LooseObjectStore = loose_store_open_packed(repo_path_cstr(&objects_root), repo_path_cstr(&packs_root) as &const byte) catch {
         fprintf(stderr, "%s" as *byte, CHECKOUT_FAILURE_TEXT);
         return EXIT_RUNTIME_ERROR;
     };
