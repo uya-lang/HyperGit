@@ -893,6 +893,30 @@ fn status_print_no_head_untracked_direct(arena: &Arena, root: &RepoPath) !usize 
     return out.file_count;
 }
 
+// Validates every workspace path against the manifest naming rules before any
+// status output is produced. The streaming no-head untracked scanner does not
+// normalize names, so a Windows-incompatible / otherwise invalid name would
+// otherwise be printed as an ordinary untracked file. workspace_scan_files runs
+// the same manifest_path_normalize the rest of HyperGit uses; we translate its
+// path errors into the status-specific variants.
+fn status_validate_no_head_names(arena: &Arena, root: &RepoPath) !void {
+    _ = workspace_scan_files(arena, repo_path_cstr(root) as &const byte) catch |err| {
+        if @error_id(err) == @error_id(error.WorkspaceScanPermissionDenied) {
+            return error.RepoPermissionDenied;
+        }
+        if @error_id(err) == @error_id(error.ManifestReservedName) {
+            return error.StatusReservedName;
+        }
+        if status_manifest_path_error_is_invalid(@error_id(err)) {
+            return error.StatusInvalidPath;
+        }
+        if @error_id(err) == @error_id(error.WorkspaceScanUnsupportedFileType) {
+            return error.StatusUnsupportedWorkspaceEntry;
+        }
+        return error.StatusWorkspaceScanFailed;
+    };
+}
+
 fn status_workspace_entry_from_change_stat(change: &LocalChange, st: &Stat) !WorkspaceFileEntry {
     return WorkspaceFileEntry{
         path: ByteList{ ptr: change.path.ptr, len: change.path.len },
@@ -1847,6 +1871,29 @@ export fn run_status() i32 {
     status_profile_trace(&profile, "local_read", profile.local_read_ms);
 
     if !has_head && staged.entries.len == 0 as usize && stored_local_changes.len == 0 as usize {
+        // Reject Windows-incompatible / otherwise invalid workspace names before
+        // emitting any output, so stdout stays empty on failure.
+        status_validate_no_head_names(&arena, &root) catch |err| {
+            if @error_id(err) == @error_id(error.RepoPermissionDenied) {
+                fprintf(stderr, "%s" as *byte, STATUS_PERMISSION_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            if @error_id(err) == @error_id(error.StatusReservedName) {
+                fprintf(stderr, "%s" as *byte, STATUS_RESERVED_NAME_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            if @error_id(err) == @error_id(error.StatusInvalidPath) {
+                fprintf(stderr, "%s" as *byte, STATUS_INVALID_PATH_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            if @error_id(err) == @error_id(error.StatusUnsupportedWorkspaceEntry) {
+                fprintf(stderr, "%s" as *byte, STATUS_UNSUPPORTED_WORKSPACE_ENTRY_TEXT);
+                return EXIT_RUNTIME_ERROR;
+            }
+            fprintf(stderr, "%s" as *byte, STATUS_FAILURE_TEXT);
+            return EXIT_RUNTIME_ERROR;
+        };
+
         fprintf(stdout, STATUS_BRANCH_TEXT as *byte, &config.default_branch[0]);
         fprintf(stdout, "%s" as *byte, STATUS_NO_COMMITS_TEXT);
         _ = fflush(stdout);
