@@ -1061,16 +1061,6 @@ fn workspace_scan_parallel_task_run(task_ptr: usize) usize {
     return WORKSPACE_SCAN_PARALLEL_STATUS_OK;
 }
 
-fn workspace_scan_parallel_status_to_error(status: usize) !void {
-    if status == WORKSPACE_SCAN_PARALLEL_STATUS_OK {
-        return;
-    }
-    if status == WORKSPACE_SCAN_PARALLEL_STATUS_ALLOC {
-        return error.WorkspaceScanAlloc;
-    }
-    return error.WorkspaceScanStatFailed;
-}
-
 fn workspace_scan_copy_entry_to_arena(arena: &Arena, entry: &WorkspaceFileEntry) !WorkspaceFileEntry {
     const normalized_path: ByteList = try manifest_path_normalize(arena, entry.path.ptr[0: entry.path.len]);
     return WorkspaceFileEntry{
@@ -1221,16 +1211,41 @@ fn workspace_scan_files_parallel(
         task_index = task_index + 1 as usize;
     }
 
+    // Drain every worker before acting on the results so all threads finish
+    // touching their scratch arenas. If any worker failed (most commonly because
+    // a single large subtree exhausted its fixed-size per-worker arena), fall
+    // back to a serial scan that uses the caller's much larger arena. The serial
+    // pass either completes or surfaces the real error with its precise type.
+    var needs_serial_fallback: bool = false;
     task_index = 0 as usize;
     while task_index < worker_count {
         const status: usize = block_on<usize>(futures[task_index]) catch {
             return error.WorkspaceScanOpenFailed;
         };
-        try workspace_scan_parallel_status_to_error(status);
+        if status != WORKSPACE_SCAN_PARALLEL_STATUS_OK {
+            needs_serial_fallback = true;
+        }
         task_index = task_index + 1 as usize;
     }
 
+    if needs_serial_fallback {
+        return workspace_scan_serial_fallback(arena, root, path_only);
+    }
+
     return workspace_scan_merge_parallel_results(arena, tasks, worker_count, path_only);
+}
+
+// Serial scan into the caller's arena, used as a fallback when the parallel
+// workers fail (e.g. a large subtree overflows a worker's fixed scratch arena).
+fn workspace_scan_serial_fallback(arena: &Arena, root: &WorkspaceScanPath, path_only: bool) !WorkspaceFileList {
+    const empty_relative: WorkspaceScanPath = workspace_scan_path_empty();
+    var collector: WorkspaceScanCollector = workspace_scan_collector_init();
+    if path_only {
+        try workspace_scan_collect_file_paths(arena, root, &empty_relative, &collector);
+    } else {
+        try workspace_scan_collect_files(arena, root, &empty_relative, &collector);
+    }
+    return try workspace_scan_collector_flatten(arena, &collector);
 }
 
 fn min_usize(left: usize, right: usize) usize {

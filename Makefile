@@ -111,6 +111,7 @@ test:
 	./tests/test_diff_pathspec_scan.sh
 	./tests/test_diff_binary.sh
 	./tests/test_diff_large_file.sh
+	./tests/test_diff_symlink.sh
 	./tests/test_checkout_content.sh
 	./tests/test_checkout_restore_workspace.sh
 	./tests/test_checkout_parallel_apply.sh
@@ -132,6 +133,7 @@ test:
 	./tests/test_status_large_staged.sh
 	./tests/test_status_reserved_name_error.sh
 	./tests/test_status_split.sh
+	./tests/test_status_missing_dir.sh
 	./tests/test_loose_store_concurrent.sh
 
 experimental-test:
